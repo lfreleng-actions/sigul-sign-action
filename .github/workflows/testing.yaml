@@ -1,8 +1,26 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
+#
+# The action signs against a Sigul server, which CI has no access to:
+# the credentials are production signing material and the bridge is
+# real infrastructure. Testing therefore splits in two.
+#
+#   validation  Calls the action itself, exercising every input-
+#               validation path. These reach no credential and no
+#               network, so they run exactly as a consumer would.
+#
+#   scripts     Runs the container entrypoints directly with a mock
+#               `sigul` on PATH. This is where the substance lives:
+#               file selection, exclusions, retry, the count, and the
+#               refusal to sign nothing. A mock proves the logic
+#               without touching a signing server.
+#
+# What remains untested is the container invocation itself -- image
+# pull, mounts, credential materialisation. That needs real
+# credentials and is verified by the first live signing run.
 name: "Test GitHub Action 🧪"
 
 # yamllint disable-line rule:truthy
@@ -20,23 +38,80 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  # Every call here fails during validation, before any credential is
+  # written, so the placeholder secrets below never reach a container.
+  validation:
+    name: "Test input validation"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: "unknown mode"
+            mode: "sign-everything"
+            path: "."
+            backend: "legacy"
+          - case: "directory mode without path"
+            mode: "directory"
+            path: ""
+            backend: "legacy"
+          - case: "path does not exist"
+            mode: "directory"
+            path: "does-not-exist"
+            backend: "legacy"
+          - case: "file mode given a directory"
+            mode: "file"
+            path: "scripts"
+            backend: "legacy"
+          - case: "git-tag mode without a tag"
+            mode: "git-tag"
+            path: ""
+            backend: "legacy"
+          - case: "unknown backend"
+            mode: "directory"
+            path: "scripts"
+            backend: "sigstore"
+          # Named, validated, and refused until the infrastructure
+          # migrates. Asserting it fails is the point: a silent
+          # fallback to legacy would sign against the wrong server.
+          - case: "k8s backend not yet available"
+            mode: "directory"
+            path: "scripts"
+            backend: "k8s"
+          # '/tmp' exists but sits outside any work tree. 'scripts'
+          # would NOT do: git searches upwards, so a subdirectory of
+          # this checkout resolves to the repository root rather than
+          # failing -- which is the very behaviour being guarded.
+          - case: "repository-path is not a git work tree"
+            mode: "git-tag"
+            path: ""
+            git_tag: "v1.0.0"
+            repository_path: "/tmp"
+            backend: "legacy"
+          - case: "non-integer max-retries"
+            mode: "directory"
+            path: "scripts"
+            backend: "legacy"
+            max_retries: "many"
+          - case: "max-retries below one"
+            mode: "directory"
+            path: "scripts"
+            backend: "legacy"
+            max_retries: "0"
+          - case: "negative retry-delay"
+            mode: "directory"
+            path: "scripts"
+            backend: "legacy"
+            retry_delay: "-1"
     steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
         with:
           config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -46,45 +121,540 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: "Running local action: ${{ github.repository }}"
+      - name: "${{ matrix.case }} (should fail)"
+        id: invalid
+        continue-on-error: true
         uses: $/
         with:
-          input: "test input 💬"
+          mode: "${{ matrix.mode }}"
+          path: "${{ matrix.path }}"
+          backend: "${{ matrix.backend }}"
+          git-tag: "${{ matrix.git_tag }}"
+          # Defaults to '.', which IS a work tree here, so rows that
+          # do not override it exercise the other rejection paths
+          # rather than tripping on the repository check.
+          repository-path: "${{ matrix.repository_path || '.' }}"
+          # Fall back to the action's own defaults where a row does
+          # not override them; an empty string would defeat the
+          # default and make every row a numeric-validation case.
+          max-retries: "${{ matrix.max_retries || '5' }}"
+          retry-delay: "${{ matrix.retry_delay || '15' }}"
+          sigul-key: "not-a-real-key"
+          sigul-config: "not-a-real-config"
+          sigul-password: "not-a-real-password"
+          sigul-pki: "not-real-pki-material"
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Assert it failed"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          CASE: "${{ matrix.case }}"
+          OUTCOME: "${{ steps.invalid.outcome }}"
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [ "${OUTCOME}" = "success" ]; then
+            printf 'ERROR: accepted invalid input: %s ❌\n' "${CASE}"
+            exit 1
+          fi
+          printf 'Rejected: %s ✅\n' "${CASE}"
 
+  # The entrypoints above run under Python 3 on the runner, but the
+  # only usable backend today executes them with the legacy image's
+  # Python 2.7. Testing one interpreter proves nothing about the
+  # other: a Python-3-only construct would pass every job above and
+  # still break production. This runs the same scripts inside the real
+  # pinned image, against a mock sigul.
+  legacy-interpreter:
+    name: "Test entrypoints under Python 2.7"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
         with:
-          invalid_input: "Some garbage"
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: 'Harden runner (audit)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          # Pulling the signing image needs registry egress that is
+          # impractical to enumerate in the allow-list; audit instead.
+          egress-policy: 'audit'
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Run entrypoints under the image's Python 2.7"
+        shell: bash
+        env:
+          # The digest action.yaml defaults to, so this exercises the
+          # interpreter callers actually get.
+          # yamllint disable-line rule:line-length
+          IMAGE: "lfreleng/sigul:0.1.0@sha256:e8b958a6e5ba3ee6334c0244e9fbe0881248133e97bc77236a176baa5d219cbd"
+        run: |
+          set -euo pipefail
+          docker pull --quiet "${IMAGE}"
+          docker run --rm --entrypoint /bin/bash \
+            -v "$(pwd)/scripts:/s:ro" \
+            -v "$(pwd)/tests:/t:ro" \
+            "${IMAGE}" /t/legacy-interpreter-check.sh
+
+      - name: "Legacy interpreter validated"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          msg="Entrypoints behave correctly under Python 2.7 ✅"
+          echo "${msg}"
+          echo "- ${msg}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Exercises the container entrypoints with a mock `sigul`, so the
+  # selection and retry logic is covered without a signing server.
+  scripts:
+    name: "Test signing scripts"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Install a mock sigul"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/mockbin"
+          # Mimics the real CLI closely enough to exercise the callers:
+          # parses the same flags, writes the -o target, and honours
+          # MOCK_FAIL_TIMES so the retry path can be tested.
+          cat > "${RUNNER_TEMP}/mockbin/sigul" <<'MOCKEOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          out=""
+          prev=""
+          for arg in "$@"; do
+            if [ "${prev}" = "-o" ]; then out="${arg}"; fi
+            prev="${arg}"
+          done
+          state="${MOCK_STATE:-/tmp/mock-sigul-attempts}"
+          attempts=0
+          [ -f "${state}" ] && attempts="$(cat "${state}")"
+          attempts=$((attempts + 1))
+          printf '%s\n' "${attempts}" > "${state}"
+          if [ "${attempts}" -le "${MOCK_FAIL_TIMES:-0}" ]; then
+            echo "mock sigul: induced failure ${attempts}" >&2
+            exit 1
+          fi
+          [ -n "${out}" ] && printf 'MOCK SIGNATURE\n' > "${out}"
+          exit 0
+          MOCKEOF
+          chmod +x "${RUNNER_TEMP}/mockbin/sigul"
+          echo "${RUNNER_TEMP}/mockbin" >> "$GITHUB_PATH"
+
+      - name: "Directory mode: signs, excludes and counts"
+        shell: bash
+        env:
+          SIGUL_KEY: "mock-key"
+          MAX_RETRIES: "3"
+          RETRY_DELAY: "0"
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/dir-case"
+          mkdir -p "${work}/nested"
+          # Three signable files, and three that must be skipped.
+          echo a > "${work}/artifact.jar"
+          echo b > "${work}/artifact.pom"
+          echo c > "${work}/nested/deep.jar"
+          echo x > "${work}/artifact.jar.asc"
+          echo y > "${work}/artifact.jar.md5"
+          echo z > "${work}/maven-metadata.xml"
+
+          conf="${RUNNER_TEMP}/conf"; : > "${conf}"
+          pass="${RUNNER_TEMP}/pass"; printf 'p\0\n' > "${pass}"
+          count="${RUNNER_TEMP}/count"
+          rm -f /tmp/mock-sigul-attempts
+
+          SIGN_TARGET="${work}" \
+          SIGUL_CONFIG="${conf}" \
+          SIGUL_PASSWORD="${pass}" \
+          COUNT_FILE="${count}" \
+          EXCLUDE_GLOBS=$'*.asc\n*.md5\nmaven-metadata.xml' \
+            python3 ./scripts/sign_data.py
+
+          got="$(cat "${count}")"
+          if [ "${got}" != "3" ]; then
+            echo "ERROR: signed ${got} files, expected 3 ❌"; exit 1
+          fi
+          # Excluded files must not have gained a signature, and the
+          # nested one must have.
+          [ -f "${work}/nested/deep.jar.asc" ] || {
+            echo "ERROR: nested file not signed ❌"; exit 1; }
+          [ -f "${work}/maven-metadata.xml.asc" ] && {
+            echo "ERROR: excluded file was signed ❌"; exit 1; }
+          echo "Directory mode: 3 signed, exclusions honoured ✅"
+
+      # prepare_credentials.py owns the whole credential path now:
+      # validate, write config and passphrase, decode/decrypt/unpack
+      # the PKI bundle, locate the NSS database and rewrite nss-dir.
+      # Python because the work is archive handling and text
+      # rewriting, where shell quoting and glob semantics are a
+      # liability -- and because it is then testable, which the
+      # container invocation is not.
+      - name: "Credential prep: every bundle layout"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTEST'
+          import base64, os, subprocess, sys, tarfile, tempfile, shutil
+          from pathlib import Path
+
+          SCRIPT = str(Path("scripts/prepare_credentials.py").resolve())
+          HEAD = "[client]\nbridge-port: 44334\n"
+
+          def run(conf, layout, extra=None, armour=False):
+              """Build a bundle, encrypt it, and run the preparer."""
+              tmp = Path(tempfile.mkdtemp())
+              src = tmp / "build"
+              target = src / layout if layout else src
+              target.mkdir(parents=True, exist_ok=True)
+              (target / "cert9.db").write_bytes(b"")
+              (target / "key4.db").write_bytes(b"")
+              for name, body in (extra or {}).items():
+                  (src / name).write_text(body)
+              tar = tmp / "b.tar"
+              with tarfile.open(tar, "w") as handle:
+                  handle.add(src, arcname=".")
+              enc = tmp / "enc"
+              argv = ["gpg", "--batch", "--yes", "--quiet",
+                      "--pinentry-mode", "loopback", "--passphrase", "pw"]
+              if armour:
+                  argv.append("--armor")
+              subprocess.run(argv + ["-c", "-o", str(enc), str(tar)],
+                             check=True, capture_output=True)
+              blob = (enc.read_text() if armour
+                      else base64.b64encode(enc.read_bytes()).decode())
+              creds = tmp / "creds"
+              env = dict(os.environ, CREDS_DIR=str(creds),
+                         CONTAINER_CREDS="/sigul-creds",
+                         SIGUL_CONFIG_BODY=conf, SIGUL_PASSWORD_VALUE="pw",
+                         SIGUL_PKI_VALUE=blob, SIGUL_KEY="k")
+              done = subprocess.run([sys.executable, SCRIPT],
+                                    capture_output=True, text=True, env=env)
+              config = creds / "client.conf"
+              text = config.read_text() if config.exists() else ""
+              entries = [x for x in text.splitlines()
+                         if x.strip().startswith("nss-dir")]
+              shutil.rmtree(tmp, ignore_errors=True)
+              return done, entries, text
+
+          # Each shape must end with exactly one nss-dir, pointing at
+          # the real in-container location. ONAP's bundle unpacks to
+          # 'sigul/' with an absolute Jenkins path in its config;
+          # other tooling documents '.sigul/'.
+          ONAP_NSS = "\n[nss]\nnss-dir: /home/jenkins/sigul\n"
+          cases = [
+              ("onap base64", HEAD + ONAP_NSS,
+               "sigul", "/sigul-creds/pki/sigul", False),
+              ("onap armoured", HEAD + ONAP_NSS,
+               "sigul", "/sigul-creds/pki/sigul", True),
+              ("dotted", HEAD + "\n[nss]\nnss-dir: ~/.sigul\n",
+               ".sigul", "/sigul-creds/pki/.sigul", False),
+              ("bare", HEAD + "\n[nss]\nnss-dir: /elsewhere\n",
+               "", "/sigul-creds/pki", False),
+              ("no nss-dir", HEAD + "\n[nss]\nnss-min-tls: tls1.2\n",
+               "sigul", "/sigul-creds/pki/sigul", False),
+              ("no [nss]", HEAD, "sigul", "/sigul-creds/pki/sigul", False),
+              ("duplicate", HEAD + "\n[nss]\nnss-dir: /a\nnss-dir: /b\n",
+               "sigul", "/sigul-creds/pki/sigul", False),
+          ]
+
+          failures = 0
+          for name, conf, layout, want, armour in cases:
+              done, entries, _ = run(conf, layout, armour=armour)
+              got = entries[0].split(":", 1)[1].strip() if entries else None
+              if done.returncode or got != want or len(entries) != 1:
+                  print("FAIL {}: nss-dir={!r} want {!r} lines={}".format(
+                      name, got, want, len(entries)))
+                  if done.stderr:
+                      print("     " + done.stderr.strip().splitlines()[-1])
+                  failures += 1
+              else:
+                  print("  {} -> {}".format(name, got))
+
+          # A bundle carrying its own top-level client.conf must not
+          # overwrite the caller's: that would restore stale bridge
+          # settings without anyone noticing.
+          done, _entries, text = run(
+              HEAD + "\n[nss]\nnss-dir: /x\n", "sigul",
+              {"client.conf": "[client]\nbridge-port: 9999\n"})
+          if done.returncode or "9999" in text or "44334" not in text:
+              print("FAIL collision: bundle overwrote the caller's config")
+              failures += 1
+          else:
+              print("  collision -> caller config intact")
+
+          sys.exit(1 if failures else 0)
+          PYTEST
+          echo "All bundle layouts handled"
+
+      - name: "Credential prep: rejects bad input"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTEST'
+          import base64, os, subprocess, sys, tarfile, tempfile, shutil
+          from pathlib import Path
+
+          SCRIPT = str(Path("scripts/prepare_credentials.py").resolve())
+
+          def attempt(**overrides):
+              """Run the preparer, returning its exit status."""
+              tmp = Path(tempfile.mkdtemp())
+              src = tmp / "build" / "notes"
+              src.mkdir(parents=True)
+              (src / "readme.txt").write_text("no NSS database here")
+              tar = tmp / "b.tar"
+              with tarfile.open(tar, "w") as handle:
+                  handle.add(tmp / "build", arcname=".")
+              enc = tmp / "enc"
+              subprocess.run(
+                  ["gpg", "--batch", "--yes", "--quiet", "--pinentry-mode",
+                   "loopback", "--passphrase", "pw", "-c", "-o", str(enc),
+                   str(tar)], check=True, capture_output=True)
+              env = dict(os.environ, CREDS_DIR=str(tmp / "creds"),
+                         CONTAINER_CREDS="/sigul-creds",
+                         SIGUL_CONFIG_BODY="[client]\n",
+                         SIGUL_PASSWORD_VALUE="pw",
+                         SIGUL_PKI_VALUE=base64.b64encode(
+                             enc.read_bytes()).decode(),
+                         SIGUL_KEY="k")
+              env.update(overrides)
+              done = subprocess.run([sys.executable, SCRIPT],
+                                    capture_output=True, text=True, env=env)
+              shutil.rmtree(tmp, ignore_errors=True)
+              return done.returncode
+
+          # A composite action does not enforce `required: true`, so an
+          # omitted input arrives as an empty string. Each must fail
+          # here rather than become an empty file and surface later as
+          # a confusing Sigul error.
+          cases = {
+              "empty sigul-config": {"SIGUL_CONFIG_BODY": ""},
+              "empty sigul-password": {"SIGUL_PASSWORD_VALUE": ""},
+              "empty sigul-pki": {"SIGUL_PKI_VALUE": ""},
+              "empty sigul-key": {"SIGUL_KEY": ""},
+              "wrong passphrase": {"SIGUL_PASSWORD_VALUE": "not-the-password"},
+              "bundle without an NSS database": {},
+          }
+
+          failures = 0
+          for name, overrides in cases.items():
+              if attempt(**overrides) == 0:
+                  print("FAIL {}: accepted".format(name))
+                  failures += 1
+              else:
+                  print("  rejected: {}".format(name))
+
+          sys.exit(1 if failures else 0)
+          PYTEST
+          echo "Bad credential input rejected"
+
+      - name: "File mode: signs one file and counts it"
+        shell: bash
+        env:
+          SIGUL_KEY: "mock-key"
+          MAX_RETRIES: "3"
+          RETRY_DELAY: "0"
+        run: |
+          set -euo pipefail
+          # The public 'mode: file' path reaches a different branch
+          # from the directory walk, and promises a count of exactly 1.
+          work="${RUNNER_TEMP}/file-case"
+          mkdir -p "${work}"
+          echo a > "${work}/single.jar"
+          # A sibling that must NOT be touched: file mode signs the
+          # named file, never its directory.
+          echo b > "${work}/sibling.jar"
+
+          conf="${RUNNER_TEMP}/conf"; : > "${conf}"
+          pass="${RUNNER_TEMP}/pass"; printf 'p\0\n' > "${pass}"
+          count="${RUNNER_TEMP}/fcount"
+          rm -f /tmp/mock-sigul-attempts
+
+          SIGN_TARGET="${work}/single.jar" \
+          SIGUL_CONFIG="${conf}" \
+          SIGUL_PASSWORD="${pass}" \
+          COUNT_FILE="${count}" \
+          EXCLUDE_GLOBS='' \
+            python3 ./scripts/sign_data.py
+
+          [ "$(cat "${count}")" = "1" ] || {
+            echo "ERROR: expected a count of 1 ❌"; exit 1; }
+          [ -f "${work}/single.jar.asc" ] || {
+            echo "ERROR: signature not created ❌"; exit 1; }
+          [ -f "${work}/sibling.jar.asc" ] && {
+            echo "ERROR: file mode signed a sibling ❌"; exit 1; }
+          echo "File mode: 1 signed, sibling untouched ✅"
+
+      - name: "Refuses to sign nothing"
+        shell: bash
+        env:
+          SIGUL_KEY: "mock-key"
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/empty-case"
+          mkdir -p "${work}"
+          # Every candidate is excluded, so the run must fail rather
+          # than report success having signed nothing.
+          echo x > "${work}/only.asc"
+          conf="${RUNNER_TEMP}/conf"; pass="${RUNNER_TEMP}/pass"
+          rm -f /tmp/mock-sigul-attempts
+
+          set +e
+          SIGN_TARGET="${work}" \
+          SIGUL_CONFIG="${conf}" \
+          SIGUL_PASSWORD="${pass}" \
+          EXCLUDE_GLOBS='*.asc' \
+            python3 ./scripts/sign_data.py
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 0 ]; then
+            echo "ERROR: signing nothing exited zero ❌"; exit 1
+          fi
+          echo "Refused to sign an empty set ✅"
+
+      - name: "Retries a transient failure"
+        shell: bash
+        env:
+          SIGUL_KEY: "mock-key"
+          MAX_RETRIES: "4"
+          RETRY_DELAY: "0"
+          MOCK_FAIL_TIMES: "2"
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/retry-case"
+          mkdir -p "${work}"
+          echo a > "${work}/one.jar"
+          conf="${RUNNER_TEMP}/conf"; pass="${RUNNER_TEMP}/pass"
+          count="${RUNNER_TEMP}/rcount"
+          rm -f /tmp/mock-sigul-attempts
+
+          SIGN_TARGET="${work}" \
+          SIGUL_CONFIG="${conf}" \
+          SIGUL_PASSWORD="${pass}" \
+          COUNT_FILE="${count}" \
+          EXCLUDE_GLOBS='' \
+            python3 ./scripts/sign_data.py
+
+          [ "$(cat "${count}")" = "1" ] || {
+            echo "ERROR: expected 1 signed after retries ❌"; exit 1; }
+          echo "Recovered after 2 induced failures ✅"
+
+      - name: "Gives up after max-retries"
+        shell: bash
+        env:
+          SIGUL_KEY: "mock-key"
+          MAX_RETRIES: "2"
+          RETRY_DELAY: "0"
+          MOCK_FAIL_TIMES: "99"
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/giveup-case"
+          mkdir -p "${work}"
+          echo a > "${work}/one.jar"
+          conf="${RUNNER_TEMP}/conf"; pass="${RUNNER_TEMP}/pass"
+          rm -f /tmp/mock-sigul-attempts
+
+          set +e
+          SIGN_TARGET="${work}" \
+          SIGUL_CONFIG="${conf}" \
+          SIGUL_PASSWORD="${pass}" \
+          EXCLUDE_GLOBS='' \
+            python3 ./scripts/sign_data.py
+          rc=$?
+          set -e
+          [ "${rc}" -ne 0 ] || {
+            echo "ERROR: persistent failure exited zero ❌"; exit 1; }
+          echo "Gave up after max-retries ✅"
+
+      - name: "git-tag mode: rejects missing and lightweight tags"
+        shell: bash
+        env:
+          SIGUL_KEY: "mock-key"
+          MAX_RETRIES: "2"
+          RETRY_DELAY: "0"
+        run: |
+          set -euo pipefail
+          repo="${RUNNER_TEMP}/tagrepo"
+          rm -rf "${repo}"; mkdir -p "${repo}"
+          git -C "${repo}" init -q
+          git -C "${repo}" config user.email t@example.com
+          git -C "${repo}" config user.name Test
+          # Force these off explicitly. Where tag.gpgSign is enabled,
+          # 'git tag <name>' produces an ANNOTATED tag and opens an
+          # editor, so the lightweight case below would silently test
+          # the wrong thing.
+          git -C "${repo}" config tag.gpgSign false
+          git -C "${repo}" config commit.gpgsign false
+          echo x > "${repo}/f"
+          git -C "${repo}" add f
+          git -C "${repo}" commit -qm "initial"
+          # Lightweight, so it has no object to hold a signature.
+          git -C "${repo}" tag lightweight
+          # Assert that, rather than assume it: the whole case depends
+          # on this tag NOT being annotated.
+          kind="$(git -C "${repo}" cat-file -t refs/tags/lightweight)"
+          [ "${kind}" = "commit" ] || {
+            echo "ERROR: fixture tag is '${kind}', expected lightweight ❌"
+            exit 1; }
+          conf="${RUNNER_TEMP}/conf"; pass="${RUNNER_TEMP}/pass"
+          scripts="$(pwd)/scripts"
+          rm -f /tmp/mock-sigul-attempts
+
+          for tag in absent lightweight; do
+            set +e
+            GIT_TAG="${tag}" \
+            REPO_DIR="${repo}" \
+            SIGUL_CONFIG="${conf}" \
+            SIGUL_PASSWORD="${pass}" \
+              python3 "${scripts}/sign_git_tag.py"
+            rc=$?
+            set -e
+            [ "${rc}" -ne 0 ] || {
+              printf 'ERROR: accepted tag %q ❌\n' "${tag}"; exit 1; }
+            printf 'Rejected tag: %s ✅\n' "${tag}"
+          done
+
+          # An annotated tag must be accepted and reach sigul.
+          git -C "${repo}" tag -a annotated -m "annotated"
+          GIT_TAG="annotated" \
+          REPO_DIR="${repo}" \
+          SIGUL_CONFIG="${conf}" \
+          SIGUL_PASSWORD="${pass}" \
+            python3 "${scripts}/sign_git_tag.py"
+          echo "Accepted an annotated tag ✅"
