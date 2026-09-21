@@ -1,0 +1,170 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+ci:
+  autofix_prs: false
+  # pre-commit.ci sandbox prevents network calls; disable gha-workflow-linter.
+  # aislop also runs engines that can call the network at scan time
+  # (dependency audits), so it cannot run in the sandbox either.
+  skip: [gha-workflow-linter, aislop]
+  autofix_commit_msg: |
+    Chore: Pre-commit autofixes
+
+    Signed-off-by: pre-commit-ci[bot] <pre-commit-ci@users.noreply.github.com>
+  autoupdate_commit_msg: |
+    Chore: Pre-commit autoupdate
+
+    Signed-off-by: pre-commit-ci[bot] <pre-commit-ci@users.noreply.github.com>
+
+# gitlint declares stages: [commit-msg]; without installing that hook
+# type it never runs. Hooks that declare no stage would otherwise run
+# again at commit-msg, so confine them to pre-commit.
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+
+exclude: "^docs/conf.py"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: check-ast
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-xml
+      - id: check-yaml
+      - id: debug-statements
+      - id: end-of-file-fixer
+      - id: requirements-txt-fixer
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: no-commit-to-branch
+        args:
+          - --branch=dev
+          - --branch=master
+          - --branch=main
+          - --branch=rc
+          - --branch=production
+
+  # Block credentials before they reach a commit. Scans staged content
+  # rather than paths, so it also catches secrets in files that no
+  # .gitignore rule covers. Guards new commits only; it does not scan
+  # existing history.
+  #
+  # always_run is required: the hook reads the staged index directly, but
+  # pre-commit still gates invocation on the file classifier, so the
+  # top-level exclude above would otherwise skip scanning entirely on a
+  # commit that touches only excluded paths.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 2ca41cc1372d1e939a6a879f18cdc19fc1cac1ce  # frozen: v8.30.0
+    hooks:
+      - id: gitleaks
+        always_run: true
+
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: acc9d9de6369b76d22cb4167029d2035e8730b98  # frozen: v0.19.1
+    hooks:
+      - id: gitlint
+
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: cba56bcde1fdd01c1deb3f945e69764c291a6530  # frozen: v1.38.0
+    hooks:
+      - id: yamllint
+        types: [yaml]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: e8f7d69b957a30acb2c875078d5fd012de24b64c  # frozen: v0.16.7
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 7ff8d35ae36a7d2b968f2f90b4c723e292e594ee  # frozen: v2.3.1
+    hooks:
+      - id: mypy
+
+  - repo: https://github.com/btford/write-good
+    rev: ab66ce10136dfad5146e69e70f82a3efac8842c1  # frozen: v1.0.8
+    hooks:
+      - id: write-good
+        files: "\\.(rst|md|markdown|mdown|mkdn)$"
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: a6564f5d57444e123433a5c9af733e3975c77229  # frozen: v0.11.0.1-1
+    hooks:
+      - id: shellcheck
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: 5b5dddc4fb0f83c3ea1fc5616fa63e115dce83e0  # frozen: v0.49.1
+    hooks:
+      - id: markdownlint
+        args: ["--fix"]
+
+  - repo: https://github.com/fsfe/reuse-tool
+    rev: 9fabf9eb815a57aac116b435e8346c200cdb8604  # frozen: v6.2.0
+    hooks:
+      - id: reuse
+
+  # Actively maintained fork of https://github.com/rhysd/actionlint
+  # Unlike upstream v1.7.12, this fork understands GitHub's
+  # self-repository 'uses: $/{path}' syntax, so it no longer conflicts
+  # with zizmor's self-repository audit. A bare '$/' (an action at the
+  # repository root) is still rejected; .github/actionlint.yaml carries
+  # a path-scoped ignore for that case.
+  - repo: https://github.com/kjanat/actionlint
+    rev: 08bb2c4f0d039744455b87aef1c647fb8b66d37b  # frozen: v1.17.0
+    hooks:
+      - id: actionlint
+
+  # Check for misspellings in documentation files
+  - repo: https://github.com/codespell-project/codespell
+    rev: 57b21406f092110c18776e39b0bda50d37c945c8  # frozen: v2.4.3
+    hooks:
+      - id: codespell
+
+  # Requires a mirror, primary repo lacks .pre-commit-hooks.yaml
+  - repo: https://github.com/DetachHead/basedpyright-prek-mirror
+    rev: 706e6acebe9e88c2c28d1527d3085a14b11794c4  # frozen: 1.40.1
+    hooks:
+      - id: basedpyright
+
+  - repo: https://github.com/lfreleng-actions/gha-workflow-linter
+    rev: 445a55d2a15b12217828eecf8d4bf7741e0e1360  # frozen: v1.5.6
+    hooks:
+      - id: gha-workflow-linter
+
+  # Catch AI slop developer-side before it reaches a pull request.
+  # Runs the full-repository quality gate, scored against
+  # .aislop/config.yml (failBelow: 100). A local hook installing the
+  # published npm package: the scanaislop/aislop git repository does
+  # not ship the built dist/, so its bundled pre-commit hook cannot
+  # install. Bump the pinned version here manually when new aislop
+  # releases ship.
+  - repo: local
+    hooks:
+      - id: aislop
+        name: aislop
+        entry: aislop ci --human
+        language: node
+        additional_dependencies: ["aislop@0.13.1"]
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: c4654a7e007c9619a5eb63c39a456572a0fa1851  # frozen: 0.38.0
+    hooks:
+      - id: check-github-actions
+      - id: check-github-workflows
+      - id: check-jsonschema
+        name: Check GitHub Workflows set timeout-minutes
+        args:
+          - --builtin-schema
+          - github-workflows-require-timeout
+        files: ^\.github/workflows/[^/]+$
+        types:
+          - yaml
+      - id: check-readthedocs
