@@ -1,53 +1,260 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# Sign artefacts or a git tag using a Sigul signing server.
+#
+# Sigul keeps the private key on a server the client never sees: the
+# client sends data to a bridge, the bridge relays it to the server, and
+# a signature comes back. Nothing here holds a signing key.
+#
+# A DROP-IN REPLACEMENT for lfit/sigul-sign-action. Its inputs keep
+# their names and behaviour, so a caller migrates by changing only the
+# 'uses:' line. Every input added here is optional, and the defaults
+# reproduce that action.
+#
+# TWO GENERATIONS OF SIGUL. The Linux Foundation runs sigul 0.207 on
+# CentOS 7 ('legacy') and a containerised sigul 1.4 stack ('modern',
+# from lfreleng-actions/sigul-docker-k8s), whose protocols differ. The
+# client image follows the infrastructure, so it is chosen explicitly:
+# 'container' names a built-in image, or 'container-image' with
+# 'container-tag' and/or 'container-digest' names any other exactly.
+# Use one or the other; neither selects 'legacy'. The built-in images
+# are pinned by digest in containers/*/Dockerfile, which Dependabot
+# keeps current.
+#
+# The work runs in scripts/: action_inputs.py plans and validates (with
+# client_image.py and sign_targets.py), signing.py signs, with
+# prepare_credentials.py and git_tag.py handling the secrets and the
+# tag, client_container.py runs the client, and scripts/container/ runs
+# inside it. sigul_action.py is the entry point both steps below call.
+name: "sigul-sign-action"
+description: "Sign artefacts or a git tag using a Sigul signing server"
 
 inputs:
-  input:
-    description: "Description of input"
+  # --- The inputs of lfit/sigul-sign-action, unchanged ---
+  sign-type:
+    description: "Either 'sign-data' or 'sign-git-tag'"
+    required: false
+    default: "sign-data"
+  sign-object:
+    description: >
+      For 'sign-data', the files to sign, one per line: a line containing
+      '*' expands as a shell wildcard, and a directory signs every file
+      beneath it, less 'exclude-globs'. For 'sign-git-tag', the name of
+      an existing annotated tag.
     required: true
+  sigul-ip:
+    description: >
+      IP address of the Sigul bridge. With sigul-uri, written as a hosts
+      entry in the container; see 'sigul-hosts-entry'.
+    required: false
+    default: ""
+  sigul-uri:
+    description: "Host name of the Sigul bridge, for the hosts entry"
+    required: false
+    default: ""
+  sigul-conf:
+    description: "Body of the Sigul client configuration (client.conf)"
+    required: true
+  sigul-key-name:
+    description: "Name of the signing key held on the Sigul server"
+    required: true
+  sigul-pass:
+    description: >
+      Passphrase for the signing key, which also decrypts sigul-pki.
+      Only its first line is used.
+    required: true
+  sigul-pki:
+    description: >
+      Client PKI: a tar.xz of the NSS database, GPG-encrypted with
+      sigul-pass, ASCII-armoured or base64-encoded. An input is text,
+      so binary ciphertext cannot pass through one intact.
+    required: true
+  gh-user:
+    description: "User to push a signed tag as"
+    required: false
+    default: ${{ github.actor }}
+  gh-key:
+    description: >
+      Token for gh-user, to push a signed tag. Required for
+      'sign-git-tag' unless push-tag is 'false'.
+    required: false
+    default: ""
+
+  # --- Additions ---
+  container:
+    description: >
+      Built-in Sigul client image: 'legacy' (sigul 0.207, linux/amd64)
+      or 'modern' (sigul 1.4, linux/amd64 and linux/arm64). Empty
+      selects 'legacy', unless container-image is set; setting both is
+      an error.
+    required: false
+    default: ""
+  container-image:
+    description: >
+      A bespoke Sigul client image, in place of 'container': a registry
+      path such as ghcr.io/org/client, optionally with :tag and/or
+      @sha256:digest. A tag or a digest is required, here or below.
+    required: false
+    default: ""
+  container-tag:
+    description: "Tag for container-image"
+    required: false
+    default: ""
+  container-digest:
+    description: "Digest for container-image, as sha256:<64 hex digits>"
+    required: false
+    default: ""
+  sigul-hosts-entry:
+    description: >
+      Whether sigul-ip and sigul-uri become a hosts entry: 'auto' adds
+      it for the legacy container only, as the legacy action did;
+      'true' for any container; 'false' never.
+    required: false
+    default: "auto"
+  push-tag:
+    description: >
+      For 'sign-git-tag': push the signed tag back to the repository, as
+      the legacy action always did. 'false' signs it in the workspace
+      only.
+    required: false
+    default: "true"
+  dry-run:
+    description: >
+      'true' does everything short of signing: validates the inputs,
+      pulls the image, decrypts the credentials and has the Sigul client
+      load its configuration, NSS database and certificate, resolves the
+      bridge, and checks the files or tag. It signs nothing, pushes
+      nothing and changes no file in the workspace.
+    required: false
+    default: "false"
+  exclude-globs:
+    description: >
+      Newline-separated file name patterns skipped when sign-object
+      names a directory. The default is global-jjb's list; it does not
+      exclude *.sha256 or *.sha512, which global-jjb signs.
+    required: false
+    default: |
+      *.asc
+      *.md5
+      *.sha1
+      _maven.repositories
+      _remote.repositories
+      *.lastUpdated
+      maven-metadata.xml
+      maven-metadata-local.xml
+  max-retries:
+    description: "Attempts per signing operation"
+    required: false
+    default: "5"
+  retry-delay:
+    description: "Seconds between attempts"
+    required: false
+    default: "15"
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  signed_count:
+    description: >
+      Files signed: 0 for 'sign-git-tag', which signs a tag object, and
+      0 for a dry run, which signs nothing.
+    value: ${{ steps.sign.outputs.signed_count }}
+  container_image:
+    description: "The client image used, by digest"
+    value: ${{ steps.sign.outputs.container_image }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
-      shell: bash
+    # No credential reaches this step, so a misconfigured call fails
+    # before any secret is written to disk. The HAVE_* flags say only
+    # whether each secret was supplied.
+    #
+    # Nothing an earlier step can change through GITHUB_ENV or
+    # GITHUB_PATH runs in either step, where the signing step holds the
+    # secret inputs:
+    #   - /bin/bash by absolute path, so a 'bash' earlier on PATH is not
+    #     the shell;
+    #   - -p, so it ignores BASH_ENV, SHELLOPTS and exported functions,
+    #     as lfit/sigul-sign-action 2.0.0 did;
+    #   - BASH_ENV, ENV and the dynamic loader's LD_* variables emptied
+    #     for the shell and anything it starts;
+    #   - PATH reset to the system's directories before python3 is
+    #     found, and sigul_action.py looks up docker, git and gpg there.
+    - name: "Validate inputs"
+      shell: /bin/bash --noprofile --norc -p -eo pipefail {0}
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        BASH_ENV: ""
+        ENV: ""
+        LD_PRELOAD: ""
+        LD_LIBRARY_PATH: ""
+        LD_AUDIT: ""
+        ACTION_PATH: ${{ github.action_path }}
+        SIGN_TYPE: ${{ inputs.sign-type }}
+        SIGN_OBJECT: ${{ inputs.sign-object }}
+        SIGUL_IP: ${{ inputs.sigul-ip }}
+        SIGUL_URI: ${{ inputs.sigul-uri }}
+        SIGUL_KEY_NAME: ${{ inputs.sigul-key-name }}
+        GH_USER: ${{ inputs.gh-user }}
+        CONTAINER: ${{ inputs.container }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
+        CONTAINER_TAG: ${{ inputs.container-tag }}
+        CONTAINER_DIGEST: ${{ inputs.container-digest }}
+        HOSTS_ENTRY: ${{ inputs.sigul-hosts-entry }}
+        PUSH_TAG: ${{ inputs.push-tag }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        EXCLUDE_GLOBS: ${{ inputs.exclude-globs }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+        RETRY_DELAY: ${{ inputs.retry-delay }}
+        HAVE_SIGUL_CONF: ${{ inputs.sigul-conf != '' }}
+        HAVE_SIGUL_PASS: ${{ inputs.sigul-pass != '' }}
+        HAVE_SIGUL_PKI: ${{ inputs.sigul-pki != '' }}
+        HAVE_GH_KEY: ${{ inputs.gh-key != '' }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        set -euo pipefail
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+        export PATH
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "::error::python3 is required on the runner"
           exit 1
         fi
+        python3 -E -s "${ACTION_PATH}/scripts/sigul_action.py" validate
 
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        done
-        {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+    - name: "Sign with Sigul"
+      id: sign
+      shell: /bin/bash --noprofile --norc -p -eo pipefail {0}
+      env:
+        BASH_ENV: ""
+        ENV: ""
+        LD_PRELOAD: ""
+        LD_LIBRARY_PATH: ""
+        LD_AUDIT: ""
+        ACTION_PATH: ${{ github.action_path }}
+        SIGN_TYPE: ${{ inputs.sign-type }}
+        SIGN_OBJECT: ${{ inputs.sign-object }}
+        SIGUL_IP: ${{ inputs.sigul-ip }}
+        SIGUL_URI: ${{ inputs.sigul-uri }}
+        SIGUL_KEY_NAME: ${{ inputs.sigul-key-name }}
+        GH_USER: ${{ inputs.gh-user }}
+        CONTAINER: ${{ inputs.container }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
+        CONTAINER_TAG: ${{ inputs.container-tag }}
+        CONTAINER_DIGEST: ${{ inputs.container-digest }}
+        HOSTS_ENTRY: ${{ inputs.sigul-hosts-entry }}
+        PUSH_TAG: ${{ inputs.push-tag }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        EXCLUDE_GLOBS: ${{ inputs.exclude-globs }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+        RETRY_DELAY: ${{ inputs.retry-delay }}
+        # Handed to a fresh process image through an anonymous in-memory
+        # file by sigul_action.py, so no process keeps them in its
+        # environment; 'exec' replaces this shell, so it does not either.
+        SIGUL_CONF: ${{ inputs.sigul-conf }}
+        SIGUL_PASS: ${{ inputs.sigul-pass }}
+        SIGUL_PKI: ${{ inputs.sigul-pki }}
+        GH_KEY: ${{ inputs.gh-key }}
+      run: |
+        set -euo pipefail
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+        export PATH
+        exec python3 -E -s "${ACTION_PATH}/scripts/sigul_action.py" sign

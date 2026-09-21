@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+"""Tests for scripts/prepare_credentials.py."""
+
+from __future__ import annotations
+
+import base64
+import os
+import shutil
+import subprocess
+import tarfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from action_common import ActionError
+from prepare_credentials import (
+    check_configuration,
+    decode_pki,
+    first_line,
+    kill_gpg_agent,
+    prepare,
+    rewrite_nss_dir,
+)
+
+from tests.helpers import scratch
+
+PASSPHRASE = "bundle-passphrase"
+HEAD = "[client]\nbridge-hostname: bridge.example.org\nbridge-port: 44334\n"
+ONAP_NSS = "\n[nss]\nnss-dir: /home/jenkins/sigul\nnss-password: x\n"
+HAVE_GPG = shutil.which("gpg") is not None
+
+
+def build_bundle(
+    case: unittest.TestCase,
+    layout: str,
+    extra: dict[str, str] | None = None,
+    passphrase: str = PASSPHRASE,
+    armour: bool = True,
+    nss: bool = True,
+) -> str:
+    """Return an encrypted PKI bundle, as sigul-pki carries it."""
+    base = scratch(case)
+    tree = base / "tree"
+    database = tree / layout if layout else tree
+    database.mkdir(parents=True)
+    if nss:
+        for name in ("cert9.db", "key4.db"):
+            _ = (database / name).write_bytes(b"")
+    for name, body in (extra or {}).items():
+        path = tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(body)
+    archive = base / "pki.tar.xz"
+    with tarfile.open(archive, "w:xz") as tar:
+        for child in sorted(tree.iterdir()):
+            tar.add(child, arcname=child.name)
+    home = base / "gpg"
+    home.mkdir(mode=0o700)
+    encrypted = base / "pki.gpg"
+    argv = [
+        "gpg",
+        "--homedir",
+        str(home),
+        "--batch",
+        "--yes",
+        "--quiet",
+        "--pinentry-mode",
+        "loopback",
+        "--passphrase",
+        passphrase,
+        "--symmetric",
+        "--output",
+        str(encrypted),
+    ]
+    if armour:
+        argv.append("--armor")
+    _ = subprocess.run([*argv, str(archive)], check=True, capture_output=True)
+    kill_gpg_agent(home)
+    if armour:
+        return encrypted.read_text()
+    return base64.b64encode(encrypted.read_bytes()).decode()
+
+
+class PureFunctionTests(unittest.TestCase):
+    def test_first_line(self) -> None:
+        self.assertEqual(first_line("secret"), "secret")
+        self.assertEqual(first_line("secret\n"), "secret")
+        self.assertEqual(first_line("secret\nrest"), "secret")
+
+    def test_jenkins_placeholders_are_refused(self) -> None:
+        check_configuration(HEAD)
+        for token in ("$SIGUL_CONFIG_USR", "$SIGUL_CONFIG_PSW"):
+            with self.assertRaises(ActionError) as caught:
+                check_configuration(HEAD + f"user-name: {token}\n")
+            self.assertIn("sigul-config-credentials", str(caught.exception))
+
+    def test_decode_pki(self) -> None:
+        armoured = "-----BEGIN PGP MESSAGE-----\nabc\n-----END PGP MESSAGE-----\n"
+        self.assertEqual(decode_pki(armoured), armoured.encode())
+        self.assertEqual(
+            decode_pki(base64.b64encode(b"\x8c\x0d binary").decode()),
+            b"\x8c\x0d binary",
+        )
+        self.assertEqual(decode_pki("not base64!"), b"not base64!")
+
+    def test_rewrite_nss_dir(self) -> None:
+        new = "nss-dir: /sigul-creds/pki/sigul"
+        self.assertIn(
+            new, rewrite_nss_dir(HEAD + ONAP_NSS, "/sigul-creds/pki/sigul", True)
+        )
+        duplicate = rewrite_nss_dir(
+            "[nss]\nnss-dir: /a\nnss-dir = /b\nx: 1\n", "/n", True
+        )
+        self.assertEqual(duplicate, "[nss]\nnss-dir: /n\nx: 1\n")
+        self.assertEqual(
+            rewrite_nss_dir("[nss]\nx: 1\n", "/n", True), "[nss]\nnss-dir: /n\nx: 1\n"
+        )
+        self.assertEqual(
+            rewrite_nss_dir(HEAD, "/n", True), HEAD + "\n[nss]\nnss-dir: /n\n"
+        )
+        self.assertEqual(rewrite_nss_dir("[nss]\nx: 1\n", "/n", False), "[nss]\nx: 1\n")
+        # Option names are case-insensitive, as ConfigParser reads them;
+        # a mixed-case entry is replaced, not shadowed by a second one.
+        self.assertEqual(
+            rewrite_nss_dir("[nss]\nNSS-Dir = /home/jenkins/sigul\n", "/n", True),
+            "[nss]\nnss-dir: /n\n",
+        )
+        # Only [nss]'s nss-dir is Sigul's: one in another section stays
+        # as written, and the real one is the one rewritten.
+        self.assertEqual(
+            rewrite_nss_dir(
+                "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /old\n", "/n", True
+            ),
+            "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /n\n",
+        )
+        self.assertEqual(
+            rewrite_nss_dir("[client]\nnss-dir: /ignored\n[nss]\nx: 1\n", "/n", True),
+            "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /n\nx: 1\n",
+        )
+        self.assertEqual(rewrite_nss_dir("[nss]", "/n", True), "[nss]\nnss-dir: /n\n")
+
+
+@unittest.skipUnless(HAVE_GPG, "gpg is not installed")
+class PrepareTests(unittest.TestCase):
+    def prepare(self, config: str, password: str, pki: str) -> tuple[Path, str]:
+        base = scratch(self)
+        creds = base / "creds"
+        gnupg = base / "gnupg"
+        try:
+            prepared = prepare(creds, gnupg, "/sigul-creds", config, password, pki)
+        finally:
+            kill_gpg_agent(gnupg)
+        self.assertEqual(prepared.system_config, creds / "client.conf")
+        self.assertEqual(prepared.container_home, "/sigul-creds/pki")
+        return creds, prepared.container_nss_dir
+
+    def nss_dirs(self, text: str) -> list[str]:
+        return [
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("nss-dir")
+        ]
+
+    def test_bundle_layouts(self) -> None:
+        cases = [
+            ("sigul", True, "/sigul-creds/pki/sigul"),
+            ("sigul", False, "/sigul-creds/pki/sigul"),
+            (".sigul", True, "/sigul-creds/pki/.sigul"),
+            ("", True, "/sigul-creds/pki"),
+        ]
+        for layout, armour, expected in cases:
+            with self.subTest(layout=layout, armour=armour):
+                creds, nss_dir = self.prepare(
+                    HEAD + ONAP_NSS,
+                    PASSPHRASE,
+                    build_bundle(self, layout, armour=armour),
+                )
+                self.assertEqual(nss_dir, expected)
+                config = (creds / "client.conf").read_text()
+                self.assertEqual(self.nss_dirs(config), [expected])
+                self.assertIn("bridge.example.org", config)
+
+    def test_passphrase_file_holds_the_first_line(self) -> None:
+        # A secret stored with a trailing newline, or extra lines, still
+        # decrypts a bundle encrypted with its first line, and sigul is
+        # sent exactly that line.
+        creds, _ = self.prepare(
+            HEAD, PASSPHRASE + "\nsecond line", build_bundle(self, "sigul")
+        )
+        self.assertEqual(
+            (creds / "password").read_bytes(), PASSPHRASE.encode() + b"\0\n"
+        )
+        self.assertEqual((creds / "password").stat().st_mode & 0o777, 0o600)
+
+    def test_multi_line_passphrase_bundle_gets_a_specific_error(self) -> None:
+        pki = build_bundle(self, "sigul", passphrase=PASSPHRASE + "\nsecond line")
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(HEAD, PASSPHRASE + "\nsecond line", pki)
+        self.assertIn("only its first line is used", str(caught.exception))
+
+    def test_wrong_passphrase(self) -> None:
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(HEAD, "not-the-passphrase", build_bundle(self, "sigul"))
+        self.assertIn("Could not decrypt sigul-pki", str(caught.exception))
+
+    def test_bundle_without_a_database(self) -> None:
+        pki = build_bundle(self, "notes", extra={"notes/readme.txt": "x"}, nss=False)
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(HEAD, PASSPHRASE, pki)
+        self.assertIn("No NSS database", str(caught.exception))
+        self.assertIn("notes/", str(caught.exception))
+
+    def test_empty_inputs_and_placeholders(self) -> None:
+        pki = build_bundle(self, "sigul")
+        for config, password, bundle in (
+            ("", PASSPHRASE, pki),
+            (HEAD, "", pki),
+            (HEAD, PASSPHRASE, " "),
+            (HEAD, "\nsecond", pki),
+        ):
+            with self.assertRaises(ActionError):
+                _ = self.prepare(config, password, bundle)
+        with self.assertRaises(ActionError):
+            _ = self.prepare(HEAD + "user-name: $SIGUL_CONFIG_USR\n", PASSPHRASE, pki)
+
+    def test_top_level_client_conf_cannot_replace_the_callers(self) -> None:
+        pki = build_bundle(
+            self, "sigul", extra={"client.conf": "[client]\nbridge-port: 9999\n"}
+        )
+        creds, _ = self.prepare(HEAD + ONAP_NSS, PASSPHRASE, pki)
+        config = (creds / "client.conf").read_text()
+        self.assertIn("44334", config)
+        self.assertNotIn("9999", config)
+
+    def test_bundle_user_configuration_is_layered(self) -> None:
+        # sigul_setup_client keeps nss-password in ~/.sigul/client.conf;
+        # with HOME at the bundle root, sigul reads it over sigul-conf.
+        user = "[nss]\nnss-dir: /home/someone/.sigul\nnss-password: p\n"
+        pki = build_bundle(self, ".sigul", extra={".sigul/client.conf": user})
+        creds, nss_dir = self.prepare(HEAD, PASSPHRASE, pki)
+        layered = (creds / "pki" / ".sigul" / "client.conf").read_text()
+        self.assertEqual(self.nss_dirs(layered), [nss_dir])
+        self.assertIn("nss-password: p", layered)
+
+    def test_gpg_leaves_the_users_keyring_alone(self) -> None:
+        home = scratch(self)
+        # patch.dict restores the environment exactly as it was, an
+        # originally unset HOME included.
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            _ = self.prepare(HEAD, PASSPHRASE, build_bundle(self, "sigul"))
+        self.assertFalse((home / ".gnupg").exists())
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

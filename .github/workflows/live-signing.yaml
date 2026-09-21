@@ -1,0 +1,172 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Live signing test, against real Sigul infrastructure.
+#
+# Run by hand from the Actions tab. It signs a throwaway file, or a
+# throwaway tag that is never pushed, with real credentials, which
+# the testing workflow cannot: there, no bridge is ever contacted.
+#
+# 'Dry run' is ticked by default. A dry run does everything short of
+# signing -- it pulls the image, decrypts the credentials, has the
+# Sigul client load its configuration, NSS database and certificate,
+# and resolves the bridge -- and changes nothing anywhere, so it is
+# safe to run against production infrastructure at any time. Untick
+# it to have the server actually sign.
+#
+# CREDENTIALS. Each infrastructure has its own environment, which also
+# carries any protection rules (required reviewers, say):
+#
+#   sigul-legacy   the CentOS 7 bridges, e.g. ONAP's credentials
+#   sigul-modern   the sigul-docker-k8s stack, e.g. OpenSearch's
+#
+# Each environment holds the secrets the action takes, under the names
+# lfit/releng-reusable-workflows uses:
+#
+#   SIGUL_KEY    key name (or set it as a variable instead)
+#   SIGUL_CONF   client.conf, with any Jenkins $SIGUL_CONFIG_* filled in
+#   SIGUL_PASS   key passphrase, which also decrypts SIGUL_PKI
+#   SIGUL_PKI    the encrypted PKI bundle
+#   SIGUL_IP     optional: with SIGUL_URI, a hosts entry for the
+#   SIGUL_URI    bridge, as the legacy action added
+#
+# and optionally a SIGUL_PUBLIC_KEY variable: the signing key's public
+# half, armoured, so a real run's signature is verified as well.
+name: "Live signing 🔏"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      container:
+        description: "Signing infrastructure, and its environment"
+        type: choice
+        options: ["legacy", "modern"]
+        default: "legacy"
+      operation:
+        description: "What to sign"
+        type: choice
+        options: ["sign-data", "sign-git-tag"]
+        default: "sign-data"
+      dry-run:
+        description: "Dry run: check everything, sign nothing"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: "${{ github.workflow }}"
+  cancel-in-progress: false
+
+jobs:
+  live:
+    # yamllint disable-line rule:line-length
+    name: "${{ inputs.dry-run && 'Dry run' || 'Sign' }}: ${{ inputs.operation }} (${{ inputs.container }})"
+    # amd64, which the legacy client image requires.
+    runs-on: ubuntu-24.04
+    environment: "sigul-${{ inputs.container }}"
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # Block mode, with an organisation allow-list release carrying the
+      # Sigul bridges (added by lfreleng-actions/.github#261, in v0.16.7)
+      # alongside the registries the client images come from: this job
+      # holds real signing credentials, so nothing else may be reached.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@ac32415b91e0b6db1166bc451024c472cdbcbd3d'  # v0.16.8
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Make something to sign"
+        id: target
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${OPERATION}" = "sign-data" ]; then
+            mkdir -p live-signing
+            printf 'sigul-sign-action live test\nrun %s\ncommit %s\n' \
+              "${RUN_ID}" "${SHA}" > live-signing/payload.txt
+            echo "object=live-signing/payload.txt" >> "$GITHUB_OUTPUT"
+          else
+            # A local tag only: push-tag is off below, so nothing
+            # leaves the runner.
+            tag="sigul-live-test-${RUN_ID}"
+            git -c user.name="sigul-sign-action" \
+              -c user.email="releng@linuxfoundation.org" \
+              -c tag.gpgSign=false \
+              tag -a "${tag}" -m "Live signing test, run ${RUN_ID}"
+            echo "object=${tag}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Sign with Sigul"
+        id: sign
+        uses: $/
+        with:
+          container: ${{ inputs.container }}
+          sign-type: ${{ inputs.operation }}
+          sign-object: ${{ steps.target.outputs.object }}
+          push-tag: "false"
+          dry-run: ${{ inputs.dry-run }}
+          sigul-key-name: ${{ secrets.SIGUL_KEY || vars.SIGUL_KEY }}
+          sigul-conf: ${{ secrets.SIGUL_CONF }}
+          sigul-pass: ${{ secrets.SIGUL_PASS }}
+          sigul-pki: ${{ secrets.SIGUL_PKI }}
+          sigul-ip: ${{ secrets.SIGUL_IP }}
+          sigul-uri: ${{ secrets.SIGUL_URI }}
+
+      - name: "Verify the signature"
+        if: ${{ !inputs.dry-run }}
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+          OBJECT: ${{ steps.target.outputs.object }}
+          PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "${OPERATION}" = "sign-data" ]; then
+            {
+              echo "### Signature"
+              echo '```text'
+              cat "${OBJECT}.asc"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            git cat-file tag "refs/tags/${OBJECT}" |
+              grep -q "BEGIN PGP SIGNATURE" ||
+              { echo "::error::the tag carries no signature"; exit 1; }
+          fi
+          if [ -z "${PUBLIC_KEY}" ]; then
+            echo "::notice::No SIGUL_PUBLIC_KEY variable; not verified"
+            exit 0
+          fi
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d /tmp/verify.XXXXXX)"
+          printf '%s\n' "${PUBLIC_KEY}" | gpg --batch --quiet --import
+          if [ "${OPERATION}" = "sign-data" ]; then
+            gpg --batch --verify "${OBJECT}.asc" "${OBJECT}"
+          else
+            git verify-tag "${OBJECT}"
+          fi
+          echo "Signature verified against SIGUL_PUBLIC_KEY ✅" |
+            tee -a "$GITHUB_STEP_SUMMARY"

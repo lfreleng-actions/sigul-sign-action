@@ -1,8 +1,34 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Action test/validation workflow
+# Action test/validation workflow.
+#
+# CI has no Sigul server: the credentials are production signing
+# material and the bridges are real infrastructure. So the tests split
+# into layers, none of which contacts a bridge:
+#
+#   unit        The runner-side Python, under the oldest and newest
+#               Python the action supports.
+#   validation  The action itself, rejecting bad inputs before any
+#               credential is written.
+#   e2e         The action itself, end to end, once per client image
+#               and architecture, with throwaway credentials made by
+#               each image's own certutil:
+#                 - dry runs in the REAL pinned images, whose own sigul
+#                   modules load the configuration, open the NSS
+#                   database and find the certificate;
+#                 - real signing runs in a test image -- the pinned
+#                   image with a mock sigul on PATH -- served from a
+#                   local registry and named as a bespoke image, which
+#                   exercises signatures, ownership, retries and the
+#                   tag write-back;
+#                 - credentials that must be refused.
+#
+# The pinned images are read from containers/*/Dockerfile, so a
+# Dependabot bump runs every layer against the new image before it can
+# reach a caller. What no test can cover is a bridge and server
+# accepting the result; the live-signing workflow does that.
 name: "Test GitHub Action 🧪"
 
 # yamllint disable-line rule:truthy
@@ -20,23 +46,24 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
-    runs-on: ubuntu-latest
+  unit:
+    name: "Unit tests (${{ matrix.runner }})"
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04 ships Python 3.10.12, the oldest the action supports;
+        # 24.04 ships 3.12.
+        runner: ["ubuntu-22.04", "ubuntu-24.04"]
     steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
           config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -46,45 +73,489 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Run the unit tests"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          python3 --version
+          python3 -m unittest discover -s tests -t . -v
 
-      - name: "Running local action: ${{ github.repository }}"
+  # Every call fails during validation, before any credential is
+  # written; scripts/action_inputs.py's unit tests check each message.
+  validation:
+    name: "Rejects: ${{ matrix.case }}"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: "unknown sign-type"
+            sign_type: "sign-everything"
+          - case: "missing file"
+            sign_object: "does-not-exist.txt"
+          - case: "file outside the workspace"
+            sign_object: "/etc/hostname"
+          - case: "container and container-image both"
+            container: "legacy"
+            container_image: "docker.io/lfreleng/sigul"
+            container_tag: "0.2.0"
+          - case: "unknown container"
+            container: "k8s"
+          - case: "bespoke image without tag or digest"
+            container_image: "docker.io/lfreleng/sigul"
+          - case: "malformed digest"
+            container_image: "docker.io/lfreleng/sigul"
+            container_digest: "sha256:abc"
+          - case: "hosts entry requested without sigul-ip"
+            hosts_entry: "true"
+          - case: "tag push without gh-key"
+            sign_type: "sign-git-tag"
+            sign_object: "v1.0.0"
+          - case: "malformed tag name"
+            sign_type: "sign-git-tag"
+            sign_object: "HEAD:refs/heads/main"
+            gh_key: "not-a-token"
+          - case: "non-integer max-retries"
+            max_retries: "many"
+          - case: "dry-run not a boolean"
+            dry_run: "yes"
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "${{ matrix.case }} (should fail)"
+        id: invalid
+        continue-on-error: true
         uses: $/
         with:
-          input: "test input 💬"
+          sign-type: "${{ matrix.sign_type || 'sign-data' }}"
+          sign-object: "${{ matrix.sign_object || 'README.md' }}"
+          container: "${{ matrix.container }}"
+          container-image: "${{ matrix.container_image }}"
+          container-tag: "${{ matrix.container_tag }}"
+          container-digest: "${{ matrix.container_digest }}"
+          sigul-hosts-entry: "${{ matrix.hosts_entry || 'auto' }}"
+          max-retries: "${{ matrix.max_retries || '5' }}"
+          dry-run: "${{ matrix.dry_run || 'true' }}"
+          gh-key: "${{ matrix.gh_key }}"
+          sigul-key-name: "not-a-real-key"
+          sigul-conf: "not-a-real-config"
+          sigul-pass: "not-a-real-passphrase"
+          sigul-pki: "not-real-pki-material"
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Assert it failed"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          CASE: "${{ matrix.case }}"
+          OUTCOME: "${{ steps.invalid.outcome }}"
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [ "${OUTCOME}" = "success" ]; then
+            printf 'ERROR: accepted invalid input: %s ❌\n' "${CASE}"
+            exit 1
+          fi
+          printf 'Rejected: %s ✅\n' "${CASE}"
 
+  e2e:
+    name: "End to end: ${{ matrix.container }} (${{ matrix.platform }})"
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The legacy layout: ONAP's 'sigul/' bundle, a DBM database
+          # as the legacy bundles hold, the NSS password in sigul-conf,
+          # and the hosts entry the legacy container adds by default.
+          - container: "legacy"
+            platform: "linux/amd64"
+            runner: "ubuntu-24.04"
+            layout: "sigul"
+            db_type: "dbm"
+            hosts_entry: "auto"
+            # sigul-conf holds the NSS password, so a wrong one fails.
+            wrong_nss_password: "failure"
+          # The sigul_setup_client layout: '.sigul/' holding the
+          # database and a client.conf with the NSS password, which
+          # overrides sigul-conf; the hosts entry by request.
+          - container: "modern"
+            platform: "linux/amd64"
+            runner: "ubuntu-24.04"
+            layout: ".sigul"
+            db_type: "sql"
+            hosts_entry: "true"
+            # The bundle's own client.conf overrides a wrong password
+            # in sigul-conf, as it did with the legacy action.
+            wrong_nss_password: "success"
+          - container: "modern"
+            platform: "linux/arm64"
+            runner: "ubuntu-24.04-arm"
+            layout: ".sigul"
+            db_type: "sql"
+            hosts_entry: "true"
+            wrong_nss_password: "success"
+    services:
+      # Serves the mock-sigul test image, so the action pulls it by
+      # digest exactly as it would a bespoke image from any registry.
+      registry:
+        # yamllint disable-line rule:line-length
+        image: docker.io/library/registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+        ports:
+          - "5000:5000"
+    env:
+      # Any address will do: the bridge is resolved, never contacted.
+      BRIDGE_ADDRESS: "192.0.2.10"
+      BRIDGE_NAME: "sigul-bridge.test"
+    steps:
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          invalid_input: "Some garbage"
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: 'Harden runner (audit)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          # Pulling the client images needs registry egress that is
+          # impractical to enumerate in the allow-list; audit instead.
+          egress-policy: 'audit'
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Make test credentials and the mock image"
+        id: setup
+        shell: bash
+        env:
+          CONTAINER: ${{ matrix.container }}
+          PLATFORM: ${{ matrix.platform }}
+          LAYOUT: ${{ matrix.layout }}
+          DB_TYPE: ${{ matrix.db_type }}
+        run: |
+          set -euo pipefail
+          image="$(python3 scripts/sigul_action.py pin "${CONTAINER}")"
+          creds="${RUNNER_TEMP}/creds"
+          tests/make-test-credentials.sh "${image}" "${PLATFORM}" \
+            "${creds}" "${LAYOUT}" "${DB_TYPE}"
+          mock="$(tests/build-mock-image.sh "${image}" "${PLATFORM}" \
+            localhost:5000 "sigul-mock-${CONTAINER}")"
+          delimiter="EOF_$(openssl rand -hex 16)"
+          {
+            echo "pin=${image}"
+            echo "mock_image=${mock%%:mock@*}"
+            echo "mock_digest=${mock##*@}"
+            echo "conf<<${delimiter}"
+            cat "${creds}/client.conf"
+            echo "${delimiter}"
+            echo "pki<<${delimiter}"
+            cat "${creds}/pki.asc"
+            echo "${delimiter}"
+            echo "passphrase=$(cat "${creds}/passphrase")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Make the workspace fixtures"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          set -euo pipefail
+          mkdir -p e2e/dist/nested
+          echo a > e2e/dist/a.jar
+          echo b > e2e/dist/b.pom
+          echo c > e2e/dist/nested/c.jar
+          echo m > e2e/dist/maven-metadata.xml
+          echo "stale signature" > e2e/dist/a.jar.asc
+          # A file whose first signing attempt the mock fails, so the
+          # real run exercises the retry path.
+          echo "MOCK-FAIL-ONCE" > e2e/dist/retry.jar
+          git -c user.name=Test -c user.email=test@example.org \
+            -c tag.gpgSign=false tag -a sigul-e2e -m "test tag, never pushed"
+          git rev-parse refs/tags/sigul-e2e > "${RUNNER_TEMP}/tag-before"
+          find .git/objects -type f | sort > "${RUNNER_TEMP}/objects-before"
+
+      # An earlier step can set BASH_ENV for every later step, and the
+      # default 'bash' shell runs that file first; it can also prepend a
+      # directory to PATH, so that its own 'bash', 'python3', 'docker',
+      # 'git' or 'gpg' runs instead of the system's. Plant both, each
+      # recording any secret input it can see before passing through to
+      # the real tool: the action must never run them with those inputs.
+      # The test's own steps carry no such variable, so only the action
+      # could trip them.
+      - name: "Plant a BASH_ENV startup file and impostor tools"
+        shell: bash
+        run: |
+          set -euo pipefail
+          planted="${RUNNER_TEMP}/planted-bash-env.sh"
+          leak="${RUNNER_TEMP}/bash-env-leak"
+          # Single quotes on purpose: the planted code expands these when
+          # it runs, inside whichever process starts it.
+          # shellcheck disable=SC2016
+          check='if [ -n "${SIGUL_PASS:-}${SIGUL_PKI:-}${SIGUL_CONF:-}" ]; then'
+          printf '%s\n' "${check}" "  echo \"BASH_ENV\" >> '${leak}'" 'fi' \
+            > "${planted}"
+          echo "BASH_ENV=${planted}" >> "$GITHUB_ENV"
+          impostors="${RUNNER_TEMP}/planted-bin"
+          mkdir -p "${impostors}"
+          for tool in bash python3 docker git gpg gpgconf; do
+            real="$(command -v "${tool}")"
+            printf '%s\n' '#!/bin/sh' "${check}" \
+              "  echo \"${tool}\" >> '${leak}'" 'fi' \
+              "exec '${real}' \"\$@\"" > "${impostors}/${tool}"
+            chmod +x "${impostors}/${tool}"
+          done
+          echo "${impostors}" >> "$GITHUB_PATH"
+
+      # --- Dry runs in the real pinned image ---
+
+      - name: "Dry run: sign-data"
+        id: dry_data
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Dry run: sign-git-tag"
+        id: dry_tag
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-type: "sign-git-tag"
+          sign-object: "sigul-e2e"
+          gh-key: "not-a-real-token"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Assert the dry runs changed nothing"
+        shell: bash
+        env:
+          PIN: ${{ steps.setup.outputs.pin }}
+          DATA_IMAGE: ${{ steps.dry_data.outputs.container_image }}
+          DATA_COUNT: ${{ steps.dry_data.outputs.signed_count }}
+        run: |
+          set -euo pipefail
+          fail() { echo "ERROR: $* ❌"; exit 1; }
+          [ "${DATA_IMAGE}" = "${PIN}" ] || fail "image ${DATA_IMAGE}"
+          [ "${DATA_COUNT}" = "0" ] || fail "dry run reported ${DATA_COUNT}"
+          [ "$(cat e2e/dist/a.jar.asc)" = "stale signature" ] ||
+            fail "a dry run touched an existing signature"
+          [ "$(find e2e -name '*.asc' | wc -l)" = "1" ] ||
+            fail "a dry run wrote a signature"
+          [ "$(git rev-parse refs/tags/sigul-e2e)" = \
+            "$(cat "${RUNNER_TEMP}/tag-before")" ] ||
+            fail "a dry run moved the tag"
+          find .git/objects -type f | sort |
+            cmp -s - "${RUNNER_TEMP}/objects-before" ||
+            fail "a dry run wrote to the workspace's object store"
+          echo "Dry runs passed and changed nothing ✅"
+
+      # --- Real signing runs, with the mock client image ---
+
+      - name: "Sign data with the mock client"
+        id: sign_data
+        uses: $/
+        with:
+          container-image: ${{ steps.setup.outputs.mock_image }}
+          container-tag: "mock"
+          container-digest: ${{ steps.setup.outputs.mock_digest }}
+          sign-object: |
+            e2e/dist
+
+            e2e/dist/nested/*.jar
+          retry-delay: "0"
+          sigul-hosts-entry: "true"
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          # A second line must not reach sigul: the mock checks it
+          # receives exactly the first.
+          sigul-pass: |
+            ${{ steps.setup.outputs.passphrase }}
+            not part of the passphrase
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Sign the tag with the mock client"
+        uses: $/
+        with:
+          container-image: ${{ steps.setup.outputs.mock_image }}
+          container-digest: ${{ steps.setup.outputs.mock_digest }}
+          sign-type: "sign-git-tag"
+          sign-object: "sigul-e2e"
+          push-tag: "false"
+          retry-delay: "0"
+          sigul-hosts-entry: "true"
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Assert the signatures and the signed tag"
+        shell: bash
+        env:
+          COUNT: ${{ steps.sign_data.outputs.signed_count }}
+        run: |
+          set -euo pipefail
+          fail() { echo "ERROR: $* ❌"; exit 1; }
+          # a.jar, b.pom, retry.jar and nested/c.jar; maven-metadata.xml
+          # and the stale signature are excluded.
+          [ "${COUNT}" = "4" ] || fail "signed_count is ${COUNT}, not 4"
+          for file in a.jar b.pom retry.jar nested/c.jar; do
+            asc="e2e/dist/${file}.asc"
+            [ -s "${asc}" ] || fail "no signature for ${file}"
+            grep -q "BEGIN PGP SIGNATURE" "${asc}" ||
+              fail "${asc} is not a signature"
+            [ "$(stat -c '%a %U' "${asc}")" = "644 $(id -un)" ] ||
+              fail "${asc} is $(stat -c '%a %U' "${asc}")"
+          done
+          [ ! -e e2e/dist/maven-metadata.xml.asc ] ||
+            fail "an excluded file was signed"
+          [ -z "$(find e2e -name '*~')" ] || fail "backup files left"
+          git cat-file tag refs/tags/sigul-e2e |
+            grep -q "BEGIN PGP SIGNATURE" || fail "the tag is not signed"
+          [ "$(git rev-parse refs/tags/sigul-e2e)" != \
+            "$(cat "${RUNNER_TEMP}/tag-before")" ] ||
+            fail "the tag was not moved"
+          git fsck --no-dangling
+          [ -z "$(find "${RUNNER_TEMP}" -maxdepth 1 -name 'sigul.*')" ] ||
+            fail "credentials were left in RUNNER_TEMP"
+          [ -z "$(find /tmp -maxdepth 1 -name 'sigul-gpg.*')" ] ||
+            fail "a gpg home was left in /tmp"
+          echo "Signatures, ownership and the signed tag are correct ✅"
+
+      # --- Credentials that must be refused ---
+
+      - name: "Refuse a wrong passphrase (should fail)"
+        id: wrong_passphrase
+        continue-on-error: true
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: "not-the-passphrase"
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Prepare credential variants"
+        id: variants
+        shell: bash
+        env:
+          CONF: ${{ steps.setup.outputs.conf }}
+        run: |
+          set -euo pipefail
+          delimiter="EOF_$(openssl rand -hex 16)"
+          {
+            # As copied from Jenkins' managed-files page, unsubstituted:
+            # the placeholder is literal, so the single quotes are meant.
+            echo "placeholder<<${delimiter}"
+            # shellcheck disable=SC2016
+            printf '%s\n' "${CONF}" |
+              sed 's/^user-name: .*/user-name: $SIGUL_CONFIG_USR/'
+            echo "${delimiter}"
+            echo "wrong_nss<<${delimiter}"
+            printf '%s\n' "${CONF}" | grep -v '^nss-password'
+            echo "nss-password: not-the-nss-password"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Refuse Jenkins placeholders (should fail)"
+        id: placeholder
+        continue-on-error: true
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.variants.outputs.placeholder }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Wrong NSS password in sigul-conf"
+        id: wrong_nss
+        continue-on-error: true
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.variants.outputs.wrong_nss }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Assert the refusals"
+        shell: bash
+        env:
+          WRONG_PASSPHRASE: ${{ steps.wrong_passphrase.outcome }}
+          PLACEHOLDER: ${{ steps.placeholder.outcome }}
+          WRONG_NSS: ${{ steps.wrong_nss.outcome }}
+          WRONG_NSS_EXPECTED: ${{ matrix.wrong_nss_password }}
+        run: |
+          set -euo pipefail
+          fail() { echo "ERROR: $* ❌"; exit 1; }
+          [ "${WRONG_PASSPHRASE}" = "failure" ] ||
+            fail "a wrong passphrase was accepted"
+          [ "${PLACEHOLDER}" = "failure" ] ||
+            fail "Jenkins placeholders were accepted"
+          [ "${WRONG_NSS}" = "${WRONG_NSS_EXPECTED}" ] ||
+            fail "wrong NSS password: ${WRONG_NSS} (${WRONG_NSS_EXPECTED})"
+          # Last, so it covers every call of the action above.
+          if [ -e "${RUNNER_TEMP}/bash-env-leak" ]; then
+            fail "planted code ran with the secret inputs:" \
+              "$(sort -u "${RUNNER_TEMP}/bash-env-leak" | tr '\n' ' ')"
+          fi
+          echo "Bad credentials refused; layering as expected ✅"
