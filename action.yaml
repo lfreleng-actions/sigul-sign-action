@@ -1,53 +1,425 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# Sign artefacts or a git tag using a Sigul signing server.
+#
+# Sigul keeps the private key on a server the client never sees: the
+# client sends data to a bridge, the bridge relays to the server, and a
+# detached signature comes back. Nothing here holds a signing key.
+#
+# TWO BACKENDS, ONE INTERFACE
+#
+# The Linux Foundation runs two generations of Sigul infrastructure:
+#
+#   legacy  sigul 0.207 on CentOS 7, deployed and serving production
+#           releases today. Reached over the public internet, TLS 1.2
+#           only, authenticated by an NSS client certificate.
+#
+#   k8s     sigul 1.4, containerised, deployed via the Helm charts in
+#           lfreleng-actions/sigul-docker-k8s. Not yet stood up.
+#
+# The protocol differs between the two, so the backend is an explicit
+# input rather than something detected at runtime. A signing step that
+# silently picks the wrong backend is a bad failure mode: it either
+# fails confusingly, or succeeds against infrastructure the caller did
+# not intend to use.
+#
+# WHY A CONTAINER
+#
+# Sigul 0.x needs Python 2 and an NSS stack that no current runner
+# image ships. The legacy backend therefore runs the published
+# lfreleng/sigul image, pinned by digest. Unlike global-jjb, this
+# action does NOT build an image at sign time, and does NOT fetch its
+# own scripts from a branch at runtime: global-jjb's sigul-sign-dir.sh
+# wgets sigul-sign.sh, sigul-sign-git-tag.sh and a Dockerfile from
+# releng-global-jjb master on every run, so pinning global-jjb does not
+# pin the code that signs releases. The scripts live in this repository
+# and are mounted into the container.
+#
+# CREDENTIALS
+#
+# Four inputs. Three are secrets -- sigul-config, sigul-password and
+# sigul-pki -- conventionally sourced from 1Password by the caller.
+# sigul-key names a key rather than containing one, so it is not
+# sensitive and a repository variable suits it.
+#
+# The three secrets are written to a mode-0700 temporary directory and
+# removed by a shell trap that fires on every exit path including
+# failure. The container receives their PATHS rather than their
+# values, so no secret appears in the process table or in
+# `docker inspect`; sigul-key is passed by value, being a name.
+#
+# That directory mounts read-WRITE, not read-only: NSS creates lock
+# files in its certificate database, and a read-only mount fails with
+# a certificate error that reads like a bad credential.
+name: "sigul-sign-action"
+description: "Sign artefacts or a git tag using a Sigul signing server"
 
 inputs:
-  input:
-    description: "Description of input"
+  mode:
+    description: >
+      What to sign: 'directory' signs every file beneath a path,
+      'file' signs one file, 'git-tag' signs an existing annotated tag.
+    required: true
+  path:
+    description: >
+      Directory or file to sign. Required for mode 'directory' and
+      mode 'file'; ignored for 'git-tag'.
+    required: false
+    default: ""
+  git-tag:
+    description: >
+      Name of an existing annotated tag. Required for mode 'git-tag'.
+      The tag is signed in place and NOT pushed; pushing is the
+      release lane's business and needs a different privilege.
+    required: false
+    default: ""
+  repository-path:
+    description: "Repository directory for mode 'git-tag'"
+    required: false
+    default: "."
+
+  # --- Backend selection ---
+  backend:
+    description: >
+      Which Sigul infrastructure to sign against: 'legacy' (sigul
+      0.207, currently deployed) or 'k8s' (sigul 1.4, the containerised
+      stack from sigul-docker-k8s). Defaults to 'legacy' because that
+      is what serves production today.
+    required: false
+    default: "legacy"
+
+  # --- Credentials ---
+  sigul-key:
+    description: "Name of the signing key held on the Sigul server"
+    required: true
+  sigul-config:
+    description: "Body of the Sigul client configuration (client.conf)"
+    required: true
+  sigul-password:
+    description: >
+      Passphrase for the signing key. Also decrypts sigul-pki.
+    required: true
+  sigul-pki:
+    description: >
+      Client PKI material: a tar.xz of the .sigul/ NSS database,
+      GPG-encrypted with sigul-password. Accepted raw or base64
+      encoded; the encoding is detected.
     required: true
 
+  # --- Behaviour ---
+  exclude-globs:
+    description: >
+      Newline-separated find(1) -name patterns to skip, for mode
+      'directory'. The default reproduces global-jjb's exclusion list
+      exactly. Note it does NOT exclude *.sha256 or *.sha512:
+      global-jjb signs those, and omitting them here would silently
+      change what a migrated release publishes. Set to an empty
+      string to sign every file.
+    required: false
+    default: |
+      *.asc
+      *.md5
+      *.sha1
+      _maven.repositories
+      _remote.repositories
+      *.lastUpdated
+      maven-metadata.xml
+      maven-metadata-local.xml
+  max-retries:
+    description: >
+      Attempts per signing operation. The bridge is reached over the
+      network, so a transient failure should not fail a release.
+    required: false
+    default: "5"
+  retry-delay:
+    description: "Seconds between attempts"
+    required: false
+    default: "15"
+
+  # --- Images ---
+  legacy-image:
+    description: >
+      Sigul client image for the legacy backend, pinned by digest.
+      This is the image global-jjb builds from and which is proven
+      against the deployed 0.207 infrastructure.
+    required: false
+    # yamllint disable-line rule:line-length
+    default: "lfreleng/sigul:0.1.0@sha256:e8b958a6e5ba3ee6334c0244e9fbe0881248133e97bc77236a176baa5d219cbd"
+  k8s-image:
+    description: "Sigul client image for the k8s backend"
+    required: false
+    default: "ghcr.io/lfreleng-actions/sigul-docker-k8s/client:latest"
+
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  signed_count:
+    description: >
+      Number of files signed. Always 1 for mode 'file', and 0 for
+      mode 'git-tag', which signs a tag object rather than files.
+    value: ${{ steps.sign.outputs.signed_count }}
+  backend:
+    description: "Backend actually used"
+    value: ${{ steps.validate.outputs.backend }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    # Validation is a separate step and touches no credential, so a
+    # misconfigured call fails before any secret is written to disk.
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        MODE: ${{ inputs.mode }}
+        PATH_INPUT: ${{ inputs.path }}
+        GIT_TAG: ${{ inputs['git-tag'] }}
+        REPOSITORY_PATH: ${{ inputs['repository-path'] }}
+        BACKEND: ${{ inputs.backend }}
+        MAX_RETRIES: ${{ inputs['max-retries'] }}
+        RETRY_DELAY: ${{ inputs['retry-delay'] }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
-          exit 1
-        fi
+        set -euo pipefail
+        fail() { echo "::error::$*"; exit 1; }
 
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        case "${MODE}" in
+          directory|file)
+            [ -n "${PATH_INPUT}" ] || \
+              fail "mode '${MODE}' requires the 'path' input"
+            [ -e "${PATH_INPUT}" ] || \
+              fail "path does not exist: ${PATH_INPUT}"
+            if [ "${MODE}" = "directory" ] && [ ! -d "${PATH_INPUT}" ]; then
+              fail "mode 'directory' needs a directory: ${PATH_INPUT}"
+            fi
+            if [ "${MODE}" = "file" ] && [ ! -f "${PATH_INPUT}" ]; then
+              fail "mode 'file' needs a regular file: ${PATH_INPUT}"
+            fi
+            ;;
+          git-tag)
+            [ -n "${GIT_TAG}" ] || \
+              fail "mode 'git-tag' requires the 'git-tag' input"
+            # Checked here, before any credential is written. Left to
+            # the container, a missing path would fail only after
+            # materialising secrets and pulling an image, and a path
+            # that exists but is not a repository would be reported
+            # as a missing tag.
+            [ -n "${REPOSITORY_PATH}" ] || \
+              fail "mode 'git-tag' requires a non-empty 'repository-path'"
+            [ -d "${REPOSITORY_PATH}" ] || \
+              fail "repository-path is not a directory: ${REPOSITORY_PATH}"
+            # Resolve to the work tree ROOT and publish it for the
+            # signing step. 'rev-parse --git-dir' alone is not enough:
+            # git searches upwards, so a subdirectory passes the check
+            # while the mount would carry no .git at all, and tag
+            # signing would then report a missing tag rather than a
+            # bad path.
+            repo_root="$(git -C "${REPOSITORY_PATH}" rev-parse \
+              --show-toplevel 2>/dev/null)" || \
+              fail "repository-path is not a git work tree: ${REPOSITORY_PATH}"
+            [ -n "${repo_root}" ] || \
+              fail "repository-path has no work tree;" \
+                "a bare repository cannot be used here:" \
+                "${REPOSITORY_PATH}"
+            # In a normal checkout .git is a directory. In a linked
+            # worktree or a submodule it is a FILE holding a gitdir
+            # pointer to metadata elsewhere on the host. Only the work
+            # tree root is mounted, so that pointer would dangle and
+            # git inside the container would report no repository at
+            # all. Rejected rather than mounting the pointed-at path
+            # too, which would expose more of the host than the caller
+            # asked for.
+            [ -d "${repo_root}/.git" ] || \
+              fail "repository-path is a linked worktree or submodule;" \
+                "its .git points outside the work tree, which cannot be" \
+                "mounted. Use a standard checkout: ${REPOSITORY_PATH}"
+            if [ "$(cd "${REPOSITORY_PATH}" && pwd)" != "${repo_root}" ]; then
+              echo "INFO: resolved repository-path to its work tree root:" \
+                "${repo_root}"
+            fi
+            echo "repo_root=${repo_root}" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            fail "mode must be 'directory', 'file' or 'git-tag' (got '${MODE}')"
+            ;;
+        esac
+
+        case "${BACKEND}" in
+          legacy)
+            # The published lfreleng/sigul image installs an
+            # x86_64-only RPM and is released single-platform, so an
+            # arm64 runner cannot run it. Fail here with the reason
+            # rather than letting docker report an exec format error.
+            arch="$(uname -m)"
+            case "${arch}" in
+              x86_64|amd64) ;;
+              *)
+                fail "backend 'legacy' needs an x86_64 runner;" \
+                  "the published Sigul client image is amd64-only" \
+                  "(this runner is ${arch})"
+                ;;
+            esac
+            ;;
+          k8s)
+            # Named and validated so callers can write workflows
+            # against it, but refused until the infrastructure exists.
+            # Silently falling back to legacy would sign against the
+            # wrong server; failing late, inside the container, would
+            # surface as a confusing connection error.
+            echo "::error::backend 'k8s' is not yet available. The deployed" \
+              "infrastructure runs sigul 0.207 and the k8s client speaks 1.4." \
+              "Use backend 'legacy' until the migration completes."
+            exit 1
+            ;;
+          *)
+            fail "backend must be 'legacy' or 'k8s' (got '${BACKEND}')"
+            ;;
+        esac
+
+        retries_pair="max-retries:${MAX_RETRIES}"
+        delay_pair="retry-delay:${RETRY_DELAY}"
+        for pair in "${retries_pair}" "${delay_pair}"; do
+          name="${pair%%:*}"; value="${pair#*:}"
+          [[ "${value}" =~ ^[0-9]+$ ]] || \
+            fail "${name} must be a non-negative integer (got '${value}')"
         done
-        {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+        [ "${MAX_RETRIES}" -ge 1 ] || fail "max-retries must be at least 1"
+
+        echo "backend=${BACKEND}" >> "$GITHUB_OUTPUT"
+        echo "Inputs validated: mode=${MODE} backend=${BACKEND} ✅"
+
+    - name: "Sign with Sigul"
+      id: sign
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        PATH_INPUT: ${{ inputs.path }}
+        GIT_TAG: ${{ inputs['git-tag'] }}
+        REPOSITORY_PATH: ${{ inputs['repository-path'] }}
+        REPO_ROOT: ${{ steps.validate.outputs.repo_root }}
+        BACKEND: ${{ inputs.backend }}
+        SIGUL_KEY: ${{ inputs['sigul-key'] }}
+        SIGUL_CONFIG_BODY: ${{ inputs['sigul-config'] }}
+        SIGUL_PASSWORD_VALUE: ${{ inputs['sigul-password'] }}
+        SIGUL_PKI_VALUE: ${{ inputs['sigul-pki'] }}
+        EXCLUDE_GLOBS: ${{ inputs['exclude-globs'] }}
+        MAX_RETRIES: ${{ inputs['max-retries'] }}
+        RETRY_DELAY: ${{ inputs['retry-delay'] }}
+        LEGACY_IMAGE: ${{ inputs['legacy-image'] }}
+        K8S_IMAGE: ${{ inputs['k8s-image'] }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        # Everything credential-bearing lives under one directory, and
+        # the trap removes it on every exit path. A composite action
+        # cannot declare a post step, so cleanup has to be inside the
+        # step that created the material -- doing it in a later step
+        # would leave the credentials on disk whenever signing failed.
+        creds="$(mktemp -d "${RUNNER_TEMP:-/tmp}/sigul.XXXXXXXX")"
+        cleanup() {
+          # shred where available; the runner is ephemeral, but this
+          # costs nothing and the directory is small.
+          find "${creds}" -type f -exec shred -u {} + 2>/dev/null || true
+          rm -rf "${creds}"
+        }
+        trap cleanup EXIT
+
+        c_creds="/sigul-creds"
+
+        # Credential materialisation runs in Python 3 on the runner:
+        # it validates the inputs, writes the config and passphrase,
+        # decodes/decrypts/unpacks the PKI bundle, and rewrites
+        # nss-dir to the path the container will see. Python rather
+        # than shell because the work is archive handling and text
+        # rewriting, where shell quoting and glob semantics are a
+        # liability, and because it is then testable on its own.
+        CREDS_DIR="${creds}" \
+        CONTAINER_CREDS="${c_creds}" \
+        SIGUL_CONFIG_BODY="${SIGUL_CONFIG_BODY}" \
+        SIGUL_PASSWORD_VALUE="${SIGUL_PASSWORD_VALUE}" \
+        SIGUL_PKI_VALUE="${SIGUL_PKI_VALUE}" \
+        SIGUL_KEY="${SIGUL_KEY}" \
+          python3 "${ACTION_PATH}/scripts/prepare_credentials.py"
+
+        # Backend selects both the image and the interpreter inside
+        # it. The legacy CentOS 7 image ships Python 2.7 and no
+        # python3; the containerised 1.4 stack is Fedora-based and
+        # ships python3 with no bare 'python'. The entrypoints are
+        # written to run under both, so only the command name differs.
+        case "${BACKEND}" in
+          legacy) image="${LEGACY_IMAGE}"; interp="python" ;;
+          k8s)    image="${K8S_IMAGE}";    interp="python3" ;;
+        esac
+        echo "INFO: backend=${BACKEND} image=${image} interpreter=${interp}"
+        docker pull --quiet "${image}"
+
+        count_file="${creds}/count"
+
+        # The credential directory mounts read-WRITE, not read-only:
+        # NSS creates lock files in its database directory, and a
+        # read-only mount makes the client fail with a certificate
+        # error that looks like bad credentials. The directory is a
+        # per-run temp dir that the trap destroys, so the exposure is
+        # bounded. c_creds is set above, before the bundle unpacks.
+        scripts_src="${ACTION_PATH}/scripts"
+        scripts_mount="type=bind,source=${scripts_src}"
+        scripts_mount="${scripts_mount},target=/sigul-scripts,readonly"
+
+        # Run as the runner's own user. The pinned image declares no
+        # USER, so it would otherwise run as root and every .asc file
+        # and rewritten git object would come out root-owned --
+        # breaking later non-root steps such as artefact upload or
+        # publishing. global-jjb papers over this with a
+        # 'sudo chown -R jenkins:jenkins' afterwards; a GitHub runner
+        # has no such step, so get the ownership right at the source.
+        run_user="$(id -u):$(id -g)"
+
+        docker_common=(
+          docker run --rm
+          -u "${run_user}"
+          --mount "type=bind,source=${creds},target=${c_creds}"
+          -e "SIGUL_CONFIG=${c_creds}/client.conf"
+          -e "SIGUL_PASSWORD=${c_creds}/password"
+          -e "SIGUL_KEY=${SIGUL_KEY}"
+          -e "MAX_RETRIES=${MAX_RETRIES}"
+          -e "RETRY_DELAY=${RETRY_DELAY}"
+          # client.conf conventionally points nss-dir at ~/.sigul, so
+          # HOME must be where the unpacked bundle put it. The creds
+          # directory is runner-owned, so it stays writable under the
+          # unprivileged user above.
+          -e "HOME=${c_creds}"
+          --mount "${scripts_mount}"
+        )
+
+        if [ "${MODE}" = "git-tag" ]; then
+          # Already resolved to the work tree root during validation,
+          # so the mount always carries the .git directory.
+          repo_abs="${REPO_ROOT}"
+          "${docker_common[@]}" \
+            --mount "type=bind,source=${repo_abs},target=/repo" \
+            -e "GIT_TAG=${GIT_TAG}" \
+            -e "REPO_DIR=/repo" \
+            -w /repo \
+            --entrypoint "${interp}" \
+            "${image}" /sigul-scripts/sign_git_tag.py
+          echo "signed_count=0" >> "$GITHUB_OUTPUT"
+          echo "Signed git tag ✅" >> "$GITHUB_STEP_SUMMARY"
+        else
+          # Resolve to an absolute path and mount the PARENT, so a
+          # relative input resolves identically inside the container.
+          parent_abs="$(cd "$(dirname "${PATH_INPUT}")" && pwd)"
+          target_abs="${parent_abs}/$(basename "${PATH_INPUT}")"
+          "${docker_common[@]}" \
+            --mount "type=bind,source=${parent_abs},target=${parent_abs}" \
+            -e "SIGN_TARGET=${target_abs}" \
+            -e "EXCLUDE_GLOBS=${EXCLUDE_GLOBS}" \
+            -e "COUNT_FILE=${c_creds}/count" \
+            -w "${parent_abs}" \
+            --entrypoint "${interp}" \
+            "${image}" /sigul-scripts/sign_data.py
+
+          signed=0
+          [ -f "${count_file}" ] && signed="$(cat "${count_file}")"
+          echo "signed_count=${signed}" >> "$GITHUB_OUTPUT"
+          echo "Signed ${signed} file(s) ✅" >> "$GITHUB_STEP_SUMMARY"
+        fi
