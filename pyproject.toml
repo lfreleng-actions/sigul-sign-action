@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# basedpyright configuration.
+#
+# Kept here rather than in pyrightconfig.json because that file would
+# need JSONC comments to carry this explanation, and the repository's
+# check-json hook parses it as strict JSON.
+#
+# basedpyright checks this repository in its default strict mode,
+# which is right for scripts/prepare_credentials.py: that runs on the
+# runner, is modern Python 3, and is fully annotated.
+#
+# The two container entrypoints cannot meet it. They are valid under
+# BOTH Python 2.7 and 3.x by design -- the legacy Sigul image is
+# CentOS 7 with Python 2.7 and no python3, while the containerised 1.4
+# stack ships python3 and no bare python -- so one source file serves
+# both and there is no second implementation to keep in step.
+# Annotation syntax does not exist in 2.7 and typing is not in its
+# standard library, so the parameter-type rules cannot be satisfied
+# without breaking the portability that is the point of the files.
+#
+# Ignored rather than relaxing the rules globally, so
+# prepare_credentials.py and anything added later keep the full strict
+# treatment. 'ignore' rather than 'exclude' because the pre-commit
+# hook passes filenames explicitly, and 'exclude' only applies to
+# files basedpyright discovers for itself. ruff still checks them;
+# .ruff.toml records the rules exempted there for the same reason.
+#
+# Remove this file, the __future__ imports and the .ruff.toml
+# per-file-ignores together once the legacy Sigul infrastructure
+# retires and the entrypoints can become Python 3 only.
+[tool.basedpyright]
+ignore = ["scripts/sign_data.py", "scripts/sign_git_tag.py"]
