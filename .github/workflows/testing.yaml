@@ -295,6 +295,18 @@ jobs:
           # A file whose first signing attempt the mock fails, so the
           # real run exercises the retry path.
           echo "MOCK-FAIL-ONCE" > e2e/dist/retry.jar
+          # Modules named as Sigul's own, at the workspace root: the
+          # container's working directory for sign-data, which 'python
+          # -c' would search before anything else. A project may well
+          # have a client.py of its own. Each records being imported;
+          # none may be, under either image's Python.
+          for module in client utils settings; do
+            printf '%s\n' 'import os' \
+              'here = os.path.dirname(os.path.abspath(__file__))' \
+              'marker = os.path.join(here, "planted-module-ran")' \
+              'open(marker, "a").write(__name__ + "\n")' \
+              > "${module}.py"
+          done
           git -c user.name=Test -c user.email=test@example.org \
             -c tag.gpgSign=false tag -a sigul-e2e -m "test tag, never pushed"
           git rev-parse refs/tags/sigul-e2e > "${RUNNER_TEMP}/tag-before"
@@ -387,6 +399,9 @@ jobs:
           find .git/objects -type f | sort |
             cmp -s - "${RUNNER_TEMP}/objects-before" ||
             fail "a dry run wrote to the workspace's object store"
+          [ ! -e planted-module-ran ] ||
+            fail "a workspace module was imported in the container:" \
+              "$(sort -u planted-module-ran | tr '\n' ' ')"
           echo "Dry runs passed and changed nothing ✅"
 
       # --- Real signing runs, with the mock client image ---
@@ -558,6 +573,9 @@ jobs:
             fail "planted code ran with the secret inputs:" \
               "$(sort -u "${RUNNER_TEMP}/bash-env-leak" | tr '\n' ' ')"
           fi
+          [ ! -e planted-module-ran ] ||
+            fail "a workspace module was imported in the container:" \
+              "$(sort -u planted-module-ran | tr '\n' ' ')"
           echo "Bad credentials refused; layering as expected ✅"
 
       # --- Tools planted in a system directory ---
