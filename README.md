@@ -252,6 +252,16 @@ built from one would send signing nowhere.
 
 - The validation step never receives a credential, so a misconfigured call
   fails before any secret reaches the disk.
+- **The trust boundary is the job, not the step.** Every step of a job runs
+  as one user, who on GitHub-hosted runners has passwordless `sudo` and the
+  Docker socket, so an earlier step that means harm can always reach a later
+  step's secrets. What the action does guard against is an earlier step
+  redirecting it by accident, which `setup-*` actions and tool shims do: it
+  ignores the job's `PATH`, `BASH_ENV`, `ENV` and the dynamic loader's
+  variables, runs `/bin/bash -p` by absolute path, finds its tools in the
+  system's directories alone, and refuses one in a directory the job's user
+  can write to (see Requirements). Put nothing you distrust in a job that
+  signs.
 - Secrets live in a mode-0700 directory. On every exit path, cancellation
   included, the action overwrites each file that held one before removing
   it, without depending on `shred`; like `shred`, that cannot reach copies a
@@ -281,11 +291,15 @@ built from one would send signing nowhere.
 - **Python 3.10.12, 3.11.4, 3.12 or later**, for `tarfile`'s `data`
   extraction filter. The action refuses to unpack key material without it.
   Every current GitHub-hosted runner image qualifies.
-- **`python3`, `docker`, `git` and `gpg` in the system's own directories**:
-  Debian's and Ubuntu's default `PATH` of `/usr/local/bin`, `/usr/bin`,
-  `/bin`, their `sbin` siblings and `/snap/bin`. The action never runs a tool
-  from the job's `PATH`, to which an earlier step could add one that would
-  receive the credentials.
+- **`python3`, `docker`, `git` and `gpg` in the system's own directories**,
+  and nowhere the job's user can write: Debian's and Ubuntu's default `PATH`
+  of `/usr/local/bin`, `/usr/bin`, `/bin`, their `sbin` siblings and
+  `/snap/bin`. The action never runs a tool from the job's `PATH`, to which
+  an earlier step could add one, and refuses a tool whose directory the
+  runner's user, or anyone, can write to. GitHub-hosted Ubuntu runners leave
+  `/usr/local/bin` world-writable, so the action refuses a tool planted there
+  with no privilege at all, rather than run it; install tools in a directory
+  that root alone can write to.
 - **Network access to the bridge**, on port 44334:
 
 <!-- markdownlint-disable MD013 -->
@@ -315,7 +329,11 @@ CI never contacts a bridge. It tests in three layers:
     configuration and opens the NSS database;
   - real signing runs inside a test image, the pinned image with a mock
     `sigul` added, served from a local registry as a bespoke image;
-  - credentials the action must refuse.
+  - credentials the action must refuse;
+  - code planted by an earlier step: a `BASH_ENV` file and impostor tools on
+    the job's `PATH`, which must never run with a secret, and impostors in
+    the world-writable `/usr/local/bin` of a hosted runner, which the action
+    must refuse before running.
 
 The **Live signing** workflow covers the rest. Run it by hand to sign a
 throwaway file or tag against real infrastructure, with real credentials; the

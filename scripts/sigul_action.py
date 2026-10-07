@@ -31,6 +31,7 @@ from action_common import (
     PASSTHROUGH_VARIABLES,
     SYSTEM_PATH,
     ActionError,
+    check_trusted_location,
     error,
     info,
     notice,
@@ -117,15 +118,31 @@ def on_signal(signum: int, _frame: FrameType | None) -> None:
 
 
 def check_runtime() -> None:
-    """Fail early, with the reason, where the action cannot run."""
+    """Fail early, with the reason, where the action cannot run.
+
+    Every tool is looked up in SYSTEM_PATH and refused where an earlier
+    step of the job could have planted it (see action_common.SYSTEM_PATH),
+    gpgconf included, because the cleanup that runs it must never fail
+    part-way. The interpreter running this code was chosen by
+    action.yaml under the same rule; checking it again covers a root
+    runner, where the shell's test cannot tell a writable directory
+    from any other.
+    """
     runner_os = os.environ.get("RUNNER_OS", "Linux")
     if runner_os != "Linux":
         raise ActionError(f"this action needs a Linux runner (this one is {runner_os})")
+    if sys.executable:
+        check_trusted_location(sys.executable)
     for tool in ("docker", "git", "gpg"):
-        if system_tool(tool) is None:
+        found = system_tool(tool)
+        if found is None:
             raise ActionError(
                 f"{tool} is not installed in the runner's system directories ({SYSTEM_PATH})"
             )
+        check_trusted_location(found)
+    gpgconf = system_tool("gpgconf")
+    if gpgconf is not None:
+        check_trusted_location(gpgconf)
 
 
 def report_plan(plan: Plan) -> None:

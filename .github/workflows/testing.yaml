@@ -559,3 +559,99 @@ jobs:
               "$(sort -u "${RUNNER_TEMP}/bash-env-leak" | tr '\n' ' ')"
           fi
           echo "Bad credentials refused; layering as expected ✅"
+
+      # --- Tools planted in a system directory ---
+      #
+      # GitHub-hosted Ubuntu runners leave /usr/local/bin world-writable
+      # (actions/runner-images chmods it so 'npm -g' works without sudo),
+      # and it comes before /usr/bin on the action's PATH. An earlier
+      # step needs no privilege to plant a tool there, and nothing the
+      # action does with PATH or BASH_ENV would notice. So the action
+      # must refuse a tool found in a directory this user can write to,
+      # before running it: the shell checks the interpreter, and the
+      # interpreter checks docker, git and gpg. These are last, so they
+      # cannot disturb the calls above; they plant nothing until the
+      # directory is confirmed writable without sudo, as it is on the
+      # hosted runners, and record that the impostor ever ran at all.
+      - name: "Plant impostors in /usr/local/bin"
+        id: system_plant
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -w /usr/local/bin ]; then
+            echo "::notice::/usr/local/bin is not writable here; skipping"
+            echo "planted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ran="${RUNNER_TEMP}/system-impostor-ran"
+          for tool in gpg python3; do
+            [ ! -e "/usr/local/bin/${tool}" ] ||
+              { echo "::error::/usr/local/bin/${tool} already exists"; exit 1; }
+            # The distribution's own, not the impostor an earlier step
+            # put on the job's PATH.
+            real="$(PATH=/usr/bin:/bin command -v "${tool}")"
+            printf '%s\n' '#!/bin/sh' "echo \"${tool}\" >> '${ran}'" \
+              "exec '${real}' \"\$@\"" > "/usr/local/bin/${tool}.planted"
+            chmod +x "/usr/local/bin/${tool}.planted"
+          done
+          # gpg first: python3 stays real, so the refusal is the
+          # interpreter's own check of the tools it would run.
+          mv "/usr/local/bin/gpg.planted" /usr/local/bin/gpg
+          echo "planted=true" >> "$GITHUB_OUTPUT"
+
+      - name: "Refuse a planted gpg (should fail)"
+        id: planted_gpg
+        if: steps.system_plant.outputs.planted == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Swap the planted gpg for a planted python3"
+        if: steps.system_plant.outputs.planted == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /usr/local/bin/gpg
+          mv /usr/local/bin/python3.planted /usr/local/bin/python3
+
+      - name: "Refuse a planted python3 (should fail)"
+        id: planted_python
+        if: steps.system_plant.outputs.planted == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Assert the planted tools were refused, unrun"
+        if: always() && steps.system_plant.outputs.planted == 'true'
+        shell: bash
+        env:
+          PLANTED_GPG: ${{ steps.planted_gpg.outcome }}
+          PLANTED_PYTHON: ${{ steps.planted_python.outcome }}
+        run: |
+          set -euo pipefail
+          rm -f /usr/local/bin/gpg /usr/local/bin/python3 \
+            /usr/local/bin/gpg.planted /usr/local/bin/python3.planted
+          fail() { echo "ERROR: $* ❌"; exit 1; }
+          [ "${PLANTED_GPG}" = "failure" ] ||
+            fail "a gpg planted in /usr/local/bin was accepted"
+          [ "${PLANTED_PYTHON}" = "failure" ] ||
+            fail "a python3 planted in /usr/local/bin was accepted"
+          if [ -e "${RUNNER_TEMP}/system-impostor-ran" ]; then
+            fail "a planted tool ran before it was refused:" \
+              "$(sort -u "${RUNNER_TEMP}/system-impostor-ran" | tr '\n' ' ')"
+          fi
+          echo "Tools planted in /usr/local/bin refused without running ✅"

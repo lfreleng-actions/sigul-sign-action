@@ -15,7 +15,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from action_common import SYSTEM_PATH, ActionError, set_output, system_tool
+from action_common import (
+    SYSTEM_PATH,
+    ActionError,
+    check_trusted_location,
+    set_output,
+    system_tool,
+)
 from action_inputs import Plan, build_plan
 from client_container import (
     ContainerRun,
@@ -313,8 +319,22 @@ class CommandLineTests(unittest.TestCase):
             _ = os.fstat(descriptor)
 
 
+def interpreter_is_trusted() -> bool:
+    """Whether check_runtime would accept the interpreter running the
+    tests: a virtualenv under the developer's home is refused, as a
+    planted one would be, which the test below is not about."""
+    try:
+        check_trusted_location(sys.executable)
+    except ActionError:
+        return False
+    return True
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "/proc is Linux-only")
 @unittest.skipUnless(system_tool("docker"), "needs the docker CLI, not a daemon")
+@unittest.skipUnless(
+    interpreter_is_trusted(), "the interpreter is in a writable directory"
+)
 class SecretEnvironmentTests(unittest.TestCase):
     def test_signing_process_is_isolated_from_the_job(self) -> None:
         """Run the real 'sign' command against a fake Docker daemon,

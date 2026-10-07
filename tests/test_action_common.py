@@ -10,9 +10,19 @@ import os
 import re
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
-from action_common import SYSTEM_PATH, error, escape_data, minimal_env, shred_file
+from action_common import (
+    SYSTEM_PATH,
+    ActionError,
+    check_trusted_location,
+    error,
+    escape_data,
+    is_untrusted_directory,
+    minimal_env,
+    shred_file,
+)
 
 from tests.helpers import REPOSITORY, scratch
 
@@ -71,12 +81,71 @@ class EnvironmentTests(unittest.TestCase):
         )
         self.assertEqual(found, [SYSTEM_PATH, SYSTEM_PATH])
 
+    def test_action_yaml_refuses_a_planted_interpreter(self) -> None:
+        # Both steps must check the interpreter's directory before
+        # running it, with builtins only, and skip the test as root.
+        text = (REPOSITORY / "action.yaml").read_text()
+        self.assertEqual(text.count('python3="$(type -P python3)"'), 2)
+        self.assertEqual(
+            text.count('if (( EUID != 0 )) && [[ -w "${python3%/*}" ]]; then'), 2
+        )
+
     def test_minimal_env_carries_no_secret(self) -> None:
         with mock.patch.dict(os.environ, {"SIGUL_PASS": "secret"}):
             env = minimal_env({"HOME": "/h"})
         self.assertNotIn("SIGUL_PASS", env)
         self.assertEqual(env["HOME"], "/h")
         self.assertEqual(env["PATH"], SYSTEM_PATH)
+
+
+class TrustedLocationTests(unittest.TestCase):
+    """Tools are refused where an earlier step could have planted them."""
+
+    def make_tool(self, directory: Path, mode: int) -> Path:
+        directory.mkdir()
+        tool = directory / "gpg"
+        _ = tool.write_text("#!/bin/sh\n")
+        directory.chmod(mode)
+        self.addCleanup(directory.chmod, 0o755)
+        return tool
+
+    def test_world_writable_directory_is_refused_by_everyone(self) -> None:
+        # Whatever user runs the tests, root included: the mode bits
+        # alone decide. This is /usr/local/bin on a GitHub-hosted runner.
+        tool = self.make_tool(scratch(self) / "bin", 0o777)
+        self.assertTrue(is_untrusted_directory(str(tool.parent)))
+        with self.assertRaises(ActionError) as caught:
+            check_trusted_location(str(tool))
+        self.assertIn("an earlier step could have planted it", str(caught.exception))
+
+    def test_directory_this_user_cannot_write_is_trusted(self) -> None:
+        # Owned by this user but without its write bit, as /usr/bin is
+        # root's without anyone else's.
+        tool = self.make_tool(scratch(self) / "bin", 0o555)
+        self.assertFalse(is_untrusted_directory(str(tool.parent)))
+        check_trusted_location(str(tool))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can write to every directory")
+    def test_directory_this_user_can_write_is_refused(self) -> None:
+        # Group-writable or owner-writable by the job's user is as good
+        # as world-writable: every step of the job runs as that user.
+        tool = self.make_tool(scratch(self) / "bin", 0o755)
+        self.assertTrue(is_untrusted_directory(str(tool.parent)))
+        with self.assertRaises(ActionError):
+            check_trusted_location(str(tool))
+
+    def test_a_link_from_a_trusted_directory_is_resolved(self) -> None:
+        # The trusted directory holds only a symlink; what runs lives
+        # where anyone could have put it.
+        base = scratch(self)
+        planted = self.make_tool(base / "planted", 0o777)
+        trusted = base / "trusted"
+        trusted.mkdir()
+        (trusted / "gpg").symlink_to(planted)
+        trusted.chmod(0o555)
+        self.addCleanup(trusted.chmod, 0o755)
+        with self.assertRaises(ActionError):
+            check_trusted_location(str(trusted / "gpg"))
 
 
 if __name__ == "__main__":

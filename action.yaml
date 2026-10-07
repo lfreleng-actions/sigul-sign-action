@@ -170,9 +170,9 @@ runs:
     # before any secret is written to disk. The HAVE_* flags say only
     # whether each secret was supplied.
     #
-    # Nothing an earlier step can change through GITHUB_ENV or
-    # GITHUB_PATH runs in either step, where the signing step holds the
-    # secret inputs:
+    # Nothing an earlier step changes through GITHUB_ENV or GITHUB_PATH
+    # redirects either step, where the signing step holds the secret
+    # inputs:
     #   - /bin/bash by absolute path, so a 'bash' earlier on PATH is not
     #     the shell;
     #   - -p, so it ignores BASH_ENV, SHELLOPTS and exported functions,
@@ -180,7 +180,17 @@ runs:
     #   - BASH_ENV, ENV and the dynamic loader's LD_* variables emptied
     #     for the shell and anything it starts;
     #   - PATH reset to the system's directories before python3 is
-    #     found, and sigul_action.py looks up docker, git and gpg there.
+    #     found, and sigul_action.py looks up docker, git and gpg there;
+    #   - a python3 found in a directory this user can write to is
+    #     refused: GitHub-hosted Ubuntu runners leave /usr/local/bin
+    #     world-writable, so an earlier step could plant one there with
+    #     no privilege, and sigul_action.py applies the same rule to
+    #     every tool it runs.
+    #
+    # This is defence in depth against an earlier step redirecting the
+    # action by accident, not a boundary between steps: every step of a
+    # job runs as the same user, with sudo on GitHub-hosted runners, so
+    # every step in a job that signs must be trusted.
     - name: "Validate inputs"
       shell: /bin/bash --noprofile --norc -p -eo pipefail {0}
       env:
@@ -214,11 +224,19 @@ runs:
         set -euo pipefail
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
         export PATH
-        if ! command -v python3 >/dev/null 2>&1; then
+        # Builtins only: nothing runs before the interpreter is checked.
+        # For root every directory tests writable, so sigul_action.py
+        # checks the mode bits instead once it starts.
+        if ! python3="$(type -P python3)"; then
           echo "::error::python3 is required on the runner"
           exit 1
         fi
-        python3 -E -s "${ACTION_PATH}/scripts/sigul_action.py" validate
+        if (( EUID != 0 )) && [[ -w "${python3%/*}" ]]; then
+          echo "::error::refusing ${python3}: its directory is writable by" \
+            "this user, so an earlier step could have planted it"
+          exit 1
+        fi
+        "${python3}" -E -s "${ACTION_PATH}/scripts/sigul_action.py" validate
 
     - name: "Sign with Sigul"
       id: sign
@@ -257,4 +275,15 @@ runs:
         set -euo pipefail
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
         export PATH
-        exec python3 -E -s "${ACTION_PATH}/scripts/sigul_action.py" sign
+        # The same check as above, builtins only, before the secrets
+        # reach any other process.
+        if ! python3="$(type -P python3)"; then
+          echo "::error::python3 is required on the runner"
+          exit 1
+        fi
+        if (( EUID != 0 )) && [[ -w "${python3%/*}" ]]; then
+          echo "::error::refusing ${python3}: its directory is writable by" \
+            "this user, so an earlier step could have planted it"
+          exit 1
+        fi
+        exec "${python3}" -E -s "${ACTION_PATH}/scripts/sigul_action.py" sign

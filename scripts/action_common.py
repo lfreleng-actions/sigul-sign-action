@@ -23,9 +23,19 @@ from pathlib import Path
 # Python itself. Never the job's PATH, to which any earlier step can
 # prepend a directory through GITHUB_PATH, so that its own 'docker' or
 # 'gpg' would receive the credentials. This is Debian's and Ubuntu's
-# default PATH: directories only root can write to, with an
-# administrator's /usr/local ahead of the distribution's own, as there.
-# action.yaml sets the same value before starting Python.
+# default PATH, with an administrator's /usr/local ahead of the
+# distribution's own, as there. Its directories are usually root's
+# alone, but not always: GitHub-hosted Ubuntu runners make
+# /usr/local/bin world-writable, so an earlier step can plant a tool
+# there with no privilege at all. check_runtime() therefore refuses a
+# tool found in a directory the runner's user, or anyone, can write
+# to, and action.yaml makes the same check before starting Python.
+#
+# None of this is a boundary between steps. Every step of a job runs
+# as one user, on GitHub-hosted runners one with passwordless sudo, so
+# a hostile earlier step can always win; these checks stop an earlier
+# step from redirecting the action by accident, and turn a planted tool
+# into a loud failure rather than a silent leak.
 SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 
 # Settings a child process may legitimately need from the job's
@@ -133,8 +143,42 @@ def shred_file(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def is_untrusted_directory(directory: str) -> bool:
+    """Return True when an earlier step of the job could write here.
+
+    World-writable is untrusted outright. Short of that, 'writable'
+    means by the user this process runs as, because every other step
+    of the job runs as that same user. Root can write anywhere, so for
+    root only the mode bits say anything.
+    """
+    status = os.stat(directory)
+    if status.st_mode & stat.S_IWOTH:
+        return True
+    if os.geteuid() == 0:
+        return False
+    return os.access(directory, os.W_OK)
+
+
+def check_trusted_location(path: str) -> None:
+    """Fail unless path, and whatever it resolves to, lie in directories
+    an earlier step of the job could not have written to."""
+    for directory in sorted(
+        {os.path.dirname(path), os.path.dirname(os.path.realpath(path))}
+    ):
+        if is_untrusted_directory(directory):
+            raise ActionError(
+                f"refusing {path}: {directory} is writable by the user running "
+                + "this job, so an earlier step could have planted it; install "
+                + "the tool in a directory only root can write to"
+            )
+
+
 def system_tool(name: str) -> str | None:
-    """Return the absolute path of a tool in SYSTEM_PATH, or None."""
+    """Return the absolute path of a tool in SYSTEM_PATH, or None.
+
+    Whether that path can be trusted is check_trusted_location's
+    question, asked by check_runtime before anything runs.
+    """
     return shutil.which(name, path=SYSTEM_PATH)
 
 

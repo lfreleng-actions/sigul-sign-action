@@ -132,7 +132,7 @@ def decrypt_bundle(encrypted: Path, passphrase: Path, output: Path, home: Path) 
     passphrase from a file in batch mode; older releases reject one or
     both options, so each is dropped only when gpg names it as invalid.
     """
-    optional = ["--pinentry-mode", "loopback", "--no-symkey-cache"]
+    optional: list[str] = ["--pinentry-mode", "loopback", "--no-symkey-cache"]
     rest = [
         "--batch",
         "--quiet",
