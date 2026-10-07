@@ -235,6 +235,15 @@ needs to push. `sigul-key-name` names a key rather than containing one.
   `sigul_setup_client` keeps `nss-password` there.
 - **Decryption and Sigul both use the first line of `sigul-pass`**, so a
   secret stored with a trailing newline works as before.
+- **Decryption happens on the runner, with its own GnuPG**, where the legacy
+  action decrypted inside its CentOS 7 container with GnuPG 2.0.22. GnuPG
+  2.2.8 and later refuse a message that carries no integrity protection
+  (MDC), which GnuPG 2.0 and earlier omitted by default; the runner's gpg
+  refuses a bundle made that way even with the right passphrase. The action
+  says so, and the fix is to re-encrypt the bundle with a current GnuPG
+  (`gpg --symmetric --cipher-algo AES256 --armor sigul.tar.xz`) and store
+  the result. The action never passes `--ignore-mdc-error`, which would
+  also accept a bundle someone had altered.
 
 ### The hosts entry
 

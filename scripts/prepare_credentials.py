@@ -79,6 +79,18 @@ class PreparedCredentials:
     layered: bool
 
 
+class UnprotectedBundleError(ActionError):
+    """sigul-pki was encrypted without integrity protection."""
+
+
+# What gpg says, since 2.2.8, of a message without an MDC: the
+# modification detection code that GnuPG 2.0 and earlier omitted by
+# default with their default cipher, CAST5. Earlier gpg decrypted such
+# a message with a warning; the legacy action's CentOS 7 container had
+# GnuPG 2.0.22, so a bundle it accepted can be refused here.
+_NO_INTEGRITY = ("message was not integrity protected", "decryption forced to fail")
+
+
 def first_line(value: str) -> str:
     """Return the first line of a passphrase.
 
@@ -131,6 +143,11 @@ def decrypt_bundle(encrypted: Path, passphrase: Path, output: Path, home: Path) 
     GnuPG 2.1 and later need --pinentry-mode loopback to take the
     passphrase from a file in batch mode; older releases reject one or
     both options, so each is dropped only when gpg names it as invalid.
+
+    A message without integrity protection is refused, as gpg refuses
+    it: --ignore-mdc-error would decrypt it, and would also decrypt
+    one an attacker had altered, for everyone, to spare the one caller
+    who should re-encrypt. That caller is told so instead.
     """
     optional: list[str] = ["--pinentry-mode", "loopback", "--no-symkey-cache"]
     rest = [
@@ -168,6 +185,15 @@ def decrypt_bundle(encrypted: Path, passphrase: Path, output: Path, home: Path) 
                 ]
                 continue
         lines = [line for line in stderr.splitlines() if line.strip()]
+        if any(marker in stderr for marker in _NO_INTEGRITY):
+            raise UnprotectedBundleError(
+                "sigul-pki was encrypted without integrity protection (an MDC), "
+                + "as GnuPG 2.0 and earlier did by default, and this runner's gpg "
+                + "refuses to decrypt such a message. The passphrase may well be "
+                + "right. Re-encrypt the bundle with a current GnuPG, which adds "
+                + "the protection, and store the result as sigul-pki: "
+                + "gpg --symmetric --cipher-algo AES256 --armor sigul.tar.xz"
+            )
         raise ActionError(lines[-1] if lines else "gpg failed")
 
 
@@ -320,6 +346,11 @@ def prepare(
     try:
         decrypt_bundle(encrypted, gpg_passphrase, decrypted, gnupg_home)
     except ActionError as exc:
+        # gpg can have written the plaintext before deciding to fail, as
+        # it does for a message without integrity protection.
+        shred_file(decrypted)
+        if isinstance(exc, UnprotectedBundleError):
+            raise
         rest = password.split("\n", 1)[1] if "\n" in password else ""
         if rest.strip():
             raise ActionError(

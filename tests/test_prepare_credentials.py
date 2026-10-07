@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -16,6 +17,7 @@ from unittest import mock
 
 from action_common import ActionError
 from prepare_credentials import (
+    UnprotectedBundleError,
     check_configuration,
     decode_pki,
     first_line,
@@ -30,6 +32,39 @@ PASSPHRASE = "bundle-passphrase"
 HEAD = "[client]\nbridge-hostname: bridge.example.org\nbridge-port: 44334\n"
 ONAP_NSS = "\n[nss]\nnss-dir: /home/jenkins/sigul\nnss-password: x\n"
 HAVE_GPG = shutil.which("gpg") is not None
+
+# A bundle as GnuPG 2.0 and earlier made one by default, and as the
+# legacy action's CentOS 7 container (GnuPG 2.0.22) accepted: CAST5,
+# with no modification detection code. A tar.xz of sigul/cert8.db and
+# sigul/key3.db, encrypted with PASSPHRASE by
+#   gpg1 --cipher-algo CAST5 --disable-mdc --symmetric --armor
+# which GnuPG 2.2.8 and later refuse to decrypt without
+# --ignore-mdc-error. 'gpg --list-packets' shows a plain 'encrypted
+# data packet' rather than an integrity-protected one.
+NO_MDC_BUNDLE = """\
+-----BEGIN PGP MESSAGE-----
+
+jA0EAwMClktGgoIXIpVgycAnpfTMcbkuqk6rUcVx+V3sApAImt8SpJnCZD7Au+iO
+tWQ6Su/5XIGs3ODcba/J/psGCctyYJ+khMst/uNvLDVDYE22dZ+HvIEpJIL3NRt6
+2LMdwqe27lifPYBmZxrucJMEF7i1tJWx+ex8vtsRt40EgalNuz0zWqSKBsS0IahW
+RB4S6P+1rnhPtaao4e2Mq/53u8MrSmGc/7p3Egb2L0gztZH1fjzavKdzuhKNHiPn
+5xQGrQEov1nYvsaFLvsrLnloIxpwYMCL/Bf2+Bn2fQdpDjzzC9Mmy6V1lmhW01rP
+zqSiu3ExJRTO
+=EKwW
+-----END PGP MESSAGE-----
+"""
+
+
+def gpg_version() -> tuple[int, ...]:
+    """Return the installed gpg's version, or () without one."""
+    if not HAVE_GPG:
+        return ()
+    done = subprocess.run(
+        ["gpg", "--version"], capture_output=True, text=True, check=False
+    )
+    first = (done.stdout.splitlines() or [""])[0]
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", first)
+    return tuple(int(part) for part in found.groups()) if found else ()
 
 
 def build_bundle(
@@ -204,6 +239,28 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaises(ActionError) as caught:
             _ = self.prepare(HEAD, "not-the-passphrase", build_bundle(self, "sigul"))
         self.assertIn("Could not decrypt sigul-pki", str(caught.exception))
+
+    @unittest.skipUnless(gpg_version() >= (2, 2, 8), "older gpg accepts the bundle")
+    def test_bundle_without_integrity_protection_is_explained(self) -> None:
+        # The passphrase is right, and gpg still refuses: the caller is
+        # told to re-encrypt rather than to check the passphrase.
+        base = scratch(self)
+        creds, gnupg = base / "creds", base / "gnupg"
+        try:
+            with self.assertRaises(UnprotectedBundleError) as caught:
+                _ = prepare(
+                    creds, gnupg, "/sigul-creds", HEAD, PASSPHRASE, NO_MDC_BUNDLE
+                )
+        finally:
+            kill_gpg_agent(gnupg)
+        message = str(caught.exception)
+        self.assertIn("without integrity protection", message)
+        self.assertIn("--cipher-algo AES256", message)
+        self.assertNotIn("Could not decrypt", message)
+        # Whatever gpg wrote before refusing is gone, with the passphrase
+        # and ciphertext; the keyring gpg creates for any home is empty.
+        for name in ("passphrase", "pki.gpg", "pki.tar"):
+            self.assertFalse((gnupg / name).exists(), name)
 
     def test_bundle_without_a_database(self) -> None:
         pki = build_bundle(self, "notes", extra={"notes/readme.txt": "x"}, nss=False)
