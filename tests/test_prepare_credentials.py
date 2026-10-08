@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import configparser
 import io
 import os
 import re
@@ -148,40 +149,38 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(decode_pki("not base64!"), b"not base64!")
 
     def test_rewrite_nss_dir(self) -> None:
-        new = "nss-dir: /sigul-creds/pki/sigul"
-        self.assertIn(
-            new, rewrite_nss_dir(HEAD + ONAP_NSS, "/sigul-creds/pki/sigul", True)
-        )
-        duplicate = rewrite_nss_dir(
-            "[nss]\nnss-dir: /a\nnss-dir = /b\nx: 1\n", "/n", True
-        )
-        self.assertEqual(duplicate, "[nss]\nnss-dir: /n\nx: 1\n")
-        self.assertEqual(
-            rewrite_nss_dir("[nss]\nx: 1\n", "/n", True), "[nss]\nnss-dir: /n\nx: 1\n"
-        )
-        self.assertEqual(
-            rewrite_nss_dir(HEAD, "/n", True), HEAD + "\n[nss]\nnss-dir: /n\n"
-        )
-        self.assertEqual(rewrite_nss_dir("[nss]\nx: 1\n", "/n", False), "[nss]\nx: 1\n")
-        # Option names are case-insensitive, as ConfigParser reads them;
-        # a mixed-case entry is replaced, not shadowed by a second one.
-        self.assertEqual(
-            rewrite_nss_dir("[nss]\nNSS-Dir = /home/jenkins/sigul\n", "/n", True),
-            "[nss]\nnss-dir: /n\n",
-        )
-        # Only [nss]'s nss-dir is Sigul's: one in another section stays
-        # as written, and the real one is the one rewritten.
-        self.assertEqual(
-            rewrite_nss_dir(
-                "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /old\n", "/n", True
+        # Serialization may change whitespace, never other effective values.
+        # Strict parsing of the result also proves duplicates were removed.
+        cases = [
+            (HEAD + ONAP_NSS, True, HEAD + "[nss]\nnss-dir: /n\nnss-password: x\n"),
+            (
+                "[nss]\nnss-dir: /a\nnss-dir = /b\nx: 1\n",
+                True,
+                "[nss]\nnss-dir: /n\nx: 1\n",
             ),
-            "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /n\n",
-        )
-        self.assertEqual(
-            rewrite_nss_dir("[client]\nnss-dir: /ignored\n[nss]\nx: 1\n", "/n", True),
-            "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /n\nx: 1\n",
-        )
-        self.assertEqual(rewrite_nss_dir("[nss]", "/n", True), "[nss]\nnss-dir: /n\n")
+            ("[nss]\nx: 1\n", True, "[nss]\nnss-dir: /n\nx: 1\n"),
+            (HEAD, True, HEAD + "[nss]\nnss-dir: /n\n"),
+            ("[nss]\nx: 1\n", False, "[nss]\nx: 1\n"),
+            ("[nss]\nNSS-Dir = /home/jenkins/sigul\n", True, "[nss]\nnss-dir: /n\n"),
+            (
+                "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /old\n",
+                True,
+                "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /n\n",
+            ),
+            (
+                "[client]\nnss-dir: /ignored\n[nss]\nx: 1\n",
+                True,
+                "[client]\nnss-dir: /ignored\n[nss]\nnss-dir: /n\nx: 1\n",
+            ),
+            ("[nss]", True, "[nss]\nnss-dir: /n\n"),
+        ]
+        for text, add_if_missing, expected in cases:
+            with self.subTest(text=text, add_if_missing=add_if_missing):
+                actual_parser = configparser.RawConfigParser()
+                actual_parser.read_string(rewrite_nss_dir(text, "/n", add_if_missing))
+                expected_parser = configparser.RawConfigParser()
+                expected_parser.read_string(expected)
+                self.assertEqual(dict(actual_parser), dict(expected_parser))
 
 
 @unittest.skipUnless(HAVE_GPG, "gpg is not installed")
@@ -335,15 +334,13 @@ class PrepareTests(unittest.TestCase):
         creds, nss_dir = self.prepare(HEAD, PASSPHRASE, pki)
         layered = (creds / "pki" / ".sigul" / "client.conf").read_text()
         self.assertEqual(self.nss_dirs(layered), [nss_dir])
-        self.assertIn("nss-password: p", layered)
+        parser = configparser.RawConfigParser()
+        parser.read_string(layered)
+        self.assertEqual(parser.get("nss", "nss-password"), "p")
 
     def test_symlinked_user_configuration_is_refused(self) -> None:
-        # A link that stays inside the bundle passes extraction, and
-        # sigul would follow it to a configuration whose nss-dir was
-        # never rewritten, overriding the one that was. The target sits
-        # beside the link: Python 3.10.12's filter resolves a relative
-        # target against the destination root rather than the link's
-        # directory, and would refuse '../real.conf' itself.
+        # Even an in-tree configuration link must be rejected during
+        # extraction, before it can be followed or rewritten.
         user = "[nss]\nnss-dir: /home/someone/.sigul\nnss-password: p\n"
         pki = build_bundle(
             self,
@@ -374,7 +371,7 @@ class PrepareTests(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch("gpg_bundle.system_tool", return_value="/usr/bin/gpgconf"),
-            mock.patch("gpg_bundle.subprocess.run", never_returns),
+            mock.patch("gpg_bundle.capture_text", never_returns),
             redirect_stdout(output),
         ):
             kill_gpg_agent(home)

@@ -22,9 +22,11 @@ from action_common import ActionError, minimal_env, system_tool
 from gpg_bundle import UnprotectedBundleError, decrypt_bundle, kill_gpg_agent
 from prepare_credentials import (
     PreparedCredentials,
+    decode_pki,
     extract_bundle,
     prepare,
     rewrite_nss_dir,
+    write_private,
 )
 
 from tests.helpers import scratch
@@ -34,7 +36,7 @@ PASSWORD = "synthetic-bundle-passphrase"
 NSS_PASSWORD = "synthetic-nss-password-not-for-logging"
 CONTAINER_NSS = "/sigul-creds/pki/sigul"
 
-# The proposed credential archive budget, tested through the public extractor.
+# The credential archive budget, tested through the public extractor.
 # Repeated zero-filled payloads compress cheaply; no exhaustion probe is needed.
 FILE_BYTES = 16 * 1024 * 1024
 TOTAL_BYTES = 32 * 1024 * 1024
@@ -104,7 +106,6 @@ class ArchiveLinkTests(unittest.TestCase):
             (destination / "sigul/key4.db").read_bytes(), b"synthetic key material"
         )
 
-    @unittest.expectedFailure
     def test_in_tree_file_symlink_is_rejected(self) -> None:
         archive = pack(
             self,
@@ -116,7 +117,6 @@ class ArchiveLinkTests(unittest.TestCase):
         with self.assertRaises(ActionError):
             extract_bundle(archive, scratch(self) / "pki")
 
-    @unittest.expectedFailure
     def test_in_tree_directory_symlink_is_rejected(self) -> None:
         archive = pack(
             self,
@@ -128,7 +128,6 @@ class ArchiveLinkTests(unittest.TestCase):
         with self.assertRaises(ActionError):
             extract_bundle(archive, scratch(self) / "pki")
 
-    @unittest.expectedFailure
     def test_in_tree_hardlink_is_rejected(self) -> None:
         archive = pack(
             self,
@@ -140,7 +139,6 @@ class ArchiveLinkTests(unittest.TestCase):
         with self.assertRaises(ActionError):
             extract_bundle(archive, scratch(self) / "pki")
 
-    @unittest.expectedFailure
     def test_relocated_link_cannot_rewrite_an_external_configuration(self) -> None:
         base = scratch(self)
         work = base / "work"
@@ -187,14 +185,110 @@ class ArchiveLinkTests(unittest.TestCase):
                     extract_bundle(archive, scratch(self) / "pki")
 
 
+class ArchiveFormatTests(unittest.TestCase):
+    def test_supported_compression_and_dot_root(self) -> None:
+        for mode in ("w", "w:gz", "w:bz2", "w:xz"):
+            with self.subTest(mode=mode):
+                base = scratch(self)
+                archive = base / "archive"
+                with tarfile.open(archive, mode) as tar:
+                    for member, data in (
+                        entry(".", kind=tarfile.DIRTYPE, mode=0o7777),
+                        entry("./sigul/key4.db", b"synthetic", mode=0o7777),
+                    ):
+                        tar.addfile(member, io.BytesIO(data))
+                destination = base / "pki"
+                extract_bundle(archive, destination)
+                target = destination / "sigul/key4.db"
+                self.assertEqual(target.read_bytes(), b"synthetic")
+                self.assertEqual(target.stat().st_mode & 0o7777, 0o600)
+                self.assertEqual(target.parent.stat().st_mode & 0o7777, 0o700)
+                self.assertEqual(destination.stat().st_mode & 0o7777, 0o700)
+
+    def test_unsafe_names_are_rejected_before_any_file_is_written(self) -> None:
+        names = (
+            "/absolute",
+            "a/../outside",
+            "back\\slash",
+            "line\nbreak",
+            "carriage\rreturn",
+            "tab\tname",
+            " trailing",
+            "trailing ",
+            "directory/" + "x" * 256,
+            "/".join(["x" * 220] * 5),
+        )
+        for name in names:
+            with self.subTest(name=name):
+                archive = pack(self, [entry("first", b"synthetic"), entry(name)])
+                destination = scratch(self) / "pki"
+                with self.assertRaises(ActionError):
+                    extract_bundle(archive, destination)
+                self.assertFalse(destination.exists())
+
+    def test_duplicate_normalized_file_paths_are_rejected(self) -> None:
+        archive = pack(self, [entry("sigul/key4.db"), entry("./sigul/key4.db")])
+        with self.assertRaises(ActionError):
+            extract_bundle(archive, scratch(self) / "pki")
+
+    def test_existing_destination_link_is_not_followed(self) -> None:
+        base = scratch(self)
+        outside = base / "outside"
+        outside.mkdir()
+        destination = base / "pki"
+        destination.symlink_to(outside, target_is_directory=True)
+        archive = pack(self, [entry("key4.db", b"synthetic")])
+        with self.assertRaises(ActionError):
+            extract_bundle(archive, destination)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_invalid_gzip_is_a_safe_action_error(self) -> None:
+        archive = scratch(self) / "invalid.gz"
+        # A valid gzip header followed by the reserved DEFLATE block type.
+        _ = archive.write_bytes(b"\x1f\x8b\x08\0\0\0\0\0\0\xff\x07" + bytes(8))
+        with self.assertRaises(ActionError):
+            extract_bundle(archive, scratch(self) / "pki")
+
+    def test_decompressed_metadata_has_a_separate_budget(self) -> None:
+        member, data = entry("file")
+        member.pax_headers = {"comment": "synthetic" * 1024}
+        archive = pack(self, [(member, data)])
+        with mock.patch("credential_archive.MAX_ARCHIVE_BYTES", 4096):
+            with self.assertRaises(ActionError):
+                extract_bundle(archive, scratch(self) / "pki")
+
+
+class PrivateCredentialTests(unittest.TestCase):
+    def test_private_write_cannot_overwrite_a_file_or_follow_a_link(self) -> None:
+        base = scratch(self)
+        original = base / "original"
+        write_private(original, b"synthetic")
+        self.assertEqual(original.stat().st_mode & 0o777, 0o600)
+        link = base / "link"
+        link.symlink_to(original)
+        for path in (original, link):
+            with self.subTest(path=path), self.assertRaises(OSError):
+                write_private(path, b"replacement")
+        self.assertEqual(original.read_bytes(), b"synthetic")
+
+    def test_oversized_ciphertext_is_rejected(self) -> None:
+        raw = base64.b64encode(bytes(1024 * 1024 + 1)).decode()
+        with self.assertRaises(ActionError):
+            _ = decode_pki(raw)
+
+    def test_oversized_configuration_is_rejected_without_its_value(self) -> None:
+        body = "[nss]\nnss-password: " + NSS_PASSWORD + "x" * (1024 * 1024)
+        with self.assertRaises(ActionError) as caught:
+            _ = rewrite_nss_dir(body, CONTAINER_NSS, True)
+        self.assertNotIn(NSS_PASSWORD, str(caught.exception))
+
+
 class ArchiveBudgetTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_single_file_over_budget_is_rejected(self) -> None:
         archive = pack(self, [entry("key4.db", bytes(FILE_BYTES + 1))])
         with self.assertRaises(ActionError):
             extract_bundle(archive, scratch(self) / "pki")
 
-    @unittest.expectedFailure
     def test_total_expansion_over_budget_is_rejected(self) -> None:
         payload = bytes(FILE_BYTES)
         archive = pack(
@@ -219,7 +313,6 @@ class ArchiveBudgetTests(unittest.TestCase):
         self.assertEqual(sizes, [FILE_BYTES, FILE_BYTES])
         self.assertEqual(sum(sizes), TOTAL_BYTES)
 
-    @unittest.expectedFailure
     def test_too_many_members_including_directories_are_rejected(self) -> None:
         archive = pack(
             self,
@@ -237,7 +330,6 @@ class ArchiveBudgetTests(unittest.TestCase):
         extract_bundle(archive, destination)
         self.assertEqual(len(list(destination.iterdir())), MEMBERS)
 
-    @unittest.expectedFailure
     def test_path_deeper_than_limit_is_rejected(self) -> None:
         name = "/".join(["directory"] * PATH_COMPONENTS + ["key4.db"])
         archive = pack(self, [entry(name)])
@@ -253,7 +345,6 @@ class ArchiveBudgetTests(unittest.TestCase):
 
 
 class ConfigurationSecurityTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_indented_nss_options_remain_separate(self) -> None:
         text = f"[nss]\n  nss-dir: /old\n  nss-password: {NSS_PASSWORD}\n"
         parser = configparser.RawConfigParser()
@@ -261,7 +352,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
         self.assertEqual(parser.get("nss", "nss-dir"), CONTAINER_NSS)
         self.assertEqual(parser.get("nss", "nss-password"), NSS_PASSWORD)
 
-    @unittest.expectedFailure
     def test_adding_nss_dir_preserves_an_indented_password(self) -> None:
         text = f"[nss]\n  nss-password: {NSS_PASSWORD}\n"
         parser = configparser.RawConfigParser()
@@ -269,7 +359,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
         self.assertEqual(parser.get("nss", "nss-dir"), CONTAINER_NSS)
         self.assertEqual(parser.get("nss", "nss-password"), NSS_PASSWORD)
 
-    @unittest.expectedFailure
     def test_continued_nss_dir_is_replaced_as_one_value(self) -> None:
         text = f"[nss]\nnss-dir:\n  /old/location\nnss-password: {NSS_PASSWORD}\n"
         parser = configparser.RawConfigParser()
@@ -277,7 +366,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
         self.assertEqual(parser.get("nss", "nss-dir"), CONTAINER_NSS)
         self.assertEqual(parser.get("nss", "nss-password"), NSS_PASSWORD)
 
-    @unittest.expectedFailure
     def test_option_like_password_continuation_is_preserved(self) -> None:
         text = (
             f"[nss]\nnss-dir: /old\nnss-password: {NSS_PASSWORD}\n"
@@ -298,7 +386,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
         parser.read_string(rewrite_nss_dir(text, CONTAINER_NSS, True))
         self.assertEqual(parser.get("nss", "nss-password"), password)
 
-    @unittest.expectedFailure
     def test_malformed_configuration_has_no_value_bearing_exception(self) -> None:
         text = f"[nss]\nnss-password: {NSS_PASSWORD}\n{NSS_PASSWORD}\n"
         with self.assertRaises(ActionError) as caught:
@@ -306,7 +393,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
         rendered = "".join(traceback.format_exception(caught.exception))
         self.assertNotIn(NSS_PASSWORD, rendered)
 
-    @unittest.expectedFailure
     def test_container_path_cannot_inject_an_option(self) -> None:
         with self.assertRaises(ActionError):
             _ = rewrite_nss_dir(
@@ -315,7 +401,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
                 True,
             )
 
-    @unittest.expectedFailure
     def test_prepare_preserves_the_bundled_indented_password(self) -> None:
         user = f"[nss]\n  nss-dir: /old\n  nss-password: {NSS_PASSWORD}\n"
         archive = pack(
@@ -337,7 +422,6 @@ class ConfigurationSecurityTests(unittest.TestCase):
         self.assertEqual(parser.get("nss", "nss-password"), NSS_PASSWORD)
         self.assertNotIn(NSS_PASSWORD, output.getvalue())
 
-    @unittest.expectedFailure
     def test_prepare_refuses_malformed_bundled_config_without_its_value(self) -> None:
         user = f"[nss]\nnss-password: {NSS_PASSWORD}\n{NSS_PASSWORD}\n"
         archive = pack(
@@ -357,7 +441,7 @@ class ConfigurationSecurityTests(unittest.TestCase):
 
 class GPGStatusTests(unittest.TestCase):
     def paths(self) -> tuple[Path, Path, Path, Path]:
-        """Return private synthetic GPG inputs and an existing plaintext output."""
+        """Return private inputs and the fresh output path owned by decryption."""
         home = scratch(self)
         encrypted, password, output = (
             home / name for name in ("pki.gpg", "passphrase", "pki.tar")
@@ -365,13 +449,11 @@ class GPGStatusTests(unittest.TestCase):
         for path, data in (
             (encrypted, b"synthetic ciphertext"),
             (password, PASSWORD.encode()),
-            (output, b"synthetic plaintext"),
         ):
             path.touch(mode=0o600)
             _ = path.write_bytes(data)
         return encrypted, password, output, home
 
-    @unittest.expectedFailure
     def test_zero_exit_without_mdc_is_still_rejected(self) -> None:
         status = (
             "[GNUPG:] BEGIN_DECRYPTION\n"
@@ -385,23 +467,96 @@ class GPGStatusTests(unittest.TestCase):
             stdout=status,
             stderr="gpg: WARNING: message was not integrity protected\n",
         )
-        with mock.patch("gpg_bundle.subprocess.run", return_value=done):
+        with mock.patch("gpg_bundle.capture_text", return_value=done):
             with self.assertRaises(UnprotectedBundleError):
                 decrypt_bundle(*self.paths())
 
-    @unittest.expectedFailure
+    def test_authentication_status_must_be_complete_and_unambiguous(self) -> None:
+        valid = (
+            "[GNUPG:] BEGIN_DECRYPTION\n[GNUPG:] DECRYPTION_INFO 2 9 0\n"
+            "[GNUPG:] PLAINTEXT 62 0 file\n[GNUPG:] DECRYPTION_OKAY\n"
+            "[GNUPG:] END_DECRYPTION\n"
+        )
+        invalid = (
+            "",
+            valid.replace("[GNUPG:] DECRYPTION_OKAY\n", ""),
+            valid + "[GNUPG:] PLAINTEXT 62 0 extra\n",
+            valid + "[GNUPG:] BADMDC\n",
+            valid + valid,
+        )
+        for status in invalid:
+            done = subprocess.CompletedProcess(["gpg"], 0, stdout=status, stderr="")
+            with (
+                self.subTest(status=status),
+                mock.patch("gpg_bundle.capture_text", return_value=done),
+            ):
+                with self.assertRaises(ActionError):
+                    decrypt_bundle(*self.paths())
+        # AEAD has no MDC. Current GPG also allows a compliance-status field.
+        for info in ("2 9", "2 9 0", "0 9 2", "0 9 2 0"):
+            done = subprocess.CompletedProcess(
+                ["gpg"], 0, stdout=valid.replace("2 9 0", info), stderr=""
+            )
+            with (
+                self.subTest(info=info),
+                mock.patch("gpg_bundle.capture_text", return_value=done),
+            ):
+                decrypt_bundle(*self.paths())
+        for info in ("0 3", "0 3 0"):
+            done = subprocess.CompletedProcess(
+                ["gpg"], 0, stdout=valid.replace("2 9 0", info), stderr=""
+            )
+            with (
+                self.subTest(info=info),
+                mock.patch("gpg_bundle.capture_text", return_value=done),
+            ):
+                with self.assertRaises(UnprotectedBundleError):
+                    decrypt_bundle(*self.paths())
+
+    def test_compatibility_retries_share_the_deadline(self) -> None:
+        unsupported = subprocess.CompletedProcess(
+            ["gpg"], 2, stdout="", stderr="invalid option no-symkey-cache"
+        )
+        success = subprocess.CompletedProcess(
+            ["gpg"],
+            0,
+            stdout=(
+                "[GNUPG:] BEGIN_DECRYPTION\n[GNUPG:] DECRYPTION_INFO 2 9 0\n"
+                "[GNUPG:] PLAINTEXT 62 0 file\n[GNUPG:] DECRYPTION_OKAY\n"
+                "[GNUPG:] END_DECRYPTION\n"
+            ),
+            stderr="",
+        )
+        timeouts: list[float] = []
+        results = iter((unsupported, success))
+
+        def command(
+            argv: list[str], *, env: dict[str, str], timeout: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertIn("--max-output", argv)
+            self.assertIn("--status-fd", argv)
+            self.assertNotIn(PASSWORD, env.values())
+            timeouts.append(timeout)
+            return next(results)
+
+        with (
+            mock.patch("gpg_bundle.time.monotonic", side_effect=[100, 100.5, 130]),
+            mock.patch("gpg_bundle.capture_text", new=command),
+        ):
+            decrypt_bundle(*self.paths())
+        self.assertEqual(timeouts, [59.5, 30])
+
     def test_gpg_diagnostic_values_are_not_exposed(self) -> None:
         done = subprocess.CompletedProcess(
             ["gpg"], 2, stdout="", stderr=f"gpg: malformed data: {NSS_PASSWORD}\n"
         )
-        with mock.patch("gpg_bundle.subprocess.run", return_value=done):
+        with mock.patch("gpg_bundle.capture_text", return_value=done):
             with self.assertRaises(ActionError) as caught:
                 decrypt_bundle(*self.paths())
         self.assertNotIn(
             NSS_PASSWORD, "".join(traceback.format_exception(caught.exception))
         )
 
-    @unittest.expectedFailure
     def test_gpg_wait_is_bounded_and_timeout_is_sanitized(self) -> None:
         def never_finishes(
             argv: list[str], **kwargs: object
@@ -413,7 +568,7 @@ class GPGStatusTests(unittest.TestCase):
             self.assertLessEqual(timeout, 60)
             raise subprocess.TimeoutExpired(argv, timeout, stderr=NSS_PASSWORD)
 
-        with mock.patch("gpg_bundle.subprocess.run", side_effect=never_finishes):
+        with mock.patch("gpg_bundle.capture_text", side_effect=never_finishes):
             with self.assertRaises(ActionError) as caught:
                 decrypt_bundle(*self.paths())
         self.assertNotIn(
@@ -479,7 +634,6 @@ class GPGEnvelopeTests(unittest.TestCase):
             base64.b64encode(packet).decode(),
         )
 
-    @unittest.expectedFailure
     def test_unencrypted_store_packet_is_rejected(self) -> None:
         packet = self.envelope(encrypted=False)
         with self.assertRaises(ActionError):
