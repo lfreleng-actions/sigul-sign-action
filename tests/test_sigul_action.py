@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -29,6 +30,7 @@ from client_container import (
     PulledImage,
     bind,
     container_argv,
+    docker,
     pulled_digest,
     run_container,
     user_for_daemon,
@@ -223,6 +225,27 @@ class ContainerCommandTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         token = lines[0].removeprefix("::stop-commands::")
         self.assertEqual(lines[-1], f"::{token}::")
+
+    @unittest.skipUnless(system_tool("docker"), "needs the docker CLI, not a daemon")
+    def test_a_stuck_container_is_given_up_within_the_cleanup_budget(self) -> None:
+        # Whatever ends the wait, the way out must fit in the ten seconds
+        # the runner allows a cancelled step, with time left to erase
+        # the key material: here the CLI stands in for a container that
+        # ignores its removal.
+        started = time.monotonic()
+        with redirect_stdout(io.StringIO()), self.assertRaises(ActionError) as caught:
+            _ = run_container(["sleep", "60"], "sigul-sign-test-absent", 1)
+        self.assertIn("did not finish within 1s", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 9)
+
+    def test_docker_commands_in_cleanup_are_bounded(self) -> None:
+        def never_returns(*_args: object, **_kwargs: object) -> object:
+            raise subprocess.TimeoutExpired("docker", 5)
+
+        with mock.patch("client_container.subprocess.run", never_returns):
+            done = docker(["rm", "--force", "x"], timeout=5)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("did not finish within 5s", done.stderr)
 
 
 class SigningFileTests(unittest.TestCase):

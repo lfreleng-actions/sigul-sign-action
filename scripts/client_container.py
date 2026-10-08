@@ -66,11 +66,29 @@ def docker_env() -> dict[str, str]:
     return minimal_env(extra)
 
 
-def docker(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run a docker CLI command, capturing its output."""
-    return subprocess.run(
-        ["docker", *args], capture_output=True, text=True, env=docker_env(), check=False
-    )
+def docker(
+    args: list[str], timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run a docker CLI command, capturing its output.
+
+    With a timeout, a command still running when it expires is killed
+    and reported as failed, so that cleanup cannot wait on a daemon
+    that does not answer.
+    """
+    argv = ["docker", *args]
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=docker_env(),
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            argv, -1, "", f"docker {args[0]} did not finish within {timeout}s"
+        )
 
 
 @dataclass(frozen=True)
@@ -270,6 +288,18 @@ def container_argv(
     return argv
 
 
+# How long cleanup waits on the daemon and the CLI. The runner gives a
+# cancelled step about ten seconds in all -- SIGINT, then SIGTERM, then
+# SIGKILL -- and the key material must be erased within them.
+REMOVE_TIMEOUT_SECONDS = 5
+CLI_EXIT_TIMEOUT_SECONDS = 2
+
+
+def remove_container(name: str) -> None:
+    """Remove the container, running or not, within the cleanup budget."""
+    _ = docker(["rm", "--force", name], timeout=REMOVE_TIMEOUT_SECONDS)
+
+
 def run_container(argv: list[str], name: str, timeout: int | None) -> int:
     """Run the container, streaming its output; return its status.
 
@@ -279,7 +309,9 @@ def run_container(argv: list[str], name: str, timeout: int | None) -> int:
     inject a command. Whatever ends the wait -- completion, the timeout,
     or the exception a termination signal raises -- commands are
     switched back on, and a container still running is removed, so
-    cancellation stops the client rather than orphaning it.
+    cancellation stops the client rather than orphaning it. Every wait
+    on the way out is bounded, so that the caller's own cleanup runs
+    before the runner stops waiting.
     """
     token = secrets.token_hex(16)
     print(f"::stop-commands::{token}", flush=True)
@@ -296,11 +328,12 @@ def run_container(argv: list[str], name: str, timeout: int | None) -> int:
             ) from None
         finally:
             if process.poll() is None:
-                _ = docker(["rm", "--force", name])
+                remove_container(name)
                 try:
-                    _ = process.wait(timeout=30)
+                    _ = process.wait(timeout=CLI_EXIT_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    _ = process.wait()
     finally:
         # On a line of its own: the container's last output may not end
         # with a newline, and a token joined to it would not be read as a

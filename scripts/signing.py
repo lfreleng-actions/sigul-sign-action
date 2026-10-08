@@ -39,8 +39,8 @@ from client_container import (
     bind,
     container_argv,
     container_user,
-    docker,
     pull_image,
+    remove_container,
     run_container,
 )
 from git_tag import SigningRepository, workspace_git_dir, write_tag_ref
@@ -313,7 +313,13 @@ def sign(plan: Plan, values: dict[str, str]) -> None:
         else:
             sign_git_tag(run, work, values["GH_KEY"])
     finally:
-        _ = docker(["rm", "--force", name])
+        # The key material first, and nothing that could wait on the
+        # daemon before it: a cancelled step has about ten seconds
+        # before the runner kills it, and run_container has already
+        # asked for any container still running to be removed. The
+        # container holds the same files through its mount, and is
+        # gone, or going, by the time they are erased here.
+        destroy(work)
         kill_gpg_agent(gnupg)
         destroy(gnupg)
-        destroy(work)
+        remove_container(name)

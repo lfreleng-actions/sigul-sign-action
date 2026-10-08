@@ -284,8 +284,10 @@ built from one would send signing nowhere.
   cancellation included, the action overwrites each file that held one
   before removing it, without depending on `shred`; like `shred`, that
   cannot reach copies a copy-on-write or journalling filesystem keeps, which
-  is why memory comes first. A composite action has no post step, so the
-  step that creates them removes them.
+  is why memory comes first. The runner gives a cancelled step about ten
+  seconds before killing it, so the action bounds every wait on the way out
+  and erases the key material before anything else. A composite action has
+  no post step, so the step that creates them removes them.
 - The client container receives them as files: no secret appears on any
   command line, in any environment, or in `docker inspect`. The signing step
   hands them to a fresh process image through an anonymous in-memory file,
