@@ -74,7 +74,6 @@ class SigningFixture:
 
 
 class CleanupSignalTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_first_signal_during_final_cleanup_does_not_abandon_secrets(self) -> None:
         fixture = SigningFixture(self)
         fired = False
@@ -100,7 +99,6 @@ class CleanupSignalTests(unittest.TestCase):
         self.assertFalse(fixture.creds.exists())
         self.assertFalse(fixture.work.exists())
 
-    @unittest.expectedFailure
     def test_one_cleanup_failure_does_not_abandon_other_secrets(self) -> None:
         fixture = SigningFixture(self)
         visited: list[Path] = []
@@ -140,7 +138,6 @@ class UnreapableCLI:
 
 
 class ProcessReapingTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_unreapable_cli_never_causes_an_unbounded_wait(self) -> None:
         process = UnreapableCLI()
         with (
@@ -157,7 +154,6 @@ class ProcessReapingTests(unittest.TestCase):
 
 
 class StaleCleanupTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_failed_unlink_does_not_skip_later_stale_signatures(self) -> None:
         workspace = scratch(self)
         for name in ("a.txt", "b.txt", "c.txt"):

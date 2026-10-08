@@ -7,15 +7,13 @@
 Runs on the RUNNER, under Python 3.10 or later, in both of the
 action's steps: the validation step, whose environment holds no
 credential, and the signing step, which rebuilds the same plan before
-writing anything. A misconfigured call therefore fails before any
-secret reaches the disk.
+writing anything. Structural input errors fail before credentials are
+materialised; credential contents and tag existence are checked later.
 
-The inputs are lfit/sigul-sign-action's, with their behaviour, so a
-caller migrates by changing only its 'uses:' line. The additions --
-container selection, dry-run, push-tag, exclusions, retries -- are
-optional, and their defaults reproduce that action. The client image
-and hosts entries are chosen in client_image.py, and the files to sign
-in sign_targets.py.
+Legacy input names remain, with stricter signing and credential rules.
+The unsupported legacy image requires explicit risk acceptance. Client
+images and hosts entries are chosen in client_image.py; sign_targets.py
+selects the files and checks output dependencies.
 """
 
 from __future__ import annotations
@@ -99,7 +97,7 @@ def build_plan(
     pins_dir: Path,
     tag_checker: Callable[[str], None] = check_tag_name,
 ) -> Plan:
-    """Validate every input and return the plan."""
+    """Validate public input structure and credential presence."""
     messages = Messages()
     workspace_raw = env.get("GITHUB_WORKSPACE", "")
     if not workspace_raw or not os.path.isdir(workspace_raw):
@@ -120,6 +118,19 @@ def build_plan(
         env.get("CONTAINER_DIGEST", ""),
         pins_dir,
     )
+    allow_legacy = parse_bool("allow-legacy", env.get("ALLOW_LEGACY", "false"))
+    if image.source == "legacy":
+        if not allow_legacy:
+            raise InputError(
+                "the legacy client uses unsupported CentOS 7/Python 2; "
+                + "set allow-legacy: true only with an approved risk exception, "
+                + "or select a maintained client compatible with your server"
+            )
+        messages.warnings.append(
+            "legacy client risk accepted: CentOS 7/Python 2 no longer receive "
+            + "upstream security fixes; use an isolated signing runner and "
+            + "a time-bounded migration plan"
+        )
     hosts = resolve_hosts(
         env.get("HOSTS_ENTRY", "auto"),
         env.get("SIGUL_IP", ""),

@@ -8,9 +8,9 @@ Runs on the RUNNER, under Python 3.10 or later, invoked by action.yaml
 as 'python3 -E -s sigul_action.py <command>' so that no PYTHON*
 variable from the job can change what it imports.
 
-  validate  Checks every input and prints the plan. Its environment
-            holds no credential, so a misconfigured call fails before
-            any secret exists on disk.
+  validate  Checks public input structure and credential presence,
+            emits validation provenance, and prints the plan without
+            receiving signing credential values.
   sign      Re-executes without the secret inputs in its environment,
             rebuilds the same plan, and signs (signing.py).
   pin NAME  Prints the image reference a built-in container pins; the
@@ -25,7 +25,6 @@ import socket
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from types import FrameType
 
 from action_common import (
     PASSTHROUGH_VARIABLES,
@@ -35,6 +34,7 @@ from action_common import (
     error,
     info,
     notice,
+    set_output,
     system_tool,
     warning,
 )
@@ -42,6 +42,8 @@ from action_inputs import Plan, build_plan
 from client_container import DOCKER_VARIABLES
 from client_image import NICKNAMES, read_pin
 from signing import sign
+from termination import Cancelled as Cancelled
+from termination import on_signal as on_signal
 
 PINS_DIR = Path(__file__).resolve().parent.parent / "containers"
 
@@ -68,6 +70,7 @@ SIGNING_ENVIRONMENT = (
     "SIGUL_KEY_NAME",
     "GH_USER",
     "CONTAINER",
+    "ALLOW_LEGACY",
     "CONTAINER_IMAGE",
     "CONTAINER_TAG",
     "CONTAINER_DIGEST",
@@ -100,22 +103,6 @@ SIGNING_ENVIRONMENT = (
     "TZ",
     *PASSTHROUGH_VARIABLES,
 )
-
-
-class Cancelled(ActionError):
-    """The job was cancelled, or the step received a signal."""
-
-
-def on_signal(signum: int, _frame: FrameType | None) -> None:
-    """Turn a termination signal into an exception, so cleanup runs.
-
-    Later signals are ignored: the runner escalates SIGINT to SIGTERM
-    on cancellation, and a second exception raised in the middle of
-    the cleanup would abandon it.
-    """
-    for other in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        _ = signal.signal(other, signal.SIG_IGN)
-    raise Cancelled(f"interrupted by signal {signum}; cleaning up")
 
 
 # --- Validation ------------------------------------------------------
@@ -208,7 +195,12 @@ def check_hosts_against_dns(
 
 def command_validate() -> None:
     check_runtime()
-    plan = build_plan(os.environ, PINS_DIR)
+    try:
+        plan = build_plan(os.environ, PINS_DIR)
+    except ActionError:
+        set_output("validation_status", "rejected")
+        raise
+    set_output("validation_status", "passed")
     report_plan(plan)
     check_hosts_against_dns(plan)
     info("Inputs validated ✅")

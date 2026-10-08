@@ -268,7 +268,7 @@ class ContainerCommandTests(unittest.TestCase):
         def never_returns(*_args: object, **_kwargs: object) -> object:
             raise subprocess.TimeoutExpired("docker", 5)
 
-        with mock.patch("client_container.subprocess.run", never_returns):
+        with mock.patch("client_container.capture_text", never_returns):
             done = docker(["rm", "--force", "x"], timeout=5)
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("did not finish within 5s", done.stderr)
@@ -422,11 +422,11 @@ class CommandLineTests(unittest.TestCase):
         with redirect_stdout(output):
             report_plan(plan)
         lines = output.getvalue().splitlines()
-        self.assertIn(f"Files to sign: {LISTING_LIMIT + 3}", lines)
+        self.assertIn(f"INFO: Files to sign: {LISTING_LIMIT + 3}", lines)
         self.assertEqual(
             sum(1 for line in lines if line.endswith(".jar")), LISTING_LIMIT
         )
-        self.assertIn("  … and 3 more", lines)
+        self.assertIn("INFO:   … and 3 more", lines)
 
 
 def interpreter_is_trusted() -> bool:

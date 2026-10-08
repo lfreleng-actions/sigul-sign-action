@@ -8,10 +8,10 @@
 # client sends data to a bridge, the bridge relays it to the server, and
 # a signature comes back. Nothing here holds a signing key.
 #
-# A DROP-IN REPLACEMENT for lfit/sigul-sign-action. Its inputs keep
-# their names and behaviour, so a caller migrates by changing only the
-# 'uses:' line. Every input added here is optional, and the defaults
-# reproduce that action.
+# Compatible input names for lfit/sigul-sign-action. Migration also
+# requires explicit consent for the unsupported legacy client, a
+# supported host runtime, and an integrity-protected credential bundle.
+# See README.md for the security-related compatibility restrictions.
 #
 # TWO GENERATIONS OF SIGUL. The Linux Foundation runs sigul 0.207 on
 # CentOS 7 ('legacy') and a containerised sigul 1.4 stack ('modern',
@@ -89,9 +89,16 @@ inputs:
       Built-in Sigul client image: 'legacy' (sigul 0.207, linux/amd64)
       or 'modern' (sigul 1.4, linux/amd64 and linux/arm64). Empty
       selects 'legacy', unless container-image is set; setting both is
-      an error.
+      an error. Legacy use also requires explicit allow-legacy consent.
     required: false
     default: ""
+  allow-legacy:
+    description: >
+      Explicitly accept the unsupported CentOS 7/Python 2 client for
+      legacy infrastructure. Requires an approved, time-bounded risk
+      exception and isolated runner; does not make that image secure.
+    required: false
+    default: "false"
   container-image:
     description: >
       A bespoke Sigul client image, in place of 'container': a registry
@@ -163,6 +170,12 @@ inputs:
     default: "600"
 
 outputs:
+  validation_status:
+    description: >
+      Structural input validation result: 'passed' or 'rejected'. Empty
+      when the action or runtime could not start validation. Does not
+      certify credentials, signatures, or successful signing.
+    value: ${{ steps.validate.outputs.validation_status }}
   signed_count:
     description: >
       Files signed: 0 for 'sign-git-tag', which signs a tag object, and
@@ -175,9 +188,9 @@ outputs:
 runs:
   using: "composite"
   steps:
-    # No credential reaches this step, so a misconfigured call fails
-    # before any secret is written to disk. The HAVE_* flags say only
-    # whether each secret was supplied.
+    # Signing credentials are represented only by presence flags here.
+    # Structural rejection happens before materialization; decryption
+    # and credential-content checks belong to the signing step.
     #
     # Nothing an earlier step changes through GITHUB_ENV or GITHUB_PATH
     # redirects either step, where the signing step holds the secret
@@ -203,6 +216,7 @@ runs:
     # job runs as the same user, with sudo on GitHub-hosted runners, so
     # every step in a job that signs must be trusted.
     - name: "Validate inputs"
+      id: validate
       shell: /bin/bash --noprofile --norc -p -eo pipefail {0}
       env:
         BASH_ENV: ""
@@ -232,6 +246,7 @@ runs:
         HAVE_SIGUL_PASS: ${{ inputs.sigul-pass != '' }}
         HAVE_SIGUL_PKI: ${{ inputs.sigul-pki != '' }}
         HAVE_GH_KEY: ${{ inputs.gh-key != '' }}
+        ALLOW_LEGACY: ${{ inputs.allow-legacy }}
       run: |
         set -euo pipefail
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
@@ -276,6 +291,7 @@ runs:
         SIGUL_PASS: ${{ inputs.sigul-pass }}
         SIGUL_PKI: ${{ inputs.sigul-pki }}
         GH_KEY: ${{ inputs.gh-key }}
+        ALLOW_LEGACY: ${{ inputs.allow-legacy }}
       run: |
         set -euo pipefail
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"

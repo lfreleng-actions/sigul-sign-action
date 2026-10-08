@@ -26,6 +26,7 @@ from action_common import ActionError, info, minimal_env
 from action_inputs import Plan
 from client_image import Image
 from prepare_credentials import PreparedCredentials
+from process_control import capture_text, kill_and_poll
 
 CONTAINER_SCRIPTS_SOURCE = Path(__file__).resolve().parent / "container"
 CONTAINER_CREDS = "/sigul-creds"
@@ -77,14 +78,7 @@ def docker(
     """
     argv = ["docker", *args]
     try:
-        return subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            env=docker_env(),
-            check=False,
-            timeout=timeout,
-        )
+        return capture_text(argv, env=docker_env(), timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             argv, -1, "", f"docker {args[0]} did not finish within {timeout}s"
@@ -319,12 +313,15 @@ def container_argv(
 # cancelled step about ten seconds in all -- SIGINT, then SIGTERM, then
 # SIGKILL -- and the key material must be erased within them.
 REMOVE_TIMEOUT_SECONDS = 5
-CLI_EXIT_TIMEOUT_SECONDS = 2
 
 
 def remove_container(name: str) -> None:
     """Remove the container, running or not, within the cleanup budget."""
-    _ = docker(["rm", "--force", name], timeout=REMOVE_TIMEOUT_SECONDS)
+    done = docker(["rm", "--force", name], timeout=REMOVE_TIMEOUT_SECONDS)
+    if done.returncode and "No such container" not in done.stderr:
+        raise ActionError(
+            f"could not remove signing container {name}; check the daemon"
+        )
 
 
 def run_container(argv: list[str], name: str, timeout: int | None) -> int:
@@ -335,10 +332,10 @@ def run_container(argv: list[str], name: str, timeout: int | None) -> int:
     Sigul's own output, could otherwise start a line with '::' and
     inject a command. Whatever ends the wait -- completion, the timeout,
     or the exception a termination signal raises -- commands are
-    switched back on, and a container still running is removed, so
-    cancellation stops the client rather than orphaning it. Every wait
-    on the way out is bounded, so that the caller's own cleanup runs
-    before the runner stops waiting.
+    switched back on and the CLI is killed without a blocking reap.
+    The caller owns container removal, after erasing credential files:
+    waiting on the daemon here would consume the cancellation budget
+    before that erasure. No timeout can interrupt blocked kernel I/O.
     """
     token = secrets.token_hex(16)
     print(f"::stop-commands::{token}", flush=True)
@@ -351,16 +348,11 @@ def run_container(argv: list[str], name: str, timeout: int | None) -> int:
             return process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             raise ActionError(
-                f"the container did not finish within {timeout}s"
+                f"container {name} did not finish within {timeout}s"
             ) from None
         finally:
             if process.poll() is None:
-                remove_container(name)
-                try:
-                    _ = process.wait(timeout=CLI_EXIT_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    _ = process.wait()
+                kill_and_poll(process)
     finally:
         # On a line of its own: the container's last output may not end
         # with a newline, and a token joined to it would not be read as a

@@ -123,17 +123,14 @@ class LiveVerificationTests(WorkflowShellTests):
             **{"PUBLIC_KEY": "synthetic expected public key", **env},
         )
 
-    @unittest.expectedFailure
     def test_data_verification_requires_an_expected_key(self) -> None:
         done = self.verify("sign-data", PUBLIC_KEY="")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_tag_verification_requires_an_expected_key(self) -> None:
         done = self.verify("sign-git-tag", PUBLIC_KEY="")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_expected_key_is_required_before_credentials_are_used(self) -> None:
         signing = LIVE_STEPS.index(named_step(LIVE_STEPS, "Sign with Sigul"))
         gates = [
@@ -213,7 +210,6 @@ class ValidationAssertionTests(WorkflowShellTests):
     def test_success_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(outcome="success")
 
-    @unittest.expectedFailure
     def test_validation_status_is_wired_to_the_action_output(self) -> None:
         self.assertRegex(
             VALIDATION_STEP,
@@ -221,43 +217,33 @@ class ValidationAssertionTests(WorkflowShellTests):
             + r"\$\{\{ steps\.invalid\.outputs\.validation_status \}\}[\"']?$",
         )
 
-    @unittest.expectedFailure
     def test_empty_outcome_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(outcome="")
 
-    @unittest.expectedFailure
     def test_cancelled_outcome_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(outcome="cancelled")
 
-    @unittest.expectedFailure
     def test_skipped_outcome_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(outcome="skipped")
 
-    @unittest.expectedFailure
     def test_unknown_outcome_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(outcome="unknown")
 
-    @unittest.expectedFailure
     def test_failure_without_validation_status_is_not_a_rejection(self) -> None:
         self.assert_not_rejected(status="")
 
-    @unittest.expectedFailure
     def test_failure_after_validation_passed_is_not_a_rejection(self) -> None:
         self.assert_not_rejected(status="passed")
 
-    @unittest.expectedFailure
     def test_bootstrap_failure_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(status="bootstrap")
 
-    @unittest.expectedFailure
     def test_unknown_status_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(status="unknown")
 
-    @unittest.expectedFailure
     def test_success_status_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(status="success")
 
-    @unittest.expectedFailure
     def test_cancelled_status_is_not_a_validation_rejection(self) -> None:
         self.assert_not_rejected(status="cancelled")
 

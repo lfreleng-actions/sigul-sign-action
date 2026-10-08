@@ -25,7 +25,6 @@ from tests.helpers import PINS_DIR, REPOSITORY, base_env, scratch
 
 
 class LoggingBoundaryTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_progress_cannot_issue_either_workflow_command_format(self) -> None:
         captured = io.StringIO()
         with redirect_stdout(captured):
@@ -35,7 +34,6 @@ class LoggingBoundaryTests(unittest.TestCase):
             self.assertFalse(line.lstrip().startswith("::"))
             self.assertNotIn("##[", line)
 
-    @unittest.expectedFailure
     def test_selected_filename_is_data_not_a_legacy_command(self) -> None:
         workspace = scratch(self)
         _ = (workspace / "##[stop-commands]synthetic-token").write_text("payload")
@@ -55,7 +53,6 @@ class ValidationBoundaryTests(unittest.TestCase):
         _ = (workspace / "a.txt").write_text("payload")
         return workspace
 
-    @unittest.expectedFailure
     def test_legacy_requires_explicit_risk_acceptance(self) -> None:
         env = base_env(self.workspace())
         _ = env.pop("ALLOW_LEGACY", None)
@@ -66,7 +63,6 @@ class ValidationBoundaryTests(unittest.TestCase):
         plan = build_plan(base_env(self.workspace(), ALLOW_LEGACY="true"), PINS_DIR)
         self.assertEqual(plan.image.source, "legacy")
 
-    @unittest.expectedFailure
     def test_rejected_inputs_emit_validation_provenance(self) -> None:
         workspace = self.workspace()
         output = workspace / "output"
@@ -85,7 +81,6 @@ class ValidationBoundaryTests(unittest.TestCase):
         self.assertTrue(output.is_file())
         self.assertEqual(output.read_text(), "validation_status=rejected\n")
 
-    @unittest.expectedFailure
     def test_successful_validation_is_distinguishable_from_later_failure(self) -> None:
         workspace = self.workspace()
         output = workspace / "output"
@@ -112,7 +107,6 @@ class ValidationBoundaryTests(unittest.TestCase):
 
 
 class ContainerPathTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_relative_and_empty_image_paths_are_refused_before_execution(self) -> None:
         base = scratch(self)
         workspace = base / "workspace"
@@ -149,7 +143,6 @@ class ContainerPathTests(unittest.TestCase):
 
 
 class DryRunMountTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_data_dry_run_mounts_workspace_read_only(self) -> None:
         workspace = scratch(self)
         _ = (workspace / "a.txt").write_text("payload")

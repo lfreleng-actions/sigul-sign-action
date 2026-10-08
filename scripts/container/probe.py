@@ -23,8 +23,9 @@ hosts entries and environment a real run gets. It checks, in order:
      its own health checks off the listeners for this reason). Only a
      real signing run proves the bridge reachable;
   6. the work itself is reachable: every file to sign is readable and
-     its signature's directory writable, or the tag resolves in the
-     signing repository.
+     its signature's directory present, or the tag resolves in the
+     signing repository. The runner checks output permissions before
+     mounting the data workspace read-only.
 
 Steps 2 to 4 import sigul's modules rather than reimplementing them,
 so the check is what the client would actually do, not an
@@ -103,8 +104,8 @@ def load_configuration(client, utils):
             ".sigul/client.conf; sigul would prompt for it, which a batch "
             "run cannot answer"
         )
-    except config_error as error:
-        fail("sigul rejected the client configuration: {}".format(error))
+    except config_error:
+        fail("sigul rejected the client configuration; check its sections and options")
     info(
         "configuration: bridge {}:{}, server {}, user {}, certificate '{}'".format(
             config.bridge_hostname,
@@ -171,7 +172,7 @@ def check_bridge(config):
 
 
 def check_files(manifest):
-    """Every source is readable and every output directory writable."""
+    """Read sources without requesting write access to the read-only mount."""
     pairs = read_manifest(manifest)
     for source, output in pairs:
         try:
@@ -179,9 +180,13 @@ def check_files(manifest):
         except (IOError, OSError) as error:
             fail("cannot read {}: {}".format(source, error))
         directory = os.path.dirname(output)
-        if not os.access(directory, os.W_OK):
-            fail("cannot write signatures into " + directory)
-    info("{} file(s) readable, signature locations writable".format(len(pairs)))
+        if not os.path.isdir(directory):
+            fail("signature directory is missing: " + directory)
+    info(
+        "{} file(s) readable; output permissions checked on the runner".format(
+            len(pairs)
+        )
+    )
     return len(pairs)
 
 

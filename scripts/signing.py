@@ -20,6 +20,7 @@ import os
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 from pathlib import Path
 
@@ -49,6 +50,7 @@ from client_container import (
 from git_tag import SigningRepository, workspace_git_dir, write_tag_ref
 from gpg_bundle import kill_gpg_agent
 from prepare_credentials import prepare
+from termination import defer_termination
 
 # A dry run does no signing, so it has no business running long; a
 # real run's duration scales with the work and is the job's to bound.
@@ -56,9 +58,8 @@ DRY_RUN_TIMEOUT_SECONDS = 600
 
 SUMMARY_FILE_LIMIT = 50
 
-# Where the key material is unpacked, when it can be: a tmpfs, so that
-# nothing written there reaches a disk. Every Linux the action runs on
-# mounts one here, apart from some container runtimes.
+# Prefer tmpfs over persistent storage. Swap, crash dumps, and a lost
+# runner still prevent an unconditional memory-only/erasure guarantee.
 SHARED_MEMORY = "/dev/shm"
 
 
@@ -81,12 +82,10 @@ def is_memory_backed(path: str) -> bool:
 def private_directory(prefix: str, fallback: str | None) -> Path:
     """Create a mode-0700 temporary directory, in memory where possible.
 
-    Key material written to a tmpfs never reaches a disk, which the
-    overwrite in destroy() cannot promise on a journalling or
-    copy-on-write filesystem; the path is also short, as gpg-agent's
-    socket needs. Where /dev/shm is missing, not a tmpfs or not
-    writable, the fallback serves and the overwrite is what it always
-    was. lfit/sigul-sign-action 2.0.0 made the same choice.
+    tmpfs avoids ordinary persistent writes but can be swapped. Its
+    short path also fits gpg-agent sockets. Without a usable tmpfs,
+    fall back to the supplied directory and overwrite files on cleanup;
+    that cannot erase older CoW, journal, snapshot, or crash-dump copies.
     """
     if is_memory_backed(SHARED_MEMORY) and os.access(SHARED_MEMORY, os.W_OK):
         return Path(tempfile.mkdtemp(prefix=prefix, dir=SHARED_MEMORY))
@@ -96,16 +95,22 @@ def private_directory(prefix: str, fallback: str | None) -> Path:
 def clear_stale_signatures(plan: Plan) -> None:
     """Remove every signature this run will write, before signing.
 
-    A failed run then leaves no signature from an earlier one behind
-    for any file it was asked to sign.
+    Try every output even if one cannot be removed; any failure aborts
+    signing and identifies the outputs the caller must remove.
     """
     removed = 0
+    failed: list[str] = []
     for target in plan.targets:
         if os.path.lexists(target.output):
-            os.remove(target.output)
-            removed += 1
+            try:
+                os.remove(target.output)
+                removed += 1
+            except OSError:
+                failed.append(target.output)
     if removed:
         info(f"Removed {removed} signature(s) left by an earlier run")
+    if failed:
+        raise ActionError("cannot remove stale signatures: " + ", ".join(failed))
 
 
 def write_manifest(path: Path, plan: Plan) -> None:
@@ -128,13 +133,27 @@ def destroy(path: Path) -> None:
     change, and a file that still cannot be erased is reported, without
     holding up the rest.
     """
+    if path.is_symlink():
+        path.unlink()
+        return
     if not path.exists():
         return
     unerased = 0
-    _make_owner_writable(path)
-    for root, directories, files in os.walk(path):
+
+    def inaccessible(_error: OSError) -> None:
+        nonlocal unerased
+        unerased += 1
+
+    try:
+        _make_owner_writable(path)
+    except OSError as exc:
+        inaccessible(exc)
+    for root, directories, files in os.walk(path, onerror=inaccessible):
         for name in directories:
-            _make_owner_writable(Path(root) / name)
+            try:
+                _make_owner_writable(Path(root) / name)
+            except OSError as exc:
+                inaccessible(exc)
         for name in files:
             try:
                 shred_file(Path(root) / name)
@@ -142,8 +161,8 @@ def destroy(path: Path) -> None:
                 unerased += 1
     shutil.rmtree(path, ignore_errors=True)
     if unerased or path.exists():
-        warning(
-            f"could not erase {unerased} file(s) under {path}"
+        raise ActionError(
+            f"could not erase {unerased} entry(s) under {path}"
             + ("; the directory remains" if path.exists() else "")
         )
 
@@ -166,8 +185,13 @@ def sign_data(run: ContainerRun) -> None:
     else:
         environment["COUNT_FILE"] = f"{CONTAINER_CREDS}/count"
     script = "probe.py" if plan.dry_run else "sign_data.py"
+    check_output_permissions(plan)
     argv = container_argv(
-        run, [bind(workspace, workspace)], environment, workspace, script
+        run,
+        [bind(workspace, workspace, readonly=plan.dry_run)],
+        environment,
+        workspace,
+        script,
     )
     status = run_container(
         argv, run.name, DRY_RUN_TIMEOUT_SECONDS if plan.dry_run else None
@@ -288,10 +312,53 @@ def sign_git_tag(run: ContainerRun, work: Path, gh_key: str) -> None:
         summarise([f"Signed tag {markdown_code(plan.tag)} with Sigul (not pushed) ✅"])
 
 
+def check_output_permissions(plan: Plan) -> None:
+    """Check the runner's original mount before the dry-run view is read-only."""
+    for target in plan.targets:
+        if not os.access(os.path.dirname(target.output), os.W_OK | os.X_OK):
+            raise ActionError(f"cannot write signatures beside {target.name}")
+
+
+def cleanup(work: Path, gnupg: Path, name: str) -> None:
+    """Attempt every cleanup stage, with secret erasure ahead of Docker I/O."""
+    failures: list[str] = []
+    unwinding = sys.exc_info()[0] is not None
+    with defer_termination():
+        for directory in (work / "creds", work / "home"):
+            try:
+                destroy(directory)
+            except (ActionError, OSError):
+                failures.append(str(directory))
+        try:
+            kill_gpg_agent(gnupg)
+        except (ActionError, OSError):
+            failures.append("gpg-agent shutdown")
+        try:
+            destroy(gnupg)
+        except (ActionError, OSError):
+            failures.append(str(gnupg))
+        try:
+            remove_container(name)
+        except (ActionError, OSError):
+            failures.append("container removal")
+        # Any remaining checkout objects are public signing inputs, not keys.
+        shutil.rmtree(work, ignore_errors=True)
+        if work.exists():
+            failures.append(str(work))
+        if failures:
+            message = "cleanup incomplete: " + ", ".join(failures)
+            if unwinding:
+                warning(message)
+            else:
+                raise ActionError(message)
+
+
 def sign(plan: Plan, values: dict[str, str]) -> None:
     """Materialise credentials, run the container, record the result."""
-    if plan.sign_type == "sign-data" and not plan.dry_run:
-        clear_stale_signatures(plan)
+    if plan.sign_type == "sign-data":
+        check_output_permissions(plan)
+        if not plan.dry_run:
+            clear_stale_signatures(plan)
     # Both before any credential is written: a daemon the client cannot
     # run under, or an image it cannot pull, fails here.
     security_options = daemon_security_options()
@@ -330,13 +397,4 @@ def sign(plan: Plan, values: dict[str, str]) -> None:
         else:
             sign_git_tag(run, work, values["GH_KEY"])
     finally:
-        # The key material first, and nothing that could wait on the
-        # daemon before it: a cancelled step has about ten seconds
-        # before the runner kills it, and run_container has already
-        # asked for any container still running to be removed. The
-        # container holds the same files through its mount, and is
-        # gone, or going, by the time they are erased here.
-        destroy(work)
-        kill_gpg_agent(gnupg)
-        destroy(gnupg)
-        remove_container(name)
+        cleanup(work, gnupg, name)

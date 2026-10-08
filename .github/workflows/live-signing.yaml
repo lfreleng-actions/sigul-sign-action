@@ -11,9 +11,9 @@
 # 'Dry run' is ticked by default. A dry run does everything short of
 # signing -- it pulls the image, decrypts the credentials, has the
 # Sigul client load its configuration, NSS database and certificate,
-# and resolves the bridge -- and changes nothing anywhere, so it is
-# safe to run against production infrastructure at any time. Untick
-# it to have the server actually sign.
+# and resolves the bridge without connecting. It still decrypts real
+# credentials and runs the selected image, so requires a trusted job.
+# Untick it to sign and verify against the expected public key.
 #
 # CREDENTIALS. Each infrastructure has its own environment, which also
 # carries any protection rules (required reviewers, say):
@@ -28,11 +28,13 @@
 #   SIGUL_CONF   client.conf, with any Jenkins $SIGUL_CONFIG_* filled in
 #   SIGUL_PASS   key passphrase, which also decrypts SIGUL_PKI
 #   SIGUL_PKI    the encrypted PKI bundle
-#   SIGUL_IP     optional: with SIGUL_URI, a hosts entry for the
-#   SIGUL_URI    bridge, as the legacy action added
+#   SIGUL_IP     optional: with SIGUL_URI, a hosts entry for the bridge
+#   SIGUL_URI    required here for the egress policy; may be a variable
+#               instead of a secret. Must match bridge-hostname in
+#               SIGUL_CONF and one approved bridge below.
 #
-# and optionally a SIGUL_PUBLIC_KEY variable: the signing key's public
-# half, armoured, so a real run's signature is verified as well.
+# A non-dry run also requires SIGUL_PUBLIC_KEY as a variable: the trusted
+# signing key's armoured public half, against which signatures are verified.
 name: "Live signing 🔏"
 
 # yamllint disable-line rule:truthy
@@ -44,6 +46,10 @@ on:
         type: choice
         options: ["legacy", "modern"]
         default: "legacy"
+      allow-legacy:
+        description: "Accept the unsupported legacy client for this run"
+        type: boolean
+        default: false
       operation:
         description: "What to sign"
         type: choice
@@ -70,29 +76,70 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 20
+    env:
+      BRIDGE_HOST: ${{ secrets.SIGUL_URI || vars.SIGUL_URI }}
     steps:
-      # Block mode, with an organisation allow-list release carrying the
-      # Sigul bridges (added by lfreleng-actions/.github#261, in v0.16.7)
-      # alongside the registries the client images come from: this job
-      # holds real signing credentials, so nothing else may be reached.
-      # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
-        with:
-          config: '@ac32415b91e0b6db1166bc451024c472cdbcbd3d'  # v0.16.8
-
+      # The firewall starts in a pre hook, before checkout. Keep its policy
+      # inline: the organisation loader adds unrelated publishing endpoints.
+      # Admit HTTPS checkout, the selected registry, and one approved bridge.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: 'block'
-          allowed-endpoints: >
-            ${{ env.CONNECTION_ALLOW_LIST }}
+          allowed-endpoints: >-
+            github.com:443
+            ${{ inputs.container == 'modern' &&
+                'ghcr.io:443 pkg-containers.githubusercontent.com:443' || '' }}
+            ${{ inputs.container == 'legacy' &&
+                'auth.docker.io:443 registry-1.docker.io:443' || '' }}
+            ${{ inputs.container == 'legacy' &&
+                'production.cloudflare.docker.com:443' || '' }}
+            ${{ inputs.container == 'legacy' &&
+                'production.cloudfront.docker.com:443' || '' }}
+            ${{ inputs.container == 'legacy' &&
+                (env.BRIDGE_HOST ==
+                  'sigul-bridge-yul.linuxfoundation.org' ||
+                 env.BRIDGE_HOST ==
+                  'sigul-bridge-us-west-2.linuxfoundation.org') &&
+                format('{0}:44334', env.BRIDGE_HOST) || '' }}
+            ${{ inputs.container == 'modern' &&
+                env.BRIDGE_HOST == 'sigul-bridge.opensearch.org' &&
+                'sigul-bridge.opensearch.org:44334' || '' }}
 
       - name: "Checkout repository"
         # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: "Require the expected public key"
+        if: ${{ !inputs.dry-run }}
+        shell: bash
+        env:
+          PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PUBLIC_KEY//[[:space:]]/}" ]; then
+            echo "::error::Set SIGUL_PUBLIC_KEY before a non-dry signing run"
+            exit 1
+          fi
+
+      - name: "Check the selected bridge"
+        shell: bash
+        env:
+          CONTAINER: ${{ inputs.container }}
+        run: |
+          set -euo pipefail
+          case "${CONTAINER}:${BRIDGE_HOST}" in
+            legacy:sigul-bridge-yul.linuxfoundation.org | \
+            legacy:sigul-bridge-us-west-2.linuxfoundation.org | \
+            modern:sigul-bridge.opensearch.org) ;;
+            *)
+              echo "::error::SIGUL_URI does not match the selected client"
+              exit 1
+              ;;
+          esac
 
       - name: "Make something to sign"
         id: target
@@ -124,6 +171,7 @@ jobs:
         uses: $/
         with:
           container: ${{ inputs.container }}
+          allow-legacy: ${{ inputs.allow-legacy }}
           sign-type: ${{ inputs.operation }}
           sign-object: ${{ steps.target.outputs.object }}
           push-tag: "false"
@@ -133,7 +181,7 @@ jobs:
           sigul-pass: ${{ secrets.SIGUL_PASS }}
           sigul-pki: ${{ secrets.SIGUL_PKI }}
           sigul-ip: ${{ secrets.SIGUL_IP }}
-          sigul-uri: ${{ secrets.SIGUL_URI }}
+          sigul-uri: ${{ env.BRIDGE_HOST }}
 
       - name: "Verify the signature"
         if: ${{ !inputs.dry-run }}
@@ -144,6 +192,10 @@ jobs:
           PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "${PUBLIC_KEY//[[:space:]]/}" ]; then
+            echo "::error::SIGUL_PUBLIC_KEY is required to verify the signature"
+            exit 1
+          fi
           if [ "${OPERATION}" = "sign-data" ]; then
             {
               echo "### Signature"
@@ -156,10 +208,7 @@ jobs:
               grep -q "BEGIN PGP SIGNATURE" ||
               { echo "::error::the tag carries no signature"; exit 1; }
           fi
-          if [ -z "${PUBLIC_KEY}" ]; then
-            echo "::notice::No SIGUL_PUBLIC_KEY variable; not verified"
-            exit 0
-          fi
+
           export GNUPGHOME
           GNUPGHOME="$(mktemp -d /tmp/verify.XXXXXX)"
           printf '%s\n' "${PUBLIC_KEY}" | gpg --batch --quiet --import

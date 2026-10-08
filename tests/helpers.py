@@ -75,6 +75,7 @@ def base_env(workspace: Path, **overrides: str) -> dict[str, str]:
         "HAVE_SIGUL_PKI": "true",
         "HAVE_GH_KEY": "false",
         "HOSTS_ENTRY": "auto",
+        "ALLOW_LEGACY": "true",
         "PUSH_TAG": "true",
         "DRY_RUN": "false",
         "MAX_RETRIES": "5",

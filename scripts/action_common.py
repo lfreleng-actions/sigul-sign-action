@@ -92,8 +92,9 @@ def notice(message: str) -> None:
 
 
 def info(message: str) -> None:
-    """Print a progress line, escaped so it cannot inject a command."""
-    print(escape_data(message), flush=True)
+    """Render progress as data for both runner command syntaxes."""
+    rendered = escape_data(message).replace("##[", "##%5B")
+    print("INFO: " + rendered, flush=True)
 
 
 def set_output(name: str, value: str) -> None:

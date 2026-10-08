@@ -26,15 +26,40 @@
 # the search itself.
 set -eu
 
+# Every descendant, including Sigul's own subprocesses, inherits this PATH.
+# Retain image-specific absolute locations, but never resolve tools in cwd.
+remaining="${PATH:-}"
+while :; do
+    component="${remaining%%:*}"
+    case "${component}" in
+        /*) ;;
+        *) echo "ERROR: image PATH must contain only nonempty absolute directories" >&2
+           exit 1 ;;
+    esac
+    case "${remaining}" in
+        *:*) remaining="${remaining#*:}" ;;
+        *) break ;;
+    esac
+done
+export PATH
+
 sigulpath="${SIGULPATH:-/usr/share/sigul}"
+case "${sigulpath}" in
+    /*) ;;
+    *) echo "ERROR: SIGULPATH must be absolute" >&2; exit 1 ;;
+esac
 fallback=""
 for candidate in python3 python; do
-    command -v "${candidate}" >/dev/null 2>&1 || continue
-    [ -n "${fallback}" ] || fallback="${candidate}"
-    if (cd / && "${candidate}" -c \
+    resolved="$(cd / && command -v "${candidate}")" || continue
+    case "${resolved}" in
+        /*) ;;
+        *) echo "ERROR: interpreter path is not absolute" >&2; exit 1 ;;
+    esac
+    [ -n "${fallback}" ] || fallback="${resolved}"
+    if (cd / && "${resolved}" -c \
         'import sys; sys.path.insert(0, sys.argv[1]); import client' \
         "${sigulpath}") >/dev/null 2>&1; then
-        exec "${candidate}" "$@"
+        exec "${resolved}" "$@"
     fi
 done
 
