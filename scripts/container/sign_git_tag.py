@@ -20,6 +20,8 @@ Environment (required unless noted):
   SIGUL_PASSWORD  path to the passphrase file (NUL-terminated)
   MAX_RETRIES     attempts (optional, default 5)
   RETRY_DELAY     seconds between attempts (optional, default 15)
+  ATTEMPT_TIMEOUT seconds an attempt may take, 0 for no limit
+                  (optional, default 0)
 """
 
 from __future__ import print_function
@@ -28,12 +30,13 @@ import time
 
 from container_common import (
     PGP_SIGNATURE_MARKER,
+    TIMED_OUT,
     call_with_password,
     fail,
     git_output,
     info,
-    int_env,
     require_env,
+    retry_policy,
     set_default_user,
     warn,
 )
@@ -52,10 +55,7 @@ def main():
     tag = require_env("GIT_TAG")
     key = require_env("SIGUL_KEY")
     password_file = require_env("SIGUL_PASSWORD")
-    max_retries = int_env("MAX_RETRIES", 5)
-    retry_delay = int_env("RETRY_DELAY", 15)
-    if max_retries < 1:
-        fail("MAX_RETRIES must be at least 1")
+    retry = retry_policy()
 
     unsigned = tag_oid(tag)
     status, kind = git_output(["cat-file", "-t", unsigned])
@@ -66,7 +66,7 @@ def main():
     argv = ["sigul", "--batch", "sign-git-tag", "--", key, tag]
     attempt = 1
     while True:
-        status = call_with_password(argv, password_file)
+        status = call_with_password(argv, password_file, retry.timeout)
         current = tag_oid(tag)
         if current != unsigned:
             # sigul moved the ref, so the signature landed. Retrying now
@@ -80,14 +80,16 @@ def main():
                 fail("the tag changed but carries no signature")
             info("signed git tag {} (attempt {})".format(tag, attempt))
             return 0
-        if attempt >= max_retries:
+        if status == TIMED_OUT:
+            warn("sigul did not finish within {}s".format(retry.timeout))
+        if attempt >= retry.attempts:
             fail("sign-git-tag failed after {} attempt(s)".format(attempt))
         warn(
             "sign-git-tag failed (attempt {}/{}), retrying in {}s".format(
-                attempt, max_retries, retry_delay
+                attempt, retry.attempts, retry.delay
             )
         )
-        time.sleep(retry_delay)
+        time.sleep(retry.delay)
         attempt += 1
 
 

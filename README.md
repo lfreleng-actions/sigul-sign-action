@@ -168,6 +168,7 @@ is what proves the bridge reachable.
 | `exclude-globs`     | `global-jjb`'s list | File name patterns skipped inside a directory                                            |
 | `max-retries`       | `5`                 | Attempts per signing operation                                                           |
 | `retry-delay`       | `15`                | Seconds between attempts                                                                 |
+| `attempt-timeout`   | `600`               | Seconds one attempt may take before the action stops and retries it; `0` for no limit    |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -214,6 +215,12 @@ The step fails when any entry names no file or directory, when nothing gets
 signed, or when any file fails to sign. Before signing, the action removes the
 signatures this run will write, so a failed run never leaves an earlier run's
 signature behind for a file in `sign-object`.
+
+The action retries each signing attempt `max-retries` times, `retry-delay`
+seconds apart, and stops one after `attempt-timeout` seconds: the Sigul
+client itself waits forever on a bridge that accepts a connection and then
+says nothing, which would otherwise hold the step, retries unused, until the
+job's own timeout.
 
 ## Credentials
 

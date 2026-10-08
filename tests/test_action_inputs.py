@@ -329,6 +329,18 @@ class BuildPlanTests(unittest.TestCase):
         self.assertEqual(plan.image.source, "legacy")
         self.assertFalse(plan.dry_run)
         self.assertEqual(len(plan.targets), 1)
+        self.assertEqual(
+            (plan.max_retries, plan.retry_delay, plan.attempt_timeout), (5, 15, 600)
+        )
+
+    def test_attempt_timeout(self) -> None:
+        root = scratch(self)
+        _ = (root / "a.txt").write_text("a")
+        plan = build_plan(base_env(root, ATTEMPT_TIMEOUT="0"), PINS_DIR)
+        self.assertEqual(plan.attempt_timeout, 0)
+        for raw in ("-1", "soon", "1.5"):
+            with self.subTest(raw=raw), self.assertRaises(InputError):
+                _ = build_plan(base_env(root, ATTEMPT_TIMEOUT=raw), PINS_DIR)
 
     def test_required_inputs(self) -> None:
         root = scratch(self)

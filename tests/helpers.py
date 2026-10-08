@@ -79,6 +79,7 @@ def base_env(workspace: Path, **overrides: str) -> dict[str, str]:
         "DRY_RUN": "false",
         "MAX_RETRIES": "5",
         "RETRY_DELAY": "15",
+        "ATTEMPT_TIMEOUT": "600",
         "EXCLUDE_GLOBS": "*.asc\n*.md5\nmaven-metadata.xml\n",
         "GH_USER": "octocat",
     }

@@ -152,6 +152,14 @@ inputs:
     description: "Seconds between attempts"
     required: false
     default: "15"
+  attempt-timeout:
+    description: >
+      Seconds a single attempt may take before it is stopped and
+      retried; 0 waits as long as the client does. A bridge that
+      accepts a connection and then says nothing otherwise holds the
+      step until the job's own timeout, retries and all.
+    required: false
+    default: "600"
 
 outputs:
   signed_count:
@@ -216,6 +224,7 @@ runs:
         EXCLUDE_GLOBS: ${{ inputs.exclude-globs }}
         MAX_RETRIES: ${{ inputs.max-retries }}
         RETRY_DELAY: ${{ inputs.retry-delay }}
+        ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
         HAVE_SIGUL_CONF: ${{ inputs.sigul-conf != '' }}
         HAVE_SIGUL_PASS: ${{ inputs.sigul-pass != '' }}
         HAVE_SIGUL_PKI: ${{ inputs.sigul-pki != '' }}
@@ -264,6 +273,7 @@ runs:
         EXCLUDE_GLOBS: ${{ inputs.exclude-globs }}
         MAX_RETRIES: ${{ inputs.max-retries }}
         RETRY_DELAY: ${{ inputs.retry-delay }}
+        ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
         # Handed to a fresh process image through an anonymous in-memory
         # file by sigul_action.py, so no process keeps them in its
         # environment; 'exec' replaces this shell, so it does not either.

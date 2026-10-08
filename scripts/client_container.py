@@ -252,6 +252,7 @@ def container_argv(
         "SIGUL_PASSWORD": f"{CONTAINER_CREDS}/password",
         "MAX_RETRIES": str(run.plan.max_retries),
         "RETRY_DELAY": str(run.plan.retry_delay),
+        "ATTEMPT_TIMEOUT": str(run.plan.attempt_timeout),
         "PYTHONUNBUFFERED": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }

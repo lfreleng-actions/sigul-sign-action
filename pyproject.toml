@@ -27,17 +27,18 @@
 #
 # The runner-side modules import one another from scripts/, as Python
 # does when sigul_action.py runs; extraPaths and mypy_path tell the
-# type checkers, and the tests, to look there too. Both check for
-# Linux, the only platform the action runs on, whatever the developer's
-# own machine is.
+# type checkers, and the tests, to look there too, and in
+# scripts/container for the one test module that imports the
+# container-side helpers directly. Both check for Linux, the only
+# platform the action runs on, whatever the developer's own machine is.
 [tool.basedpyright]
 pythonVersion = "3.10"
 pythonPlatform = "Linux"
 ignore = ["scripts/container"]
-extraPaths = ["scripts"]
+extraPaths = ["scripts", "scripts/container"]
 
 [tool.mypy]
 python_version = "3.10"
 platform = "linux"
-mypy_path = "scripts"
+mypy_path = "scripts:scripts/container"
 exclude = ["^scripts/container/"]

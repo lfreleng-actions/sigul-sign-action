@@ -20,15 +20,31 @@ file's PATH, and these scripts only ever redirect it into sigul.
 
 from __future__ import print_function
 
+import collections
 import os
 import pwd
+import signal
 import subprocess
 import sys
+import time
 
 # The marker sigul's sign-git-tag appends to a tag object. Checking
 # for it confirms a signature landed, rather than trusting the exit
 # status of a client that may have exited early.
 PGP_SIGNATURE_MARKER = "-----BEGIN PGP SIGNATURE-----"
+
+# What a timed-out attempt returns, as timeout(1) does.
+TIMED_OUT = 124
+
+# How long a client told to stop gets before it is killed.
+GRACE_SECONDS = 10
+
+_POLL_SECONDS = 0.1
+
+# How a signing operation is retried: attempts, the seconds between
+# them, and the seconds one may take (0 for as long as the client
+# takes). Read from the environment the runner sets; see retry_policy.
+Retry = collections.namedtuple("Retry", ["attempts", "delay", "timeout"])
 
 
 def fail(message):
@@ -69,6 +85,19 @@ def int_env(name, default):
     if not raw.isdigit():
         fail(name + " must be a non-negative integer, got " + repr(raw))
     return int(raw)
+
+
+def retry_policy():
+    """Return the Retry the runner asked for: MAX_RETRIES, RETRY_DELAY
+    and ATTEMPT_TIMEOUT, with the action's defaults."""
+    policy = Retry(
+        attempts=int_env("MAX_RETRIES", 5),
+        delay=int_env("RETRY_DELAY", 15),
+        timeout=int_env("ATTEMPT_TIMEOUT", 0),
+    )
+    if policy.attempts < 1:
+        fail("MAX_RETRIES must be at least 1")
+    return policy
 
 
 def set_default_user():
@@ -117,16 +146,47 @@ def read_manifest(path):
     return [(fields[index], fields[index + 1]) for index in range(0, len(fields), 2)]
 
 
-def call_with_password(argv, password_file):
+def _wait(process, deadline):
+    """Wait for the process until it ends or the deadline passes;
+    return its status, or None if it is still running."""
+    while process.poll() is None and (deadline is None or time.time() < deadline):
+        time.sleep(_POLL_SECONDS)
+    return process.poll()
+
+
+def _stop(process):
+    """Stop the process and everything it started: sigul forks a child
+    for its connection, which a signal to sigul alone would orphan."""
+    group = os.getpgid(process.pid)
+    os.killpg(group, signal.SIGTERM)
+    if _wait(process, time.time() + GRACE_SECONDS) is None:
+        os.killpg(group, signal.SIGKILL)
+        process.wait()
+
+
+def call_with_password(argv, password_file, timeout=0):
     """Run argv with the passphrase file on its stdin; return the status.
 
-    sigul reads the key passphrase from stdin, NUL-terminated.
+    sigul reads the key passphrase from stdin, NUL-terminated. With a
+    timeout, in seconds, an attempt still running when it expires is
+    stopped and reported as TIMED_OUT, so the caller can retry: the
+    client itself never gives up on a bridge that accepts a connection
+    and then says nothing. Polled, because Python 2.7's wait() has no
+    timeout and a signal would race with a process ending on time.
     """
     handle = open(password_file, "rb")
     try:
-        return subprocess.call(argv, stdin=handle)
+        # Its own process group, so that _stop can reach its children.
+        process = subprocess.Popen(argv, stdin=handle, preexec_fn=os.setsid)
     finally:
         handle.close()
+    if not timeout:
+        return process.wait()
+    status = _wait(process, time.time() + timeout)
+    if status is None:
+        _stop(process)
+        return TIMED_OUT
+    return status
 
 
 def git_output(args):

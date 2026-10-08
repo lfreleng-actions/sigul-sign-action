@@ -48,6 +48,7 @@ class Plan:
     tag: str
     max_retries: int
     retry_delay: int
+    attempt_timeout: int
     gh_user: str
     workspace: Path
     messages: Messages
@@ -110,6 +111,7 @@ def build_plan(
     push_tag = parse_bool("push-tag", env.get("PUSH_TAG", "true"))
     max_retries = parse_int("max-retries", env.get("MAX_RETRIES", "5"), 1)
     retry_delay = parse_int("retry-delay", env.get("RETRY_DELAY", "15"), 0)
+    attempt_timeout = parse_int("attempt-timeout", env.get("ATTEMPT_TIMEOUT", "600"), 0)
 
     image = resolve_image(
         env.get("CONTAINER", ""),
@@ -158,6 +160,7 @@ def build_plan(
         tag=tag,
         max_retries=max_retries,
         retry_delay=retry_delay,
+        attempt_timeout=attempt_timeout,
         gh_user=gh_user or "x-access-token",
         workspace=workspace,
         messages=messages,

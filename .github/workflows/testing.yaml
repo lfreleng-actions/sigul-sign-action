@@ -293,8 +293,10 @@ jobs:
           echo m > e2e/dist/maven-metadata.xml
           echo "stale signature" > e2e/dist/a.jar.asc
           # A file whose first signing attempt the mock fails, so the
-          # real run exercises the retry path.
+          # real run exercises the retry path, and one whose first
+          # attempt hangs, so it exercises the attempt timeout.
           echo "MOCK-FAIL-ONCE" > e2e/dist/retry.jar
+          echo "MOCK-HANG-ONCE" > e2e/dist/hang.jar
           # Modules named as Sigul's own, at the workspace root: the
           # container's working directory for sign-data, which 'python
           # -c' would search before anything else. A project may well
@@ -418,6 +420,7 @@ jobs:
 
             e2e/dist/nested/*.jar
           retry-delay: "0"
+          attempt-timeout: "5"
           sigul-hosts-entry: "true"
           sigul-ip: ${{ env.BRIDGE_ADDRESS }}
           sigul-uri: ${{ env.BRIDGE_NAME }}
@@ -454,10 +457,10 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "ERROR: $* ❌"; exit 1; }
-          # a.jar, b.pom, retry.jar and nested/c.jar; maven-metadata.xml
-          # and the stale signature are excluded.
-          [ "${COUNT}" = "4" ] || fail "signed_count is ${COUNT}, not 4"
-          for file in a.jar b.pom retry.jar nested/c.jar; do
+          # a.jar, b.pom, retry.jar, hang.jar and nested/c.jar;
+          # maven-metadata.xml and the stale signature are excluded.
+          [ "${COUNT}" = "5" ] || fail "signed_count is ${COUNT}, not 5"
+          for file in a.jar b.pom retry.jar hang.jar nested/c.jar; do
             asc="e2e/dist/${file}.asc"
             [ -s "${asc}" ] || fail "no signature for ${file}"
             grep -q "BEGIN PGP SIGNATURE" "${asc}" ||

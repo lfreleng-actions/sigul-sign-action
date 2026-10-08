@@ -74,6 +74,7 @@ SIGNING_ENVIRONMENT = (
     "EXCLUDE_GLOBS",
     "MAX_RETRIES",
     "RETRY_DELAY",
+    "ATTEMPT_TIMEOUT",
     # Where to sign and report, and against which repository.
     "GITHUB_WORKSPACE",
     "GITHUB_REPOSITORY",

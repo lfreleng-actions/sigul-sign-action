@@ -20,8 +20,11 @@
 #
 # Induced failures, for the retry paths: a file to sign containing
 # MOCK-FAIL-ALWAYS always fails; one containing MOCK-FAIL-ONCE fails
-# its first attempt in this container. MOCK_FAIL_TAG_ONCE=1 does the
-# same for sign-git-tag.
+# its first attempt in this container; one containing MOCK-HANG-ONCE
+# hangs its first attempt, as a client does on a bridge that accepts
+# the connection and says nothing, until the action's attempt timeout
+# stops it. MOCK_FAIL_TAG_ONCE=1 does the same as MOCK-FAIL-ONCE for
+# sign-git-tag.
 
 set -eu
 
@@ -78,6 +81,11 @@ case "${command}" in
         if grep -q MOCK-FAIL-ONCE "${object}" && [ ! -e "${marker}" ]; then
             : > "${marker}"
             die "induced transient failure: ${object}"
+        fi
+        if grep -q MOCK-HANG-ONCE "${object}" && [ ! -e "${marker}" ]; then
+            : > "${marker}"
+            echo "mock sigul: induced hang: ${object}" >&2
+            sleep 3600
         fi
         temporary="$(umask 077; mktemp "${output}.XXXXXX")"
         signature > "${temporary}"
