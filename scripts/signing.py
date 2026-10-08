@@ -26,6 +26,7 @@ from pathlib import Path
 from action_common import (
     ActionError,
     info,
+    markdown_code,
     set_output,
     shred_file,
     summarise,
@@ -186,7 +187,9 @@ def sign_data(run: ContainerRun) -> None:
             f"### Sigul dry run passed: {len(plan.targets)} file(s) would be signed",
             "",
         ]
-        lines += [f"- `{t.name}`" for t in plan.targets[:SUMMARY_FILE_LIMIT]]
+        lines += [
+            f"- {markdown_code(t.name)}" for t in plan.targets[:SUMMARY_FILE_LIMIT]
+        ]
         if len(plan.targets) > SUMMARY_FILE_LIMIT:
             lines.append(f"- … and {len(plan.targets) - SUMMARY_FILE_LIMIT} more")
         summarise(lines)
@@ -265,7 +268,9 @@ def sign_git_tag(run: ContainerRun, work: Path, gh_key: str) -> None:
         raise ActionError(f"Signing failed for tag: {plan.tag}")
     set_output("signed_count", "0")
     if plan.dry_run:
-        summarise([f"### Sigul dry run passed: tag `{plan.tag}` would be signed"])
+        summarise(
+            [f"### Sigul dry run passed: tag {markdown_code(plan.tag)} would be signed"]
+        )
         return
 
     signed = repo.signed_oid(plan.tag, unsigned)
@@ -276,9 +281,9 @@ def sign_git_tag(run: ContainerRun, work: Path, gh_key: str) -> None:
     if plan.push_tag:
         repo.push_tag(server, url, plan.tag, plan.gh_user, gh_key)
         info(f"Pushed signed tag {plan.tag} to {url}")
-        summarise([f"Signed and pushed tag `{plan.tag}` with Sigul ✅"])
+        summarise([f"Signed and pushed tag {markdown_code(plan.tag)} with Sigul ✅"])
     else:
-        summarise([f"Signed tag `{plan.tag}` with Sigul (not pushed) ✅"])
+        summarise([f"Signed tag {markdown_code(plan.tag)} with Sigul (not pushed) ✅"])
 
 
 def sign(plan: Plan, values: dict[str, str]) -> None:

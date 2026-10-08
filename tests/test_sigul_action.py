@@ -47,9 +47,11 @@ from signing import (
     write_manifest,
 )
 from sigul_action import (
+    LISTING_LIMIT,
     check_hosts_against_dns,
     main,
     read_handoff,
+    report_plan,
     write_handoff,
 )
 
@@ -398,6 +400,33 @@ class CommandLineTests(unittest.TestCase):
         # Closed once read, so no child process can inherit it.
         with self.assertRaises(OSError):
             _ = os.fstat(descriptor)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "memfd_create is Linux-only")
+    def test_handoff_carries_bytes_that_are_not_utf8(self) -> None:
+        # A secret holding such bytes reaches os.environ as surrogates,
+        # which a plain str.encode() would refuse.
+        values = {
+            "SIGUL_CONF": "",
+            "SIGUL_PASS": os.fsdecode(b"pass\xe9word"),
+            "SIGUL_PKI": "",
+            "GH_KEY": "",
+        }
+        self.assertEqual(read_handoff(write_handoff(values)), values)
+
+    def test_long_listings_are_cut_short(self) -> None:
+        root = scratch(self)
+        for index in range(LISTING_LIMIT + 3):
+            _ = (root / f"{index:03}.jar").write_text("x")
+        plan = build_plan(base_env(root, SIGN_OBJECT="*.jar"), PINS_DIR)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            report_plan(plan)
+        lines = output.getvalue().splitlines()
+        self.assertIn(f"Files to sign: {LISTING_LIMIT + 3}", lines)
+        self.assertEqual(
+            sum(1 for line in lines if line.endswith(".jar")), LISTING_LIMIT
+        )
+        self.assertIn("  … and 3 more", lines)
 
 
 def interpreter_is_trusted() -> bool:

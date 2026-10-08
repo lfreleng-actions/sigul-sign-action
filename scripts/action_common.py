@@ -13,6 +13,7 @@ container_common.py.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 from collections.abc import Mapping, Sequence
@@ -111,6 +112,21 @@ def summarise(lines: Sequence[str]) -> None:
     if path:
         with open(path, "a", encoding="utf-8") as stream:
             _ = stream.write("\n".join(lines) + "\n")
+
+
+def markdown_code(value: str) -> str:
+    """Return value as a Markdown code span that it cannot break out of.
+
+    A file name is the caller's, and may carry backticks or line breaks.
+    A code span is delimited by a run of backticks longer than any run
+    inside it, and cannot span a paragraph, so line breaks become
+    spaces.
+    """
+    flat = " ".join(value.splitlines()) or value
+    runs: list[str] = re.findall(r"`+", flat)
+    longest = max((len(run) for run in runs), default=0)
+    fence = "`" * (longest + 1)
+    return f"{fence} {flat} {fence}" if longest else f"`{flat}`"
 
 
 def shred_file(path: Path) -> None:

@@ -20,6 +20,7 @@ from action_common import (
     error,
     escape_data,
     is_untrusted_directory,
+    markdown_code,
     minimal_env,
     shred_file,
 )
@@ -70,6 +71,15 @@ class WorkflowCommandTests(unittest.TestCase):
         with redirect_stdout(output):
             error("bad\n::add-mask::x")
         self.assertEqual(output.getvalue(), "::error::bad%0A::add-mask::x\n")
+
+    def test_file_names_cannot_break_out_of_a_code_span(self) -> None:
+        self.assertEqual(markdown_code("dist/a.jar"), "`dist/a.jar`")
+        # One backtick inside needs a two-backtick fence, and spaces to
+        # keep the inner one off the edges; a longer run, a longer fence.
+        self.assertEqual(markdown_code("a`b"), "`` a`b ``")
+        self.assertEqual(markdown_code("a``b"), "``` a``b ```")
+        # A line break would end the span and start Markdown of its own.
+        self.assertEqual(markdown_code("a\n# heading"), "`a # heading`")
 
 
 class EnvironmentTests(unittest.TestCase):

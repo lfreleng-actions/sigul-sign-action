@@ -243,13 +243,34 @@ def extract_bundle(archive: Path, destination: Path) -> None:
 
 
 def find_nss_dir(root: Path) -> Path:
-    """Return the directory holding the NSS database."""
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and not path.is_symlink() and path.name in NSS_MARKERS:
-            return path.parent
+    """Return the directory holding the NSS database.
+
+    A bundle holding more than one -- a backup beside the live
+    database, say -- is refused, since nss-dir can name only one and
+    choosing silently could point sigul at the wrong certificate.
+    """
+    found = sorted(
+        {
+            path.parent
+            for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink() and path.name in NSS_MARKERS
+        }
+    )
+    if len(found) == 1:
+        return found[0]
     # List structure, never contents: the bundle holds key material.
-    found = sorted(f"  {p.relative_to(root)}/" for p in root.rglob("*") if p.is_dir())
-    detail = "\n".join(found) if found else "  (no directories)"
+    if found:
+        detail = "\n".join(f"  {p.relative_to(root)}/" for p in found)
+        raise ActionError(
+            f"The sigul-pki bundle holds {len(found)} NSS databases, and nss-dir "
+            + "can name only one. Pack the bundle with the one the client "
+            + "certificate lives in:\n"
+            + detail
+        )
+    directories = sorted(
+        f"  {p.relative_to(root)}/" for p in root.rglob("*") if p.is_dir()
+    )
+    detail = "\n".join(directories) if directories else "  (no directories)"
     raise ActionError(
         "No NSS database found in the sigul-pki bundle. Expected one of "
         + ", ".join(sorted(NSS_MARKERS))

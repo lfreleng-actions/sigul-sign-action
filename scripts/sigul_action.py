@@ -45,6 +45,9 @@ from signing import sign
 
 PINS_DIR = Path(__file__).resolve().parent.parent / "containers"
 
+# How many files the log lists by name before counting the rest.
+LISTING_LIMIT = 50
+
 # The secret inputs. Handed to a fresh process image through an
 # anonymous in-memory file, so that neither this process nor any child
 # -- docker, git, gpg -- carries them in its environment; see
@@ -157,8 +160,11 @@ def report_plan(plan: Plan) -> None:
         info(f"Hosts entry: {entry.address} {entry.name}")
     if plan.sign_type == "sign-data":
         info(f"Files to sign: {len(plan.targets)}")
-        for target in plan.targets:
+        # A Maven repository runs to thousands; the log is for reading.
+        for target in plan.targets[:LISTING_LIMIT]:
             info(f"  {target.name}")
+        if len(plan.targets) > LISTING_LIMIT:
+            info(f"  … and {len(plan.targets) - LISTING_LIMIT} more")
     else:
         action = "sign and push" if plan.push_tag else "sign"
         info(f"Tag to {action}: {plan.tag}")
@@ -245,8 +251,11 @@ def write_handoff(values: dict[str, str]) -> int:
     the secrets, positioned at its start."""
     descriptor = os.memfd_create("sigul-handoff")
     os.set_inheritable(descriptor, True)
-    # NUL-separated: an environment value cannot contain one.
-    data = memoryview(b"\0".join(values[name].encode() for name in SECRET_INPUTS))
+    # NUL-separated: an environment value cannot contain one. Encoded
+    # as the environment was decoded, so bytes that are not UTF-8 --
+    # which Python carries as surrogates -- survive the trip rather
+    # than fail it.
+    data = memoryview(b"\0".join(os.fsencode(values[name]) for name in SECRET_INPUTS))
     while data:
         data = data[os.write(descriptor, data) :]
     _ = os.lseek(descriptor, 0, os.SEEK_SET)
@@ -266,7 +275,8 @@ def read_handoff(descriptor: int) -> dict[str, str]:
     if len(fields) != len(SECRET_INPUTS):
         raise ActionError("the secret handoff is malformed")
     return {
-        name: field.decode() for name, field in zip(SECRET_INPUTS, fields, strict=True)
+        name: os.fsdecode(field)
+        for name, field in zip(SECRET_INPUTS, fields, strict=True)
     }
 
 

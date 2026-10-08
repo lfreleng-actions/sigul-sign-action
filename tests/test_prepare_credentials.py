@@ -269,6 +269,21 @@ class PrepareTests(unittest.TestCase):
         self.assertIn("No NSS database", str(caught.exception))
         self.assertIn("notes/", str(caught.exception))
 
+    def test_bundle_with_two_databases_is_refused(self) -> None:
+        # A backup beside the live database: nss-dir can name one only,
+        # and the caller must say which, not the action.
+        pki = build_bundle(
+            self,
+            "sigul",
+            extra={"sigul-backup/cert8.db": "", "sigul-backup/key3.db": ""},
+        )
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(HEAD, PASSPHRASE, pki)
+        message = str(caught.exception)
+        self.assertIn("2 NSS databases", message)
+        self.assertIn("sigul/", message)
+        self.assertIn("sigul-backup/", message)
+
     def test_empty_inputs_and_placeholders(self) -> None:
         pki = build_bundle(self, "sigul")
         for config, password, bundle in (
