@@ -428,10 +428,13 @@ built from one would send signing nowhere.
   home erasure, GPG-agent shutdown and GPG-home erasure, then container
   removal. One failed stage does not skip the others; incomplete cleanup
   produces an error or warning. A composite action has no post step.
-- Captured runner subprocesses use kill-and-poll after cancellation or a
-  timeout, without an unbounded post-kill wait. Agent shutdown and container
-  removal have time budgets, but processes stuck in uninterruptible kernel
-  I/O (D state) remain the runner operator's responsibility.
+- Captured runner commands and the streaming Docker CLI start in dedicated
+  process groups. Cancellation or timeout kills the whole group, including
+  helpers whose parent has exited, then polls for at most 0.2 seconds without
+  a blocking reap. Detached daemons have separate cleanup: the private GPG
+  agent has its own shutdown, and the caller removes the signing container.
+  Uninterruptible kernel I/O (D state) remains the runner operator's
+  responsibility. Cancellation cannot undo a remote operation already accepted.
 - **No unconditional erasure or no-disk guarantee applies.** Tmpfs can swap;
   overwriting cannot erase copies in swap, copy-on-write storage, journals,
   snapshots or crash dumps. Crashes, `SIGKILL`, runner loss and blocked I/O

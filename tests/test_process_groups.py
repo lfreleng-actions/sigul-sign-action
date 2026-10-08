@@ -202,27 +202,21 @@ class ProcessGroupTests(unittest.TestCase):
         self.assertEqual(tree.group, tree.processes[0].pid)
         self.assertNotEqual(tree.group, os.getpgrp())
 
-    @unittest.expectedFailure
     def test_capture_timeout_stops_a_real_helper(self) -> None:
         self.check_tree()
 
-    @unittest.expectedFailure
     def test_capture_cancellation_stops_a_real_helper(self) -> None:
         self.check_tree(cancel=True)
 
-    @unittest.expectedFailure
     def test_capture_cancellation_reaches_helpers_after_parent_exit(self) -> None:
         self.check_tree(cancel=True, parent_exits=True)
 
-    @unittest.expectedFailure
     def test_stream_timeout_stops_a_real_helper(self) -> None:
         self.check_tree(streaming=True)
 
-    @unittest.expectedFailure
     def test_stream_cancellation_stops_a_real_helper(self) -> None:
         self.check_tree(streaming=True, cancel=True)
 
-    @unittest.expectedFailure
     def test_stream_cancellation_reaches_helpers_after_parent_exit(self) -> None:
         self.check_tree(streaming=True, cancel=True, parent_exits=True)
 

@@ -124,13 +124,10 @@ class UnreapableCLI:
 
     def __init__(self) -> None:
         self.waits: list[float | None] = []
-        self.killed: bool = False
+        self.pid: int = 1_000_000_000
 
     def poll(self) -> int | None:
         return None
-
-    def kill(self) -> None:
-        self.killed = True
 
     def wait(self, timeout: float | None = None) -> int:
         self.waits.append(timeout)
@@ -143,13 +140,15 @@ class ProcessReapingTests(unittest.TestCase):
         with (
             mock.patch("client_container.subprocess.Popen", return_value=process),
             mock.patch("client_container.remove_container"),
+            mock.patch("process_control.os.killpg") as kill_group,
+            mock.patch("process_control.time.monotonic", side_effect=[0.0, 1.0]),
             redirect_stdout(io.StringIO()),
         ):
             try:
                 _ = run_container(["synthetic-cli"], "not-a-container", 1)
             except (ActionError, subprocess.TimeoutExpired):
                 pass
-        self.assertTrue(process.killed)
+        kill_group.assert_any_call(process.pid, signal.SIGKILL)
         self.assertNotIn(None, process.waits)
 
 

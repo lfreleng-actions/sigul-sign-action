@@ -332,7 +332,7 @@ def run_container(argv: list[str], name: str, timeout: int | None) -> int:
     Sigul's own output, could otherwise start a line with '::' and
     inject a command. Whatever ends the wait -- completion, the timeout,
     or the exception a termination signal raises -- commands are
-    switched back on and the CLI is killed without a blocking reap.
+    switched back on and the CLI's group is killed without a blocking reap.
     The caller owns container removal, after erasing credential files:
     waiting on the daemon here would consume the cancellation budget
     before that erasure. No timeout can interrupt blocked kernel I/O.
@@ -341,18 +341,20 @@ def run_container(argv: list[str], name: str, timeout: int | None) -> int:
     print(f"::stop-commands::{token}", flush=True)
     try:
         try:
-            process = subprocess.Popen(argv, env=docker_env())
+            process = subprocess.Popen(argv, env=docker_env(), start_new_session=True)
         except OSError as exc:
             raise ActionError(f"cannot start the container: {exc}") from None
         try:
             return process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise ActionError(
-                f"container {name} did not finish within {timeout}s"
-            ) from None
-        finally:
-            if process.poll() is None:
-                kill_and_poll(process)
+        except BaseException as exc:
+            # Helpers can outlive an already-exited CLI; do not gate group
+            # termination on the direct child's poll status.
+            kill_and_poll(process)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise ActionError(
+                    f"container {name} did not finish within {timeout}s"
+                ) from None
+            raise
     finally:
         # On a line of its own: the container's last output may not end
         # with a newline, and a token joined to it would not be read as a

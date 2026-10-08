@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+import os
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import unittest
 from unittest import mock
 
 from action_common import minimal_env
-from process_control import capture_bytes, capture_text
+from process_control import capture_bytes, capture_text, kill_and_poll
 from termination import Cancelled, defer_termination
 
 
@@ -25,16 +26,13 @@ class UnreapableProcess:
         self.stdout: io.BytesIO = io.BytesIO()
         self.stderr: io.BytesIO = io.BytesIO()
         self.returncode: int | None = None
-        self.killed: bool = False
+        self.pid: int = 1_000_000_000
         self.polled: bool = False
 
     def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
         if timeout is None:
             raise AssertionError("this fixture requires a bounded capture")
         raise self.failure
-
-    def kill(self) -> None:
-        self.killed = True
 
     def poll(self) -> int | None:
         self.polled = True
@@ -73,21 +71,62 @@ class CaptureTests(unittest.TestCase):
 
     def test_timeout_kills_without_waiting_for_reaping(self) -> None:
         process = UnreapableProcess(subprocess.TimeoutExpired("fixture", 1))
-        with mock.patch("process_control.subprocess.Popen", return_value=process):
+        with (
+            mock.patch("process_control.subprocess.Popen", return_value=process),
+            mock.patch("process_control.os.killpg") as kill_group,
+            mock.patch("process_control.time.monotonic", side_effect=[0.0, 1.0]),
+        ):
             with self.assertRaises(subprocess.TimeoutExpired):
                 _ = capture_bytes(["fixture"], env={}, timeout=1)
-        self.assertTrue(process.killed)
+        kill_group.assert_has_calls(
+            [mock.call(process.pid, signal.SIGKILL), mock.call(process.pid, 0)]
+        )
         self.assertTrue(process.polled)
         self.assertTrue(process.stdout.closed)
         self.assertTrue(process.stderr.closed)
 
     def test_cancellation_kills_without_waiting_for_reaping(self) -> None:
         process = UnreapableProcess(Cancelled("synthetic cancellation"))
-        with mock.patch("process_control.subprocess.Popen", return_value=process):
+        with (
+            mock.patch("process_control.subprocess.Popen", return_value=process),
+            mock.patch("process_control.os.killpg") as kill_group,
+            mock.patch("process_control.time.monotonic", side_effect=[0.0, 1.0]),
+        ):
             with self.assertRaisesRegex(Cancelled, "synthetic cancellation"):
                 _ = capture_bytes(["fixture"], env={}, timeout=1)
-        self.assertTrue(process.killed)
+        kill_group.assert_any_call(process.pid, signal.SIGKILL)
         self.assertTrue(process.polled)
+
+    def test_an_already_gone_group_is_polled_without_waiting(self) -> None:
+        process = UnreapableProcess(Cancelled("unused"))
+        with (
+            mock.patch("process_control.subprocess.Popen", return_value=process),
+            mock.patch("process_control.os.killpg", side_effect=ProcessLookupError),
+        ):
+            with self.assertRaises(Cancelled):
+                _ = capture_bytes(["fixture"], env={}, timeout=1)
+        self.assertTrue(process.polled)
+
+    def test_denied_exit_probe_is_bounded_and_preserves_cancellation(self) -> None:
+        process = UnreapableProcess(Cancelled("synthetic cancellation"))
+        with (
+            mock.patch("process_control.subprocess.Popen", return_value=process),
+            mock.patch(
+                "process_control.os.killpg", side_effect=[None, PermissionError]
+            ),
+            mock.patch("process_control.time.monotonic", side_effect=[0.0, 1.0]),
+        ):
+            with self.assertRaisesRegex(Cancelled, "synthetic cancellation"):
+                _ = capture_bytes(["fixture"], env={}, timeout=1)
+        self.assertTrue(process.polled)
+
+    def test_group_termination_never_targets_the_action_itself(self) -> None:
+        with mock.patch("process_control.os.killpg") as kill_group:
+            with self.assertRaisesRegex(ValueError, "own process group"):
+                process = mock.Mock(spec=subprocess.Popen)
+                process.pid = os.getpgrp()
+                kill_and_poll(process)
+        kill_group.assert_not_called()
 
     def test_missing_tool_is_not_misreported_as_a_command_failure(self) -> None:
         with self.assertRaises(FileNotFoundError):
