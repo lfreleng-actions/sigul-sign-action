@@ -13,8 +13,8 @@ Responsibilities, in order:
 1. Reject empty inputs, and a sigul-conf still carrying the Jenkins
    placeholders that Jenkins substitutes when it provides the file.
 2. Write the passphrase file sigul reads, and the caller's client.conf.
-3. Decode, decrypt and unpack the PKI bundle, with gpg confined to a
-   private home that the caller's cleanup removes.
+3. Decode, decrypt (gpg_bundle.py, in a private gpg home the caller's
+   cleanup removes) and unpack the PKI bundle.
 4. Locate the NSS database and point every client.conf at it.
 
 The configuration is layered as lfit/sigul-sign-action layered it:
@@ -31,21 +31,21 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from action_common import ActionError, info, minimal_env, shred_file, system_tool
+from action_common import ActionError, info, shred_file
+from gpg_bundle import UnprotectedBundleError, decrypt_bundle
 
 # NSS ships two on-disk formats and Sigul deployments use both. These
 # exact names identify the database directory whatever it is called:
 # ONAP's bundle unpacks to 'sigul/', other tooling documents '.sigul/'.
 # Matched exactly rather than by glob, which would also match an
 # unrelated file such as 'cert-backup.db'.
-NSS_MARKERS = frozenset(
-    {"cert8.db", "cert9.db", "key3.db", "key4.db", "secmod.db", "pkcs11.txt"}
-)
+NSS_DBM_FILES = frozenset({"cert8.db", "key3.db", "secmod.db"})
+NSS_SQL_FILES = frozenset({"cert9.db", "key4.db", "pkcs11.txt"})
+NSS_MARKERS = NSS_DBM_FILES | NSS_SQL_FILES
 
 # The bundle unpacks into its own subdirectory. Sharing a directory
 # with client.conf would let an archive carrying a top-level
@@ -54,6 +54,13 @@ PKI_SUBDIR = "pki"
 
 # sigul's default user configuration, relative to HOME.
 BUNDLE_USER_CONFIG = Path(".sigul") / "client.conf"
+
+# Where git reads a user's configuration, relative to HOME, which in
+# the container is the unpacked bundle. The legacy image's git (1.8)
+# predates GIT_CONFIG_GLOBAL, so a bundle carrying either file would
+# configure the git that sigul's sign-git-tag runs there; such a bundle
+# is refused instead, since nothing in it is git's to configure.
+GIT_USER_CONFIGS = (Path(".gitconfig"), Path(".config") / "git" / "config")
 
 # Jenkins' managed sigul-config is a template: config-file-provider
 # substitutes these from the sigul-config-credentials credential when
@@ -77,18 +84,6 @@ class PreparedCredentials:
     container_home: str
     container_nss_dir: str
     layered: bool
-
-
-class UnprotectedBundleError(ActionError):
-    """sigul-pki was encrypted without integrity protection."""
-
-
-# What gpg says, since 2.2.8, of a message without an MDC: the
-# modification detection code that GnuPG 2.0 and earlier omitted by
-# default with their default cipher, CAST5. Earlier gpg decrypted such
-# a message with a warning; the legacy action's CentOS 7 container had
-# GnuPG 2.0.22, so a bundle it accepted can be refused here.
-_NO_INTEGRITY = ("message was not integrity protected", "decryption forced to fail")
 
 
 def first_line(value: str) -> str:
@@ -134,86 +129,6 @@ def decode_pki(raw: str) -> bytes:
     return decoded if decoded else raw.encode()
 
 
-def decrypt_bundle(encrypted: Path, passphrase: Path, output: Path, home: Path) -> None:
-    """GPG-decrypt the PKI bundle inside a private gpg home.
-
-    The private home keeps the runner user's keyring and agent out of
-    it. --no-symkey-cache stops gpg-agent caching the passphrase, and
-    the caller kills that agent and removes the home afterwards.
-    GnuPG 2.1 and later need --pinentry-mode loopback to take the
-    passphrase from a file in batch mode; older releases reject one or
-    both options, so each is dropped only when gpg names it as invalid.
-
-    A message without integrity protection is refused, as gpg refuses
-    it: --ignore-mdc-error would decrypt it, and would also decrypt
-    one an attacker had altered, for everyone, to spare the one caller
-    who should re-encrypt. That caller is told so instead.
-    """
-    optional: list[str] = ["--pinentry-mode", "loopback", "--no-symkey-cache"]
-    rest = [
-        "--batch",
-        "--quiet",
-        "--yes",
-        "--no-tty",
-        "--passphrase-file",
-        str(passphrase),
-        "--output",
-        str(output),
-        "--decrypt",
-        str(encrypted),
-    ]
-    env = minimal_env({"HOME": str(home)})
-    while True:
-        argv = ["gpg", "--homedir", str(home), *optional, *rest]
-        try:
-            done = subprocess.run(
-                argv, capture_output=True, text=True, env=env, check=False
-            )
-        except FileNotFoundError:
-            raise ActionError("gpg is not installed on the runner") from None
-        if done.returncode == 0:
-            return
-        stderr = done.stderr or ""
-        if "invalid option" in stderr and "--no-symkey-cache" in optional:
-            if "no-symkey-cache" in stderr:
-                optional.remove("--no-symkey-cache")
-                continue
-        if "invalid option" in stderr and "--pinentry-mode" in optional:
-            if "pinentry-mode" in stderr:
-                optional = [
-                    o for o in optional if o not in ("--pinentry-mode", "loopback")
-                ]
-                continue
-        lines = [line for line in stderr.splitlines() if line.strip()]
-        if any(marker in stderr for marker in _NO_INTEGRITY):
-            raise UnprotectedBundleError(
-                "sigul-pki was encrypted without integrity protection (an MDC), "
-                + "as GnuPG 2.0 and earlier did by default, and this runner's gpg "
-                + "refuses to decrypt such a message. The passphrase may well be "
-                + "right. Re-encrypt the bundle with a current GnuPG, which adds "
-                + "the protection, and store the result as sigul-pki: "
-                + "gpg --symmetric --cipher-algo AES256 --armor sigul.tar.xz"
-            )
-        raise ActionError(lines[-1] if lines else "gpg failed")
-
-
-def kill_gpg_agent(home: Path) -> None:
-    """Stop any gpg-agent started for the private home.
-
-    gpgconf ships with every gpg that starts an agent, so where it is
-    absent there is no agent to stop.
-    """
-    gpgconf = system_tool("gpgconf")
-    if gpgconf is None or not home.exists():
-        return
-    _ = subprocess.run(
-        [gpgconf, "--homedir", str(home), "--kill", "gpg-agent"],
-        capture_output=True,
-        env=minimal_env({"HOME": str(home)}),
-        check=False,
-    )
-
-
 def extract_bundle(archive: Path, destination: Path) -> None:
     """Unpack the decrypted bundle safely.
 
@@ -247,7 +162,12 @@ def find_nss_dir(root: Path) -> Path:
 
     A bundle holding more than one -- a backup beside the live
     database, say -- is refused, since nss-dir can name only one and
-    choosing silently could point sigul at the wrong certificate.
+    choosing silently could point sigul at the wrong certificate. One
+    directory holding both of NSS's formats is one database: that is
+    how NSS upgrades a database in place, and nss-dir names the
+    directory; which format the client reads is its NSS library's
+    default, as it was for the legacy action and for Jenkins. It is
+    noted, since it explains a certificate that is not the one expected.
     """
     found = sorted(
         {
@@ -257,6 +177,12 @@ def find_nss_dir(root: Path) -> Path:
         }
     )
     if len(found) == 1:
+        names = {p.name for p in found[0].iterdir() if p.is_file()}
+        if names & NSS_DBM_FILES and names & NSS_SQL_FILES:
+            info(
+                "the NSS database holds both formats, dbm (cert8.db) and sql "
+                + "(cert9.db); the client image's NSS decides which it reads"
+            )
         return found[0]
     # List structure, never contents: the bundle holds key material.
     if found:
@@ -394,6 +320,13 @@ def prepare(
         shred_file(decrypted)
 
     nss_dir = find_nss_dir(pki_root)
+    for relative in GIT_USER_CONFIGS:
+        if (pki_root / relative).exists() or (pki_root / relative).is_symlink():
+            raise ActionError(
+                f"the bundle carries {relative}, which git would read as the "
+                + "user's configuration inside the client container, where it "
+                + "could name commands to run; remove it from the bundle"
+            )
     container_nss = f"{container_creds}/{nss_dir.relative_to(creds).as_posix()}"
     info(f"NSS database found at {nss_dir.relative_to(creds).as_posix()}")
 
@@ -404,7 +337,16 @@ def prepare(
     )
 
     user_config = pki_root / BUNDLE_USER_CONFIG
-    layered = user_config.is_file() and not user_config.is_symlink()
+    if user_config.is_symlink():
+        # The extraction filter admits a link that stays inside the
+        # bundle, and sigul would follow it to a configuration whose
+        # nss-dir has not been rewritten, overriding the one that has.
+        raise ActionError(
+            "the bundle's .sigul/client.conf is a symlink, which sigul would "
+            + "follow to a configuration the action cannot adjust; pack the "
+            + "bundle with the file itself"
+        )
+    layered = user_config.is_file()
     if layered:
         _ = user_config.write_text(
             rewrite_nss_dir(

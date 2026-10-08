@@ -133,6 +133,17 @@ class HostsTests(unittest.TestCase):
         )
         self.assertEqual([h.name for h in hosts], ["a.example.org", "b"])
 
+    def test_addresses_are_canonical(self) -> None:
+        # As getaddrinfo() spells them, so the DNS comparison is of
+        # addresses and a legitimate spelling draws no stale warning.
+        for raw, canonical in (
+            ("2001:0db8:0000::0001", "2001:db8::1"),
+            ("2001:DB8::1", "2001:db8::1"),
+            ("192.0.2.1", "192.0.2.1"),
+        ):
+            hosts = resolve_hosts("auto", raw, "a", "legacy", Messages())
+            self.assertEqual(hosts[0].address, canonical, raw)
+
     def test_auto_skips_unusable_values_with_a_warning(self) -> None:
         for address, names in (
             ("not-an-ip", "a.example.org"),

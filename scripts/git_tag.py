@@ -27,6 +27,7 @@ The workspace's refs are read as files for the same reason.
 
 from __future__ import annotations
 
+import configparser
 import os
 import re
 import shutil
@@ -40,8 +41,6 @@ from action_common import ActionError, minimal_env, shred_file
 PGP_SIGNATURE_MARKER = "-----BEGIN PGP SIGNATURE-----"
 
 _OID = re.compile(r"^[0-9a-f]{40}$")
-_OBJECT_FORMAT_SHA256 = re.compile(r"^\s*objectformat\s*=\s*sha256\s*$", re.I | re.M)
-_REF_STORAGE_REFTABLE = re.compile(r"^\s*refstorage\s*=\s*reftable\s*$", re.I | re.M)
 
 
 def git_env(home: Path, objects: Path | None = None) -> dict[str, str]:
@@ -108,9 +107,11 @@ def workspace_git_dir(workspace: Path) -> Path:
     a symlinked .git likewise points outside the work tree. Neither
     object store would be reachable from inside the container. The same
     goes for an object store that borrows from another through
-    objects/info/alternates, and a repository that keeps its refs in
+    objects/info/alternates; a repository that keeps its refs in
     reftables rather than files cannot have its tag recorded by writing
-    one. actions/checkout produces none of these.
+    one; and the client images' git cannot read SHA-256 object names.
+    actions/checkout produces none of these. Every refusal happens here,
+    in the validation step, before any credential exists.
     """
     dot_git = workspace / ".git"
     if dot_git.is_symlink():
@@ -144,6 +145,13 @@ def workspace_git_dir(workspace: Path) -> Path:
             + "where the signed tag cannot be recorded by writing a ref file. "
             + "Use a checkout with the default ref storage"
         )
+    if uses_sha256(dot_git):
+        # The legacy client image's git (1.8) predates SHA-256 object
+        # names entirely.
+        raise ActionError(
+            "the workspace names objects with SHA-256 (extensions.objectFormat), "
+            + "which the Sigul client images' git does not support"
+        )
     return dot_git
 
 
@@ -176,24 +184,55 @@ def read_head(git_dir: Path) -> str | None:
     return value if _OID.match(value) else None
 
 
-def uses_sha256(git_dir: Path) -> bool:
-    """Return True when the repository names objects with SHA-256.
+def read_extension(git_dir: Path, name: str) -> str:
+    """Return an [extensions] value from the repository's configuration,
+    lower-cased and unquoted, or '' when unset.
 
-    Read from the configuration file as text, which runs no git.
+    Read as text, which runs no git. Git's syntax is close enough to
+    INI for configparser: section and key names compare without case,
+    a value may be quoted, and ';' or '#' after one starts a comment. A
+    configuration that cannot be parsed is refused rather than passed,
+    since the checks built on this exist to fail closed.
     """
     config = git_dir / "config"
     if not config.is_file():
-        return False
-    return bool(_OBJECT_FORMAT_SHA256.search(config.read_text(errors="replace")))
+        return ""
+    parser = configparser.RawConfigParser(
+        strict=False,
+        allow_no_value=True,
+        delimiters=("=",),
+        comment_prefixes=(";", "#"),
+        inline_comment_prefixes=(";", "#"),
+        empty_lines_in_values=False,
+    )
+    try:
+        parser.read_string(config.read_text(errors="replace"))
+    except configparser.Error as exc:
+        raise ActionError(f"cannot read the workspace's .git/config: {exc}") from None
+    for section in parser.sections():
+        if section.strip().lower() != "extensions":
+            continue
+        for key, value in parser.items(section):
+            if key.lower() != name.lower():
+                continue
+            # allow_no_value lets a bare key through as None.
+            found: str = value or ""
+            found = found.strip()
+            if len(found) >= 2 and found[0] == found[-1] == '"':
+                found = found[1:-1]
+            return found.lower()
+    return ""
+
+
+def uses_sha256(git_dir: Path) -> bool:
+    """Return True when the repository names objects with SHA-256."""
+    return read_extension(git_dir, "objectformat") == "sha256"
 
 
 def uses_reftable(git_dir: Path) -> bool:
     """Return True when the repository keeps its refs in reftables, where
-    a loose ref file is not read. From the configuration as text."""
-    config = git_dir / "config"
-    if not config.is_file():
-        return False
-    return bool(_REF_STORAGE_REFTABLE.search(config.read_text(errors="replace")))
+    a loose ref file is not read."""
+    return read_extension(git_dir, "refstorage") == "reftable"
 
 
 def write_tag_ref(git_dir: Path, tag: str, oid: str) -> None:
@@ -252,10 +291,6 @@ class SigningRepository:
 
     def create(self) -> None:
         """Initialise the repository and seed a negotiation tip."""
-        if uses_sha256(self.workspace_git):
-            # The legacy client image's git (1.8) predates SHA-256 object
-            # names entirely.
-            raise ActionError("SHA-256 repositories are not supported")
         self.home.mkdir(parents=True, exist_ok=True)
         done = run_git(["init", "-q", str(self.root)], self.home, git_env(self.home))
         if done.returncode != 0:
@@ -333,7 +368,15 @@ class SigningRepository:
         descriptor = os.open(credential, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as stream:
             _ = stream.write(f"username={user}\npassword={token}\n")
-        helper = f"!f() {{ test \"$1\" = get || exit 0; cat '{credential}'; }}; f"
+        # Builtins only: git runs the helper through sh, with the system
+        # PATH, where /usr/local/bin comes first and is world-writable on
+        # GitHub-hosted runners; a 'cat' planted there would be handed
+        # the token. read and printf are builtins of every sh.
+        helper = (
+            '!f() { test "$1" = get || exit 0; '
+            + f"while IFS= read -r line; do printf '%s\\n' \"$line\"; done < '{credential}'; "
+            + "}; f"
+        )
         try:
             done = self._git(
                 [

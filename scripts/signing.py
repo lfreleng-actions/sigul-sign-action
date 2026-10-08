@@ -47,7 +47,8 @@ from client_container import (
     uses_selinux,
 )
 from git_tag import SigningRepository, workspace_git_dir, write_tag_ref
-from prepare_credentials import kill_gpg_agent, prepare
+from gpg_bundle import kill_gpg_agent
+from prepare_credentials import prepare
 
 # A dry run does no signing, so it has no business running long; a
 # real run's duration scales with the work and is the job's to bound.
@@ -239,8 +240,9 @@ def sign_git_tag(run: ContainerRun, work: Path, gh_key: str) -> None:
         # HOME is the unpacked bundle, so that sigul finds its
         # .sigul/client.conf; git would read a .gitconfig there too,
         # which can name commands. Nothing in the bundle is git's to
-        # configure. (git 1.8, in the legacy image, predates this
-        # variable and ignores it.)
+        # configure. The legacy image's git 1.8 predates this variable,
+        # so prepare_credentials refuses a bundle that carries a git
+        # configuration at all; this covers the git that honours it.
         "GIT_CONFIG_GLOBAL": os.devnull,
         # Trust the private repository this step created, and nothing
         # else. Where the container sees the mount under another owner

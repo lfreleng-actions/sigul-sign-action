@@ -8,6 +8,9 @@ from __future__ import annotations
 import io
 import os
 import re
+import shutil
+import subprocess
+import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -92,13 +95,15 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(found, [SYSTEM_PATH, SYSTEM_PATH])
 
     def test_action_yaml_refuses_a_planted_interpreter(self) -> None:
-        # Both steps must check the interpreter's directory before
-        # running it, with builtins only, and skip the test as root.
+        # Both steps must have the shell judge the interpreter before
+        # running it, and run exactly the one it chose.
         text = (REPOSITORY / "action.yaml").read_text()
-        self.assertEqual(text.count('python3="$(type -P python3)"'), 2)
         self.assertEqual(
-            text.count('if (( EUID != 0 )) && [[ -w "${python3%/*}" ]]; then'), 2
+            text.count('source "${ACTION_PATH}/scripts/trusted_interpreter.sh"'), 2
         )
+        self.assertEqual(text.count("trusted_python3 || exit 1"), 2)
+        self.assertEqual(text.count('"${TRUSTED_PYTHON3}" -E -s'), 2)
+        self.assertNotIn("python3 -E -s", text)
 
     def test_minimal_env_carries_no_secret(self) -> None:
         with mock.patch.dict(os.environ, {"SIGUL_PASS": "secret"}):
@@ -156,6 +161,57 @@ class TrustedLocationTests(unittest.TestCase):
         self.addCleanup(trusted.chmod, 0o755)
         with self.assertRaises(ActionError):
             check_trusted_location(str(trusted / "gpg"))
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+@unittest.skipUnless(
+    sys.platform.startswith("linux"), "uses GNU stat as the action does"
+)
+class TrustedInterpreterShellTests(unittest.TestCase):
+    """The shell's own check, which runs before any interpreter does."""
+
+    def run_check(self, bin_dir: Path) -> subprocess.CompletedProcess[str]:
+        script = (
+            f'source "{REPOSITORY}/scripts/trusted_interpreter.sh"; '
+            'trusted_python3 && printf "%s" "$TRUSTED_PYTHON3"'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def planted(self, mode: int) -> Path:
+        bin_dir = scratch(self) / "bin"
+        bin_dir.mkdir()
+        tool = bin_dir / "python3"
+        _ = tool.write_text("#!/bin/sh\nexit 7\n")
+        tool.chmod(0o755)
+        bin_dir.chmod(mode)
+        self.addCleanup(bin_dir.chmod, 0o755)
+        return bin_dir
+
+    def test_world_writable_directory_is_refused_by_root_too(self) -> None:
+        # Root sees every directory as writable, so the mode bits decide;
+        # a non-root user is refused by -w on the same directory.
+        done = self.run_check(self.planted(0o777))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("::error::refusing", done.stdout)
+        self.assertIn("planted it", done.stdout)
+
+    def test_a_directory_nobody_else_can_write_is_accepted(self) -> None:
+        bin_dir = self.planted(0o555)
+        done = self.run_check(bin_dir)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(done.stdout, str(bin_dir / "python3"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root is judged by mode bits alone")
+    def test_a_directory_this_user_can_write_is_refused(self) -> None:
+        done = self.run_check(self.planted(0o755))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("writable by this user", done.stdout)
 
 
 if __name__ == "__main__":

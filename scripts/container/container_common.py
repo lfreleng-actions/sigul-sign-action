@@ -21,6 +21,7 @@ file's PATH, and these scripts only ever redirect it into sigul.
 from __future__ import print_function
 
 import collections
+import errno
 import os
 import pwd
 import signal
@@ -36,8 +37,10 @@ PGP_SIGNATURE_MARKER = "-----BEGIN PGP SIGNATURE-----"
 # What a timed-out attempt returns, as timeout(1) does.
 TIMED_OUT = 124
 
-# How long a client told to stop gets before it is killed.
+# How long a client told to stop gets before it is killed, and how
+# long a killed one gets to disappear.
 GRACE_SECONDS = 10
+KILL_SECONDS = 2
 
 _POLL_SECONDS = 0.1
 
@@ -154,14 +157,74 @@ def _wait(process, deadline):
     return process.poll()
 
 
-def _stop(process):
+def _signal_group(group, signum):
+    """Send a signal to a process group, which may already be gone."""
+    try:
+        os.killpg(group, signum)
+    except OSError as error:
+        if error.errno != errno.ESRCH:
+            raise
+
+
+def _group_alive(group):
+    """Return True while any process remains in the group.
+
+    Members that have ended are reaped first, since an orphan of the
+    group becomes this process's child (inside the container this
+    script is PID 1) and would otherwise linger as a zombie and keep
+    the group in being. A group whose members are another process's
+    children reports ECHILD here and is judged by the probe alone.
+    """
+    while True:
+        try:
+            ended, _status = os.waitpid(-group, os.WNOHANG)
+        except OSError as error:
+            if error.errno != errno.ECHILD:
+                raise
+            break
+        if ended == 0:
+            break
+    try:
+        os.killpg(group, 0)
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return False
+        raise
+    return True
+
+
+def _wait_for_group(group, deadline):
+    """Wait until the group is empty or the deadline passes; return
+    True if it is empty."""
+    while _group_alive(group):
+        if time.time() >= deadline:
+            return False
+        time.sleep(_POLL_SECONDS)
+    return True
+
+
+def stop_process_group(process):
     """Stop the process and everything it started: sigul forks a child
-    for its connection, which a signal to sigul alone would orphan."""
-    group = os.getpgid(process.pid)
-    os.killpg(group, signal.SIGTERM)
-    if _wait(process, time.time() + GRACE_SECONDS) is None:
-        os.killpg(group, signal.SIGKILL)
-        process.wait()
+    for its connection, which a signal to sigul alone would orphan.
+
+    The process was started in a group of its own, whose ID is its PID,
+    so the group is addressed by that and never looked up: the process
+    may have ended in the instant after the deadline passed, and a
+    group already gone is the outcome wanted, not an error. The wait is
+    for the whole group, not the process alone, so that a descendant
+    that ignored the first signal cannot go on signing beside the
+    retry; whatever survives the grace period is killed.
+    """
+    group = process.pid
+    _signal_group(group, signal.SIGTERM)
+    deadline = time.time() + GRACE_SECONDS
+    _wait(process, deadline)
+    if not _wait_for_group(group, deadline):
+        _signal_group(group, signal.SIGKILL)
+        _wait_for_group(group, time.time() + KILL_SECONDS)
+    # Reap the process itself if the group's reaping did not; bounded,
+    # since a member stuck in the kernel cannot be waited for.
+    _wait(process, time.time() + KILL_SECONDS)
 
 
 def call_with_password(argv, password_file, timeout=0):
@@ -176,7 +239,8 @@ def call_with_password(argv, password_file, timeout=0):
     """
     handle = open(password_file, "rb")
     try:
-        # Its own process group, so that _stop can reach its children.
+        # Its own process group, so that stop_process_group can reach
+        # its children.
         process = subprocess.Popen(argv, stdin=handle, preexec_fn=os.setsid)
     finally:
         handle.close()
@@ -184,7 +248,7 @@ def call_with_password(argv, password_file, timeout=0):
         return process.wait()
     status = _wait(process, time.time() + timeout)
     if status is None:
-        _stop(process)
+        stop_process_group(process)
         return TIMED_OUT
     return status
 

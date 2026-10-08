@@ -6,22 +6,23 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 import re
 import shutil
 import subprocess
 import tarfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 from action_common import ActionError
+from gpg_bundle import UnprotectedBundleError, kill_gpg_agent
 from prepare_credentials import (
-    UnprotectedBundleError,
     check_configuration,
     decode_pki,
     first_line,
-    kill_gpg_agent,
     prepare,
     rewrite_nss_dir,
 )
@@ -74,8 +75,10 @@ def build_bundle(
     passphrase: str = PASSPHRASE,
     armour: bool = True,
     nss: bool = True,
+    links: dict[str, str] | None = None,
 ) -> str:
-    """Return an encrypted PKI bundle, as sigul-pki carries it."""
+    """Return an encrypted PKI bundle, as sigul-pki carries it. 'links'
+    maps a path in the bundle to the relative target of a symlink."""
     base = scratch(case)
     tree = base / "tree"
     database = tree / layout if layout else tree
@@ -87,6 +90,10 @@ def build_bundle(
         path = tree / name
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(body)
+    for name, target in (links or {}).items():
+        path = tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
     archive = base / "pki.tar.xz"
     with tarfile.open(archive, "w:xz") as tar:
         for child in sorted(tree.iterdir()):
@@ -284,6 +291,20 @@ class PrepareTests(unittest.TestCase):
         self.assertIn("sigul/", message)
         self.assertIn("sigul-backup/", message)
 
+    def test_both_formats_in_one_directory_are_one_database(self) -> None:
+        # NSS upgrades a database in place, leaving cert8.db beside
+        # cert9.db; nss-dir names the directory and the client's NSS
+        # chooses the format, as it did for the legacy action. Accepted,
+        # and said, since it can explain an unexpected certificate.
+        pki = build_bundle(
+            self, "sigul", extra={"sigul/cert8.db": "", "sigul/key3.db": ""}
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _, nss_dir = self.prepare(HEAD + ONAP_NSS, PASSPHRASE, pki)
+        self.assertEqual(nss_dir, "/sigul-creds/pki/sigul")
+        self.assertIn("holds both formats", output.getvalue())
+
     def test_empty_inputs_and_placeholders(self) -> None:
         pki = build_bundle(self, "sigul")
         for config, password, bundle in (
@@ -315,6 +336,50 @@ class PrepareTests(unittest.TestCase):
         layered = (creds / "pki" / ".sigul" / "client.conf").read_text()
         self.assertEqual(self.nss_dirs(layered), [nss_dir])
         self.assertIn("nss-password: p", layered)
+
+    def test_symlinked_user_configuration_is_refused(self) -> None:
+        # A link that stays inside the bundle passes extraction, and
+        # sigul would follow it to a configuration whose nss-dir was
+        # never rewritten, overriding the one that was. The target sits
+        # beside the link: Python 3.10.12's filter resolves a relative
+        # target against the destination root rather than the link's
+        # directory, and would refuse '../real.conf' itself.
+        user = "[nss]\nnss-dir: /home/someone/.sigul\nnss-password: p\n"
+        pki = build_bundle(
+            self,
+            ".sigul",
+            extra={".sigul/real.conf": user},
+            links={".sigul/client.conf": "real.conf"},
+        )
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(HEAD, PASSPHRASE, pki)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_a_bundle_carrying_git_configuration_is_refused(self) -> None:
+        # HOME in the container is the bundle, and the legacy image's
+        # git reads $HOME/.gitconfig whatever GIT_CONFIG_GLOBAL says.
+        for name in (".gitconfig", ".config/git/config"):
+            with self.subTest(name=name):
+                pki = build_bundle(
+                    self, "sigul", extra={name: "[core]\n\tfsmonitor = /bin/true\n"}
+                )
+                with self.assertRaises(ActionError) as caught:
+                    _ = self.prepare(HEAD + ONAP_NSS, PASSPHRASE, pki)
+                self.assertIn(name, str(caught.exception))
+                self.assertIn("remove it from the bundle", str(caught.exception))
+
+    def test_a_hung_gpgconf_does_not_hold_up_cleanup(self) -> None:
+        home = scratch(self)
+        never_returns = mock.Mock(side_effect=subprocess.TimeoutExpired("gpgconf", 2))
+        output = io.StringIO()
+        with (
+            mock.patch("gpg_bundle.system_tool", return_value="/usr/bin/gpgconf"),
+            mock.patch("gpg_bundle.subprocess.run", never_returns),
+            redirect_stdout(output),
+        ):
+            kill_gpg_agent(home)
+        self.assertEqual(never_returns.call_count, 1)
+        self.assertIn("::warning::gpgconf did not stop gpg-agent", output.getvalue())
 
     def test_gpg_leaves_the_users_keyring_alone(self) -> None:
         home = scratch(self)

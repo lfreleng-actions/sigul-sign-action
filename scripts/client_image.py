@@ -204,4 +204,8 @@ def resolve_hosts(
             raise InputError(f"sigul-hosts-entry is 'true' but {detail}")
         messages.warnings.append(f"no hosts entry was added: {detail}")
         return ()
+    # In canonical form, as getaddrinfo() reports addresses, so that the
+    # comparison with DNS is of addresses rather than of spellings:
+    # '2001:0db8::1' is '2001:db8::1'.
+    address = str(ipaddress.ip_address(address))
     return tuple(HostEntry(name=name, address=address) for name in names.split())

@@ -6,15 +6,18 @@
 from __future__ import annotations
 
 import io
+import os
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
-from action_common import ActionError
+from action_common import SYSTEM_PATH, ActionError
 from git_tag import (
     PGP_SIGNATURE_MARKER,
     SigningRepository,
     check_tag_name,
+    read_extension,
     read_head,
     read_ref,
     uses_reftable,
@@ -102,6 +105,11 @@ class RefFileTests(unittest.TestCase):
             "[extensions]\n\tobjectformat = sha256\n"
         )
         self.assertTrue(uses_sha256(repo / ".git"))
+        # Refused where validation runs, before any credential exists,
+        # not later in the signing step.
+        with self.assertRaises(ActionError) as caught:
+            _ = workspace_git_dir(repo)
+        self.assertIn("SHA-256", str(caught.exception))
 
     def test_borrowed_object_store_is_refused(self) -> None:
         repo = make_repository(scratch(self) / "repo")
@@ -121,6 +129,34 @@ class RefFileTests(unittest.TestCase):
         with self.assertRaises(ActionError) as caught:
             _ = workspace_git_dir(repo)
         self.assertIn("reftables", str(caught.exception))
+
+    def test_extension_values_are_read_as_git_reads_them(self) -> None:
+        # Quoted, commented, and in any case: each is valid to git, and a
+        # check that missed one would let the repository through.
+        repo = make_repository(scratch(self) / "repo")
+        config = repo / ".git" / "config"
+        remote = '[remote "origin"]\n\turl = https://x/y.git\n'
+        for text, expected in (
+            ('[extensions]\n\trefStorage = "reftable"\n', ("", "reftable")),
+            ("[extensions]\n\tobjectformat = sha256 ; a comment\n", ("sha256", "")),
+            ("[extensions]\n\tobjectFormat = sha256   # a comment\n", ("sha256", "")),
+            ("[Extensions]\n\tREFSTORAGE = REFTABLE\n", ("", "reftable")),
+            (remote + "[extensions]\n\tobjectformat = sha1\n", ("sha1", "")),
+            (remote, ("", "")),
+        ):
+            with self.subTest(text=text):
+                _ = config.write_text(text)
+                self.assertEqual(
+                    (
+                        read_extension(repo / ".git", "objectformat"),
+                        read_extension(repo / ".git", "refstorage"),
+                    ),
+                    expected,
+                )
+        # What cannot be parsed is refused, not passed.
+        _ = config.write_text("not a git config\n")
+        with self.assertRaises(ActionError):
+            _ = read_extension(repo / ".git", "objectformat")
 
 
 class SigningRepositoryTests(unittest.TestCase):
@@ -297,6 +333,29 @@ class AuthenticatedPushTests(unittest.TestCase):
                 repo, "https://github.com", f"{server.url}/org/repo.git", "the-token"
             )
         self.assertTrue(all(seen == "" for seen in server.seen))
+
+    def test_the_helper_runs_no_tool_a_step_could_plant(self) -> None:
+        # git runs the helper through sh with the system PATH, where a
+        # world-writable /usr/local/bin comes first on hosted runners.
+        # Plant the tools a helper might reach for, each recording the
+        # token it was handed, ahead of everything: the push must still
+        # succeed, and none of them may run.
+        repo, server, oid = self.prepare()
+        planted = scratch(self) / "bin"
+        planted.mkdir()
+        trap = planted / "ran"
+        for tool in ("cat", "head", "sed", "awk", "printf", "read", "test"):
+            path = planted / tool
+            _ = path.write_text(f'#!/bin/sh\necho "{tool} $*" >> "{trap}"\nexit 1\n')
+            path.chmod(0o755)
+        with mock.patch(
+            "action_common.SYSTEM_PATH", f"{planted}{os.pathsep}{SYSTEM_PATH}"
+        ):
+            self.push(repo, server.url, f"{server.url}/org/repo.git", "the-token")
+        remote = server.root / "org" / "repo.git"
+        self.assertEqual(git(remote, "rev-parse", "refs/tags/v1.0.0"), oid)
+        self.assertIn(server.expected, server.seen)
+        self.assertFalse(trap.exists(), trap.read_text() if trap.exists() else "")
 
 
 if __name__ == "__main__":
