@@ -271,11 +271,14 @@ built from one would send signing nowhere.
   system's directories alone, and refuses one in a directory the job's user
   can write to (see Requirements). Put nothing you distrust in a job that
   signs.
-- Secrets live in a mode-0700 directory. On every exit path, cancellation
-  included, the action overwrites each file that held one before removing
-  it, without depending on `shred`; like `shred`, that cannot reach copies a
-  copy-on-write or journalling filesystem keeps. A composite action has no
-  post step, so the step that creates them removes them.
+- Secrets live in a mode-0700 directory, in memory where the runner mounts
+  a tmpfs at `/dev/shm`, as every GitHub-hosted runner does, so nothing
+  reaches a disk; otherwise under `RUNNER_TEMP`. On every exit path,
+  cancellation included, the action overwrites each file that held one
+  before removing it, without depending on `shred`; like `shred`, that
+  cannot reach copies a copy-on-write or journalling filesystem keeps, which
+  is why memory comes first. A composite action has no post step, so the
+  step that creates them removes them.
 - The client container receives them as files: no secret appears on any
   command line, in any environment, or in `docker inspect`. The signing step
   hands them to a fresh process image through an anonymous in-memory file,

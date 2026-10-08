@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -34,7 +35,14 @@ from client_container import (
 )
 from client_image import HostEntry
 from prepare_credentials import PreparedCredentials
-from signing import clear_stale_signatures, destroy, write_manifest
+from signing import (
+    SHARED_MEMORY,
+    clear_stale_signatures,
+    destroy,
+    is_memory_backed,
+    private_directory,
+    write_manifest,
+)
 from sigul_action import (
     check_hosts_against_dns,
     main,
@@ -262,6 +270,32 @@ class SigningFileTests(unittest.TestCase):
             with self.assertRaises(ActionError):
                 set_output("signed_count", "3\ninjected=1")
         self.assertEqual(path.read_text(), "signed_count=3\n")
+
+
+class PrivateDirectoryTests(unittest.TestCase):
+    def test_memory_first_where_there_is_a_tmpfs(self) -> None:
+        fallback = scratch(self)
+        made = private_directory("sigul-test.", str(fallback))
+        self.addCleanup(shutil.rmtree, made, True)
+        self.assertEqual(made.stat().st_mode & 0o777, 0o700)
+        expected = (
+            Path(SHARED_MEMORY)
+            if is_memory_backed(SHARED_MEMORY) and os.access(SHARED_MEMORY, os.W_OK)
+            else fallback
+        )
+        self.assertEqual(made.parent, expected)
+
+    def test_fallback_without_a_tmpfs(self) -> None:
+        fallback = scratch(self)
+        with mock.patch("signing.SHARED_MEMORY", str(fallback / "no-such-shm")):
+            made = private_directory("sigul-test.", str(fallback))
+        self.assertEqual(made.parent, fallback)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "/proc/mounts is Linux-only")
+    def test_mount_table_is_read_exactly(self) -> None:
+        # The mount point itself, not a path beneath one, and tmpfs alone.
+        self.assertFalse(is_memory_backed("/"))
+        self.assertFalse(is_memory_backed(os.path.join(SHARED_MEMORY, "child")))
 
 
 class HostsDnsTests(unittest.TestCase):

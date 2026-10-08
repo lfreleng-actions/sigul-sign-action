@@ -7,10 +7,11 @@
 Runs on the RUNNER, under Python 3.10 or later, in a process whose
 environment holds no secret (see sigul_action.command_sign). It pulls
 the client image, materialises the credentials in a private temporary
-directory, runs the Sigul client in a container, and records the
-result. The directory is removed on every exit path, cancellation
-included: a composite action has no post step, so cleanup belongs to
-the step that created the material.
+directory -- in memory, where the runner has a tmpfs -- runs the Sigul
+client in a container, and records the result. The directory is
+removed on every exit path, cancellation included: a composite action
+has no post step, so cleanup belongs to the step that created the
+material.
 """
 
 from __future__ import annotations
@@ -50,6 +51,42 @@ from prepare_credentials import kill_gpg_agent, prepare
 DRY_RUN_TIMEOUT_SECONDS = 600
 
 SUMMARY_FILE_LIMIT = 50
+
+# Where the key material is unpacked, when it can be: a tmpfs, so that
+# nothing written there reaches a disk. Every Linux the action runs on
+# mounts one here, apart from some container runtimes.
+SHARED_MEMORY = "/dev/shm"
+
+
+def is_memory_backed(path: str) -> bool:
+    """Return True when path is itself a tmpfs mount, per /proc/mounts.
+
+    Without a readable mount table, which is Linux's, nothing is known
+    to be in memory.
+    """
+    table = Path("/proc/mounts")
+    if not table.is_file():
+        return False
+    for line in table.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == path and fields[2] == "tmpfs":
+            return True
+    return False
+
+
+def private_directory(prefix: str, fallback: str | None) -> Path:
+    """Create a mode-0700 temporary directory, in memory where possible.
+
+    Key material written to a tmpfs never reaches a disk, which the
+    overwrite in destroy() cannot promise on a journalling or
+    copy-on-write filesystem; the path is also short, as gpg-agent's
+    socket needs. Where /dev/shm is missing, not a tmpfs or not
+    writable, the fallback serves and the overwrite is what it always
+    was. lfit/sigul-sign-action 2.0.0 made the same choice.
+    """
+    if is_memory_backed(SHARED_MEMORY) and os.access(SHARED_MEMORY, os.W_OK):
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=SHARED_MEMORY))
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=fallback))
 
 
 def clear_stale_signatures(plan: Plan) -> None:
@@ -246,17 +283,16 @@ def sign(plan: Plan, values: dict[str, str]) -> None:
     pulled = pull_image(plan.image)
     set_output("container_image", pulled.resolved)
 
-    work = Path(
-        tempfile.mkdtemp(prefix="sigul.", dir=os.environ.get("RUNNER_TEMP") or None)
-    )
+    work = private_directory("sigul.", os.environ.get("RUNNER_TEMP") or None)
     # gpg-agent puts its socket in the gpg home, and a Unix socket path
     # is limited to around 100 characters, which a self-hosted runner's
-    # RUNNER_TEMP can already approach. /tmp keeps the path short, where
-    # TMPDIR need not; the home is removed with everything else.
-    gnupg = Path(
-        tempfile.mkdtemp(
-            prefix="sigul-gpg.", dir="/tmp" if os.path.isdir("/tmp") else None
-        )
+    # RUNNER_TEMP can already approach. Short of a tmpfs, /tmp keeps
+    # the path short, where TMPDIR need not.
+    gnupg = private_directory("sigul-gpg.", "/tmp" if os.path.isdir("/tmp") else None)
+    info(
+        "Credentials unpack in memory"
+        if work.parent == Path(SHARED_MEMORY)
+        else f"Credentials unpack under {work.parent}; no tmpfs is available"
     )
     name = f"sigul-sign-{secrets.token_hex(6)}"
     creds = work / "creds"

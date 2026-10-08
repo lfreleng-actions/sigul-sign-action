@@ -474,10 +474,12 @@ jobs:
             "$(cat "${RUNNER_TEMP}/tag-before")" ] ||
             fail "the tag was not moved"
           git fsck --no-dangling
-          [ -z "$(find "${RUNNER_TEMP}" -maxdepth 1 -name 'sigul.*')" ] ||
-            fail "credentials were left in RUNNER_TEMP"
-          [ -z "$(find /tmp -maxdepth 1 -name 'sigul-gpg.*')" ] ||
-            fail "a gpg home was left in /tmp"
+          for where in "${RUNNER_TEMP}" /dev/shm /tmp; do
+            [ -d "${where}" ] || continue
+            [ -z "$(find "${where}" -maxdepth 1 -name 'sigul.*' \
+                -o -maxdepth 1 -name 'sigul-gpg.*')" ] ||
+              fail "credentials were left in ${where}"
+          done
           echo "Signatures, ownership and the signed tag are correct ✅"
 
       # --- Credentials that must be refused ---
