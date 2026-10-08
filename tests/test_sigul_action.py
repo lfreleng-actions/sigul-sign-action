@@ -34,6 +34,7 @@ from client_container import (
     pulled_digest,
     run_container,
     user_for_daemon,
+    uses_selinux,
 )
 from client_image import HostEntry
 from prepare_credentials import PreparedCredentials
@@ -79,6 +80,10 @@ class DaemonUserTests(unittest.TestCase):
         with self.assertRaises(ActionError) as caught:
             _ = self.user_for("name=seccomp,profile=builtin,name=userns")
         self.assertIn("userns-remap", str(caught.exception))
+
+    def test_selinux_is_recognised(self) -> None:
+        self.assertTrue(uses_selinux("name=seccomp,profile=default,name=selinux"))
+        self.assertFalse(uses_selinux("name=seccomp,profile=builtin,name=cgroupns"))
 
 
 class DigestTests(unittest.TestCase):
@@ -153,6 +158,7 @@ class ContainerCommandTests(unittest.TestCase):
         self.assertIn("--user 1001:118", joined)
         self.assertIn("--cap-drop=ALL", argv)
         self.assertIn("--security-opt=no-new-privileges", argv)
+        self.assertNotIn("--security-opt=label=disable", argv)
         self.assertIn("--add-host bridge.example.org:192.0.2.7", joined)
         self.assertIn(
             "type=bind,source="
@@ -191,6 +197,24 @@ class ContainerCommandTests(unittest.TestCase):
         )
         for name in ("SIGUL_CONF", "SIGUL_PASS", "SIGUL_PKI", "GH_KEY"):
             self.assertFalse(any(arg.startswith(name + "=") for arg in argv), name)
+
+    def test_selinux_waives_mount_labelling_only(self) -> None:
+        plan = plan_for(self)
+        pulled = PulledImage("img:1", "img:1", "root", "linux/amd64")
+        creds = scratch(self)
+        prepared = PreparedCredentials(
+            creds / "client.conf", "/sigul-creds/pki", "/n", False
+        )
+        argv = container_argv(
+            ContainerRun(plan, pulled, prepared, creds, "n", "0:0", selinux=True),
+            [],
+            {},
+            "/",
+            "probe.py",
+        )
+        self.assertIn("--security-opt=label=disable", argv)
+        self.assertIn("--security-opt=no-new-privileges", argv)
+        self.assertIn("--cap-drop=ALL", argv)
 
     def test_container_output_cannot_issue_workflow_commands(self) -> None:
         output = io.StringIO()

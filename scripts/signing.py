@@ -39,9 +39,11 @@ from client_container import (
     bind,
     container_argv,
     container_user,
+    daemon_security_options,
     pull_image,
     remove_container,
     run_container,
+    uses_selinux,
 )
 from git_tag import SigningRepository, workspace_git_dir, write_tag_ref
 from prepare_credentials import kill_gpg_agent, prepare
@@ -231,6 +233,12 @@ def sign_git_tag(run: ContainerRun, work: Path, gh_key: str) -> None:
         "GIT_TAG": plan.tag,
         "GIT_OBJECT_DIRECTORY": objects,
         "GIT_CONFIG_NOSYSTEM": "1",
+        # HOME is the unpacked bundle, so that sigul finds its
+        # .sigul/client.conf; git would read a .gitconfig there too,
+        # which can name commands. Nothing in the bundle is git's to
+        # configure. (git 1.8, in the legacy image, predates this
+        # variable and ignores it.)
+        "GIT_CONFIG_GLOBAL": os.devnull,
         # Trust the private repository this step created, and nothing
         # else. Where the container sees the mount under another owner
         # -- rootless Docker, user-namespace remapping, Docker Desktop --
@@ -279,7 +287,9 @@ def sign(plan: Plan, values: dict[str, str]) -> None:
         clear_stale_signatures(plan)
     # Both before any credential is written: a daemon the client cannot
     # run under, or an image it cannot pull, fails here.
-    user = container_user()
+    security_options = daemon_security_options()
+    user = container_user(security_options)
+    selinux = uses_selinux(security_options)
     pulled = pull_image(plan.image)
     set_output("container_image", pulled.resolved)
 
@@ -307,7 +317,7 @@ def sign(plan: Plan, values: dict[str, str]) -> None:
         )
         kill_gpg_agent(gnupg)
         destroy(gnupg)
-        run = ContainerRun(plan, pulled, prepared, creds, name, user)
+        run = ContainerRun(plan, pulled, prepared, creds, name, user, selinux)
         if plan.sign_type == "sign-data":
             sign_data(run)
         else:

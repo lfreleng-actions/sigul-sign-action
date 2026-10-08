@@ -185,9 +185,20 @@ class ContainerRun:
     creds: Path
     name: str
     user: str
+    # Whether the daemon labels containers with SELinux, in which case
+    # the bind mounts need labelling disabled to be readable.
+    selinux: bool = False
 
 
-def container_user() -> str:
+def daemon_security_options() -> str:
+    """Return the daemon's security options, as 'docker info' lists them."""
+    done = docker(["info", "--format", '{{join .SecurityOptions ","}}'])
+    if done.returncode != 0:
+        raise ActionError(f"cannot query the Docker daemon: {done.stderr.strip()}")
+    return done.stdout
+
+
+def container_user(security_options: str | None = None) -> str:
     """Return the container user that is the runner's own user on the host.
 
     Signatures, git objects and the credentials directory belong to the
@@ -202,10 +213,20 @@ def container_user() -> str:
         neither read the credentials nor write what the workflow owns.
         That is refused, with the reason.
     """
-    done = docker(["info", "--format", '{{join .SecurityOptions ","}}'])
-    if done.returncode != 0:
-        raise ActionError(f"cannot query the Docker daemon: {done.stderr.strip()}")
-    return user_for_daemon(done.stdout)
+    if security_options is None:
+        security_options = daemon_security_options()
+    return user_for_daemon(security_options)
+
+
+def uses_selinux(security_options: str) -> bool:
+    """Whether the daemon labels containers with SELinux.
+
+    A labelled container cannot read a bind mount the host labelled for
+    someone else, which is every directory the action mounts: the
+    failure reads like a bad credential. global-jjb's signing job
+    disabled labelling for its container for the same reason.
+    """
+    return "name=selinux" in security_options
 
 
 def user_for_daemon(security_options: str) -> str:
@@ -245,6 +266,12 @@ def container_argv(
         run.user,
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+    ]
+    if run.selinux:
+        # The container still runs as the runner's user with every
+        # capability dropped; only the mount labelling is waived.
+        argv.append("--security-opt=label=disable")
+    argv += [
         "--workdir",
         workdir,
         # Read-write, deliberately: NSS creates lock files beside its

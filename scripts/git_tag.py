@@ -41,6 +41,7 @@ PGP_SIGNATURE_MARKER = "-----BEGIN PGP SIGNATURE-----"
 
 _OID = re.compile(r"^[0-9a-f]{40}$")
 _OBJECT_FORMAT_SHA256 = re.compile(r"^\s*objectformat\s*=\s*sha256\s*$", re.I | re.M)
+_REF_STORAGE_REFTABLE = re.compile(r"^\s*refstorage\s*=\s*reftable\s*$", re.I | re.M)
 
 
 def git_env(home: Path, objects: Path | None = None) -> dict[str, str]:
@@ -105,7 +106,11 @@ def workspace_git_dir(workspace: Path) -> Path:
     Only a standard checkout is supported. In a linked worktree or a
     submodule, .git is a FILE pointing at metadata elsewhere on the host;
     a symlinked .git likewise points outside the work tree. Neither
-    object store would be reachable from inside the container.
+    object store would be reachable from inside the container. The same
+    goes for an object store that borrows from another through
+    objects/info/alternates, and a repository that keeps its refs in
+    reftables rather than files cannot have its tag recorded by writing
+    one. actions/checkout produces none of these.
     """
     dot_git = workspace / ".git"
     if dot_git.is_symlink():
@@ -126,6 +131,18 @@ def workspace_git_dir(workspace: Path) -> Path:
         raise ActionError(
             "the workspace's .git/objects is not a directory inside .git; "
             + "its object store lies elsewhere. Use a standard checkout"
+        )
+    if (objects / "info" / "alternates").exists():
+        raise ActionError(
+            "the workspace's object store borrows objects from another "
+            + "(.git/objects/info/alternates), which the signing container "
+            + "could not reach. Use a standard checkout"
+        )
+    if uses_reftable(dot_git):
+        raise ActionError(
+            "the workspace keeps its refs in reftables (extensions.refStorage), "
+            + "where the signed tag cannot be recorded by writing a ref file. "
+            + "Use a checkout with the default ref storage"
         )
     return dot_git
 
@@ -168,6 +185,15 @@ def uses_sha256(git_dir: Path) -> bool:
     if not config.is_file():
         return False
     return bool(_OBJECT_FORMAT_SHA256.search(config.read_text(errors="replace")))
+
+
+def uses_reftable(git_dir: Path) -> bool:
+    """Return True when the repository keeps its refs in reftables, where
+    a loose ref file is not read. From the configuration as text."""
+    config = git_dir / "config"
+    if not config.is_file():
+        return False
+    return bool(_REF_STORAGE_REFTABLE.search(config.read_text(errors="replace")))
 
 
 def write_tag_ref(git_dir: Path, tag: str, oid: str) -> None:

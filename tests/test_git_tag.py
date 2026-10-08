@@ -17,6 +17,7 @@ from git_tag import (
     check_tag_name,
     read_head,
     read_ref,
+    uses_reftable,
     uses_sha256,
     workspace_git_dir,
     write_tag_ref,
@@ -96,10 +97,30 @@ class RefFileTests(unittest.TestCase):
         repo = make_repository(base / "repo")
         self.assertEqual(workspace_git_dir(repo), repo / ".git")
         self.assertFalse(uses_sha256(repo / ".git"))
+        self.assertFalse(uses_reftable(repo / ".git"))
         _ = (repo / ".git" / "config").write_text(
             "[extensions]\n\tobjectformat = sha256\n"
         )
         self.assertTrue(uses_sha256(repo / ".git"))
+
+    def test_borrowed_object_store_is_refused(self) -> None:
+        repo = make_repository(scratch(self) / "repo")
+        info = repo / ".git" / "objects" / "info"
+        info.mkdir(exist_ok=True)
+        _ = (info / "alternates").write_text("/elsewhere/objects\n")
+        with self.assertRaises(ActionError) as caught:
+            _ = workspace_git_dir(repo)
+        self.assertIn("alternates", str(caught.exception))
+
+    def test_reftable_repository_is_refused(self) -> None:
+        repo = make_repository(scratch(self) / "repo")
+        _ = (repo / ".git" / "config").write_text(
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n"
+        )
+        self.assertTrue(uses_reftable(repo / ".git"))
+        with self.assertRaises(ActionError) as caught:
+            _ = workspace_git_dir(repo)
+        self.assertIn("reftables", str(caught.exception))
 
 
 class SigningRepositoryTests(unittest.TestCase):

@@ -101,6 +101,9 @@ fetches it first, without credentials, from the repository it pushes to; a
 fetched tag replaces the local one. It then records the signed tag in the
 workspace and force-pushes it to `refs/tags/<tag>`. Set `push-tag: false` to
 sign without pushing, for example in a lane with no permission to publish.
+The workspace must be a standard checkout, as `actions/checkout` makes one:
+`.git` a directory with its own object store, refs kept as files, and SHA-1
+object names, which the legacy client's git 1.8 requires.
 
 ### Sign against the containerised infrastructure
 
@@ -307,7 +310,11 @@ built from one would send signing nowhere.
 
 - **A Linux runner with Docker**, rootful or rootless. The action refuses a
   daemon that remaps user namespaces (`userns-remap`): no container user there
-  is the runner's own. The legacy client needs `linux/amd64`; the modern
+  is the runner's own. Where the daemon labels containers with SELinux, the
+  action runs the client with labelling waived (`label=disable`), as
+  `global-jjb`'s signing job did, so that it can read the directories the
+  action mounts; the container still runs as the runner's user with every
+  capability dropped. The legacy client needs `linux/amd64`; the modern
   client also runs on `linux/arm64`.
 - **Python 3.10.12, 3.11.4, 3.12 or later**, for `tarfile`'s `data`
   extraction filter. The action refuses to unpack key material without it.
