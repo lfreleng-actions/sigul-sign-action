@@ -280,6 +280,30 @@ class SignDataTests(unittest.TestCase):
         got = [s for s, _ in self.plan(root, "dist/a.jar\nalias.asc")]
         self.assertEqual(got, ["dist/a.jar"])
 
+    @unittest.expectedFailure
+    def test_symlink_chain_through_a_planned_output_is_not_signed(self) -> None:
+        # A08: replacing a.jar.asc redirects alias even though its final
+        # resolved source, top.txt, is not itself a planned output.
+        root = self.workspace()
+        (root / "dist" / "a.jar.asc").symlink_to("../top.txt")
+        (root / "alias").symlink_to("dist/a.jar.asc")
+        self.assertEqual(
+            self.plan(root, "dist/a.jar\nalias"),
+            [("dist/a.jar", "dist/a.jar.asc")],
+        )
+
+    @unittest.expectedFailure
+    def test_dotdot_after_a_symlink_preserves_filesystem_semantics(self) -> None:
+        # A09: route/.. is dist, not the workspace root.
+        root = self.workspace()
+        (root / "route").symlink_to("dist/nested")
+        _ = (root / "dist" / "top.txt").write_text("different from top.txt")
+        for entry in ("route/../top.txt", "route/../*.txt"):
+            with self.subTest(entry=entry):
+                self.assertEqual(
+                    self.plan(root, entry), [("dist/top.txt", "dist/top.txt.asc")]
+                )
+
     def test_duplicates_collapse(self) -> None:
         root = self.workspace()
         self.assertEqual(len(self.plan(root, "top.txt\n./top.txt\n*.txt")), 1)

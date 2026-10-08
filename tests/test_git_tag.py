@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -159,6 +160,78 @@ class RefFileTests(unittest.TestCase):
             _ = read_extension(repo / ".git", "objectformat")
 
 
+class ConfigurationRegressionTests(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_extension_sections_use_git_case_and_last_value_precedence(self) -> None:
+        base = scratch(self)
+        repo = make_repository(base / "repo")
+        config = repo / ".git" / "config"
+        for name, first, last in (
+            ("refStorage", "files", "reftable"),
+            ("objectFormat", "sha1", "sha256"),
+        ):
+            with self.subTest(extension=name):
+                _ = config.write_text(
+                    f"[extensions]\n{name} = {first}\n[Extensions]\n{name} = {last}\n"
+                )
+                # A12: query an explicit file outside the workspace repo,
+                # so Git's parser is the oracle, not configparser's INI rules.
+                expected = git(
+                    base, "config", "--file", str(config), "--get", f"extensions.{name}"
+                )
+                self.assertEqual(read_extension(repo / ".git", name), expected)
+                with self.assertRaises(ActionError):
+                    _ = workspace_git_dir(repo)
+
+    @unittest.expectedFailure
+    def test_extension_values_follow_git_quoting_comments_and_continuations(
+        self,
+    ) -> None:
+        base = scratch(self)
+        repo = make_repository(base / "repo")
+        config = repo / ".git" / "config"
+        for value in ('reftab"le"', "reftable#comment", "ref\\\ntable"):
+            with self.subTest(value=value):
+                _ = config.write_text(f"[extensions]\nrefStorage = {value}\n")
+                expected = git(
+                    base,
+                    "config",
+                    "--file",
+                    str(config),
+                    "--get",
+                    "extensions.refStorage",
+                )
+                self.assertEqual(expected, "reftable")
+                self.assertEqual(read_extension(repo / ".git", "refStorage"), expected)
+
+    @unittest.expectedFailure
+    def test_git_invalid_config_is_refused_even_when_ini_accepts_it(self) -> None:
+        base = scratch(self)
+        repo = make_repository(base / "repo")
+        config = repo / ".git" / "config"
+        _ = config.write_text('[extensions]\nrefStorage = "reftable\\q"\n')
+        with self.assertRaises(subprocess.CalledProcessError):
+            _ = git(base, "config", "--file", str(config), "--list")
+        with self.assertRaises(ActionError):
+            _ = workspace_git_dir(repo)
+
+    @unittest.expectedFailure
+    def test_unconditional_and_conditional_includes_are_refused(self) -> None:
+        repo = make_repository(scratch(self) / "repo")
+        config = repo / ".git" / "config"
+        original = config.read_text()
+        _ = (repo / ".git" / "extra.config").write_text(
+            "[extensions]\nrefStorage = reftable\n"
+        )
+        # Include conditions would be evaluated in the private repository,
+        # not the workspace. Refuse includes instead of silently missing them.
+        for section in ("include", 'includeIf "gitdir:**/repo/.git"'):
+            with self.subTest(section=section):
+                _ = config.write_text(original + f"[{section}]\npath = extra.config\n")
+                with self.assertRaises(ActionError):
+                    _ = workspace_git_dir(repo)
+
+
 class SigningRepositoryTests(unittest.TestCase):
     def setup_remote(self) -> tuple[Path, Path, Path]:
         """A bare 'GitHub' repository, and a shallow workspace clone of it
@@ -183,6 +256,21 @@ class SigningRepositoryTests(unittest.TestCase):
         )
         repo.create()
         return repo
+
+    @unittest.expectedFailure
+    def test_shared_object_store_disables_automatic_maintenance(self) -> None:
+        base = scratch(self)
+        workspace = make_repository(base / "workspace")
+        repo = self.repository(base, workspace)
+        settings = dict(
+            line.split("=", 1)
+            for line in git(repo.root, "config", "--local", "--list").splitlines()
+        )
+        # A03: older fetches run gc --auto; newer Git has additional
+        # maintenance tasks. Neither may prune using only the private refs.
+        self.assertEqual(
+            (settings.get("gc.auto"), settings.get("maintenance.auto")), ("0", "false")
+        )
 
     def test_fetched_tag_replaces_the_local_one(self) -> None:
         base, remote, workspace = self.setup_remote()
