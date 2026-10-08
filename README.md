@@ -105,6 +105,13 @@ The workspace must be a standard checkout, as `actions/checkout` makes one:
 `.git` a directory with its own object store, refs kept as files, and SHA-1
 object names, which the legacy client's git 1.8 requires.
 
+`gh-key` needs write access to the repository's contents: `contents: write`
+for the job's `GITHUB_TOKEN`, or a personal access token or GitHub App token
+that grants the same. A tag pushed with `GITHUB_TOKEN` starts no other
+workflow, by GitHub's rule against recursive runs, so a release workflow that
+should run on the signed tag needs a token of its own, as with the legacy
+action.
+
 ### Sign against the containerised infrastructure
 
 ```yaml
@@ -149,29 +156,29 @@ is what proves the bridge reachable.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                | Default             | Description                                                                              |
-| ------------------- | ------------------- | ---------------------------------------------------------------------------------------- |
-| `sign-type`         | `sign-data`         | `sign-data` or `sign-git-tag`                                                            |
-| `sign-object`       |                     | **Required.** Files to sign, one per line; or the tag to sign                            |
-| `sigul-key-name`    |                     | **Required.** Name of the signing key on the server                                      |
-| `sigul-conf`        |                     | **Required.** Body of the client configuration, `client.conf`                            |
-| `sigul-pass`        |                     | **Required.** Key passphrase, which also decrypts `sigul-pki`; Sigul gets its first line |
-| `sigul-pki`         |                     | **Required.** GPG-encrypted `tar.xz` of the NSS database, ASCII-armoured or base64       |
-| `sigul-ip`          |                     | Bridge IP address, for the hosts entry                                                   |
-| `sigul-uri`         |                     | Bridge hostname, for the hosts entry                                                     |
-| `gh-user`           | `github.actor`      | User to push a signed tag as                                                             |
-| `gh-key`            |                     | Token to push a signed tag. Required for `sign-git-tag` unless `push-tag` is `false`     |
-| `container`         | `legacy` when unset | Built-in client: `legacy` or `modern`                                                    |
-| `container-image`   |                     | Bespoke client image, in place of `container`                                            |
-| `container-tag`     |                     | Tag for `container-image`                                                                |
-| `container-digest`  |                     | Digest for `container-image`, as `sha256:<64 hex digits>`                                |
-| `sigul-hosts-entry` | `auto`              | `auto` adds the hosts entry for `legacy`; `true` for any container; `false` never        |
-| `push-tag`          | `true`              | Push a signed tag back to the repository                                                 |
-| `dry-run`           | `false`             | Check everything, sign nothing                                                           |
-| `exclude-globs`     | `global-jjb`'s list | File name patterns skipped inside a directory                                            |
-| `max-retries`       | `5`                 | Attempts per signing operation                                                           |
-| `retry-delay`       | `15`                | Seconds between attempts                                                                 |
-| `attempt-timeout`   | `600`               | Seconds one attempt may take before the action stops and retries it; `0` for no limit    |
+| Name                | Default             | Description                                                                                                  |
+| ------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `sign-type`         | `sign-data`         | `sign-data` or `sign-git-tag`                                                                                |
+| `sign-object`       |                     | **Required.** Files to sign, one per line, or a directory; or the tag to sign                                |
+| `sigul-key-name`    |                     | **Required.** Name of the signing key on the server                                                          |
+| `sigul-conf`        |                     | **Required.** Body of the client configuration, `client.conf`                                                |
+| `sigul-pass`        |                     | **Required.** Key passphrase, which also decrypts `sigul-pki`; Sigul gets its first line                     |
+| `sigul-pki`         |                     | **Required.** GPG-encrypted `tar.xz` of the NSS database, ASCII-armoured or base64                           |
+| `sigul-ip`          |                     | Bridge IP address, for the hosts entry                                                                       |
+| `sigul-uri`         |                     | Bridge hostname, for the hosts entry                                                                         |
+| `gh-user`           | `github.actor`      | User to push a signed tag as                                                                                 |
+| `gh-key`            |                     | Token to push a signed tag, with `contents: write`. Required for `sign-git-tag` unless `push-tag` is `false` |
+| `container`         | `legacy` when unset | Built-in client: `legacy` or `modern`                                                                        |
+| `container-image`   |                     | Bespoke client image, in place of `container`                                                                |
+| `container-tag`     |                     | Tag for `container-image`                                                                                    |
+| `container-digest`  |                     | Digest for `container-image`, as `sha256:<64 hex digits>`                                                    |
+| `sigul-hosts-entry` | `auto`              | `auto` adds the hosts entry for `legacy`; `true` for any container; `false` never                            |
+| `push-tag`          | `true`              | Push a signed tag back to the repository                                                                     |
+| `dry-run`           | `false`             | Check everything, sign nothing                                                                               |
+| `exclude-globs`     | `global-jjb`'s list | File name patterns skipped inside a directory                                                                |
+| `max-retries`       | `5`                 | Attempts per signing operation                                                                               |
+| `retry-delay`       | `15`                | Seconds between attempts                                                                                     |
+| `attempt-timeout`   | `600`               | Seconds one attempt may take before the action stops and retries it; `0` for no limit                        |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -327,7 +334,11 @@ built from one would send signing nowhere.
   runner's user, or anyone, can write to. GitHub-hosted Ubuntu runners leave
   `/usr/local/bin` world-writable, so the action refuses a tool planted there
   with no privilege at all, rather than run it; install tools in a directory
-  that root alone can write to.
+  that root alone can write to. These four tools, and the Docker daemon, are
+  what the action trusts on the runner: the legacy action ran its own logic
+  inside the client container and trusted the daemon alone, so moving the
+  orchestration to the runner, which every other property here depends on,
+  adds the runner's Python, gpg, git and docker CLI to what must be sound.
 - **Network access to the bridge**, on port 44334:
 
 <!-- markdownlint-disable MD013 -->
