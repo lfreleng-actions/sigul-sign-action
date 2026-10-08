@@ -26,10 +26,10 @@ Environment (required unless noted):
 
 from __future__ import print_function
 
+import subprocess
 import time
 
 from container_common import (
-    PGP_SIGNATURE_MARKER,
     TIMED_OUT,
     call_with_password,
     fail,
@@ -40,6 +40,7 @@ from container_common import (
     set_default_user,
     warn,
 )
+from tag_integrity import signature_error
 
 
 def tag_oid(tag):
@@ -48,6 +49,17 @@ def tag_oid(tag):
     if status != 0 or not oid:
         fail("tag does not exist in the signing repository: " + tag)
     return oid
+
+
+def tag_bytes(oid):
+    """Read raw tag bytes; git_output strips whitespace and decodes text."""
+    process = subprocess.Popen(
+        ["git", "cat-file", "tag", oid], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    body, _error = process.communicate()
+    if process.returncode != 0:
+        fail("cannot read tag object: " + oid)
+    return body
 
 
 def main():
@@ -61,6 +73,9 @@ def main():
     status, kind = git_output(["cat-file", "-t", unsigned])
     if status != 0 or kind != "tag":
         fail("{} is not an annotated tag ({})".format(tag, kind or "unreadable"))
+    original = tag_bytes(unsigned)
+    if not original.endswith(b"\n"):
+        fail("the original tag must end with a newline before signing: " + tag)
 
     info("signing git tag " + tag)
     argv = ["sigul", "--batch", "sign-git-tag", "--", key, tag]
@@ -69,15 +84,13 @@ def main():
         status = call_with_password(argv, password_file, retry.timeout)
         current = tag_oid(tag)
         if current != unsigned:
-            # sigul moved the ref, so the signature landed. Retrying now
-            # would sign the signed object again and append a second
-            # signature, so stop even if sigul reported an error after
-            # its final update-ref.
+            # A moved ref is never retried: either its exact payload and
+            # appended signature are sound, or this run must fail closed.
+            problem = signature_error(original, tag_bytes(current))
+            if problem:
+                fail(problem)
             if status != 0:
                 warn("sigul reported failure after updating the tag")
-            _status, body = git_output(["cat-file", "tag", current])
-            if PGP_SIGNATURE_MARKER not in body:
-                fail("the tag changed but carries no signature")
             info("signed git tag {} (attempt {})".format(tag, attempt))
             return 0
         if status == TIMED_OUT:

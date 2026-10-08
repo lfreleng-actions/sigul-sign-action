@@ -71,7 +71,8 @@ class _Collector:
     def absolute(self, entry: str) -> str:
         if entry == LEGACY_WORKSPACE or entry.startswith(LEGACY_WORKSPACE + "/"):
             entry = self.workspace + entry[len(LEGACY_WORKSPACE) :]
-        return os.path.normpath(os.path.join(self.workspace, entry))
+        # Resolve symlinks before collapsing '..'; lexical cleanup changes its meaning.
+        return os.path.join(self.workspace, entry)
 
     def add_file(self, path: str, entry: str) -> None:
         """Add a regular file, or a symlink to one inside the workspace.
@@ -165,6 +166,27 @@ class _Collector:
             self.errors.append(f"Not a regular file or directory: {line}")
 
 
+def _crosses_output(path: str, outputs: set[str]) -> bool:
+    """Follow every file symlink, checking each name before dereferencing it.
+
+    Resolve only parents at each hop: resolving the whole path would hide an
+    intermediate stale signature. Planned outputs cannot be directories, so
+    none can be skipped by resolving a parent. Repeated links indicate a cycle.
+    """
+    seen: set[str] = set()
+    while True:
+        parent, name = os.path.split(path)
+        path = os.path.join(os.path.realpath(parent), name)
+        if path in outputs:
+            return True
+        if path in seen:
+            raise InputError(f"Symlink cycle while resolving {path}")
+        seen.add(path)
+        if not os.path.islink(path):
+            return False
+        path = os.path.join(os.path.dirname(path), os.readlink(path))
+
+
 def plan_sign_data(
     sign_object: str, workspace: Path, excludes: list[str], messages: Messages
 ) -> tuple[SignTarget, ...]:
@@ -183,16 +205,11 @@ def plan_sign_data(
     if collector.errors:
         raise InputError("\n".join(collector.errors))
 
-    # Never sign a file this run will itself replace: under a wildcard
-    # such as 'dist/*', an old 'a.jar.asc' is a stale signature of
-    # 'a.jar', not an artefact. Checked by the name the caller sees,
-    # since a stale signature can be a symlink to some other file, and
-    # by the resolved source, since a symlink can point at one.
+    # Keep the full output set, even for candidates filtered out below:
+    # a source depending on any planned replacement is not an artefact.
     outputs = set(collector.targets)
     targets = tuple(
-        t
-        for t in collector.targets.values()
-        if t.name not in outputs and t.source not in outputs
+        t for t in collector.targets.values() if not _crosses_output(t.name, outputs)
     )
     if not targets:
         raise InputError("No files to sign; check sign-object")

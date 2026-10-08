@@ -27,34 +27,32 @@ The workspace's refs are read as files for the same reason.
 
 from __future__ import annotations
 
-import configparser
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from action_common import ActionError, minimal_env, shred_file
+from action_common import ActionError, shred_file
+from git_config import git_env as git_env
+from git_config import read_extension as read_extension
+from git_config import uses_reftable as uses_reftable
+from git_config import uses_sha256 as uses_sha256
+from process_control import capture_bytes, capture_text
 
-# A signature sigul appends to the tag object.
-PGP_SIGNATURE_MARKER = "-----BEGIN PGP SIGNATURE-----"
+if TYPE_CHECKING:
+    # The standalone container script uses this module name. Keep type analysis
+    # on the same name so it does not load the shared source file twice.
+    from tag_integrity import BEGIN_SIGNATURE, signature_error
+else:
+    from container.tag_integrity import BEGIN_SIGNATURE, signature_error
+
+# Retained for callers that display the marker or construct test fixtures.
+PGP_SIGNATURE_MARKER = BEGIN_SIGNATURE.decode("ascii")
 
 _OID = re.compile(r"^[0-9a-f]{40}$")
-
-
-def git_env(home: Path, objects: Path | None = None) -> dict[str, str]:
-    """Return an environment for git that reads no caller configuration."""
-    extra = {
-        "HOME": str(home),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_ATTR_NOSYSTEM": "1",
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    if objects is not None:
-        extra["GIT_OBJECT_DIRECTORY"] = str(objects)
-    return minimal_env(extra)
 
 
 def run_git(
@@ -62,14 +60,7 @@ def run_git(
 ) -> subprocess.CompletedProcess[str]:
     """Run git, capturing its output."""
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        return capture_text(["git", *args], cwd=cwd, env=env)
     except FileNotFoundError:
         raise ActionError("git is not installed on the runner") from None
 
@@ -184,57 +175,6 @@ def read_head(git_dir: Path) -> str | None:
     return value if _OID.match(value) else None
 
 
-def read_extension(git_dir: Path, name: str) -> str:
-    """Return an [extensions] value from the repository's configuration,
-    lower-cased and unquoted, or '' when unset.
-
-    Read as text, which runs no git. Git's syntax is close enough to
-    INI for configparser: section and key names compare without case,
-    a value may be quoted, and ';' or '#' after one starts a comment. A
-    configuration that cannot be parsed is refused rather than passed,
-    since the checks built on this exist to fail closed.
-    """
-    config = git_dir / "config"
-    if not config.is_file():
-        return ""
-    parser = configparser.RawConfigParser(
-        strict=False,
-        allow_no_value=True,
-        delimiters=("=",),
-        comment_prefixes=(";", "#"),
-        inline_comment_prefixes=(";", "#"),
-        empty_lines_in_values=False,
-    )
-    try:
-        parser.read_string(config.read_text(errors="replace"))
-    except configparser.Error as exc:
-        raise ActionError(f"cannot read the workspace's .git/config: {exc}") from None
-    for section in parser.sections():
-        if section.strip().lower() != "extensions":
-            continue
-        for key, value in parser.items(section):
-            if key.lower() != name.lower():
-                continue
-            # allow_no_value lets a bare key through as None.
-            found: str = value or ""
-            found = found.strip()
-            if len(found) >= 2 and found[0] == found[-1] == '"':
-                found = found[1:-1]
-            return found.lower()
-    return ""
-
-
-def uses_sha256(git_dir: Path) -> bool:
-    """Return True when the repository names objects with SHA-256."""
-    return read_extension(git_dir, "objectformat") == "sha256"
-
-
-def uses_reftable(git_dir: Path) -> bool:
-    """Return True when the repository keeps its refs in reftables, where
-    a loose ref file is not read."""
-    return read_extension(git_dir, "refstorage") == "reftable"
-
-
 def write_tag_ref(git_dir: Path, tag: str, oid: str) -> None:
     """Point refs/tags/<tag> at oid by writing a loose ref file.
 
@@ -285,6 +225,7 @@ class SigningRepository:
         self.objects: Path = (
             root / ".git" / "objects" if isolated else self.workspace_objects
         )
+        self._observed_tags: dict[tuple[str, str], str] = {}
 
     def _git(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return run_git(args, self.root, git_env(self.home, self.objects))
@@ -295,6 +236,14 @@ class SigningRepository:
         done = run_git(["init", "-q", str(self.root)], self.home, git_env(self.home))
         if done.returncode != 0:
             raise ActionError(f"git init failed: {last_line(done.stderr)}")
+        # This repository cannot judge reachability in the shared object store.
+        # Persist these settings so the container's Git obeys them as well.
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false")):
+            done = self._git(["config", "--local", key, value])
+            if done.returncode != 0:
+                raise ActionError(
+                    f"cannot disable Git maintenance: {last_line(done.stderr)}"
+                )
         shallow = self.workspace_git / "shallow"
         if shallow.is_file():
             _ = shutil.copyfile(shallow, self.root / ".git" / "shallow")
@@ -312,10 +261,18 @@ class SigningRepository:
     def fetch_tag(self, url: str, tag: str) -> str:
         """Fetch the tag without credentials; return '' or the reason it
         could not be fetched."""
+        observation = (url, tag)
+        _ = self._observed_tags.pop(observation, None)
         done = self._git(
             ["fetch", "-q", "--no-tags", url, f"+refs/tags/{tag}:refs/tags/{tag}"]
         )
-        return "" if done.returncode == 0 else (last_line(done.stderr) or "failed")
+        if done.returncode != 0:
+            return last_line(done.stderr) or "failed"
+        oid = self.tag_oid(tag)
+        if oid is None:
+            return "the fetched tag has no readable object ID"
+        self._observed_tags[observation] = oid
+        return ""
 
     def tag_oid(self, tag: str) -> str | None:
         """Return the object the tag points at here, or None."""
@@ -340,28 +297,50 @@ class SigningRepository:
         done = self._git(["cat-file", "-t", oid])
         return done.stdout.strip() if done.returncode == 0 else ""
 
+    def tag_bytes(self, oid: str) -> bytes:
+        """Read a tag without decoding, stripping, or normalizing its payload."""
+        try:
+            done = capture_bytes(
+                ["git", "cat-file", "tag", oid],
+                cwd=self.root,
+                env=git_env(self.home, self.objects),
+            )
+        except FileNotFoundError:
+            raise ActionError("git is not installed on the runner") from None
+        if done.returncode != 0:
+            raise ActionError(f"cannot read tag object: {oid}")
+        return done.stdout
+
     def require_annotated(self, tag: str, oid: str) -> None:
-        """Fail unless oid is a tag object."""
+        """Fail unless oid is an annotated tag safe to append a signature to."""
         kind = self.object_type(oid)
         if kind != "tag":
             raise ActionError(
                 f"{tag} is not an annotated tag ({kind or 'unreadable'}); "
                 + "only an annotated tag can carry a signature"
             )
+        if not self.tag_bytes(oid).endswith(b"\n"):
+            raise ActionError(
+                f"the original tag must end with a newline before signing: {tag}"
+            )
 
     def signed_oid(self, tag: str, unsigned: str) -> str:
-        """Return the signed tag's object ID, verifying it was signed."""
+        """Return the new OID only for the exact original plus one armor block."""
         current = self.tag_oid(tag)
         if current is None or current == unsigned:
             raise ActionError(f"the tag was not signed: {tag}")
-        self.require_annotated(tag, current)
-        body = self._git(["cat-file", "tag", current]).stdout
-        if PGP_SIGNATURE_MARKER not in body:
-            raise ActionError(f"the signed tag carries no signature: {tag}")
+        problem = signature_error(self.tag_bytes(unsigned), self.tag_bytes(current))
+        if problem:
+            raise ActionError(f"{problem}: {tag}")
         return current
 
     def push_tag(self, server: str, url: str, tag: str, user: str, token: str) -> None:
-        """Force-push the signed tag, replacing the unsigned one."""
+        """Replace only the remote tag observed by a successful anonymous fetch."""
+        observed = self._observed_tags.get((url, tag))
+        if observed is None:
+            raise ActionError(
+                f"cannot push tag {tag} without a successful fetch from the same remote"
+            )
         credential = self.home / "git-credential"
         if "'" in str(credential):
             raise ActionError("the temporary directory path contains a quote")
@@ -384,7 +363,7 @@ class SigningRepository:
                     f"credential.{server}.helper={helper}",
                     "push",
                     "--no-verify",
-                    "--force",
+                    f"--force-with-lease=refs/tags/{tag}:{observed}",
                     url,
                     f"refs/tags/{tag}:refs/tags/{tag}",
                 ]

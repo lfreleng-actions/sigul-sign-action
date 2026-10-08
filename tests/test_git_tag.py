@@ -161,7 +161,6 @@ class RefFileTests(unittest.TestCase):
 
 
 class ConfigurationRegressionTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_extension_sections_use_git_case_and_last_value_precedence(self) -> None:
         base = scratch(self)
         repo = make_repository(base / "repo")
@@ -183,7 +182,6 @@ class ConfigurationRegressionTests(unittest.TestCase):
                 with self.assertRaises(ActionError):
                     _ = workspace_git_dir(repo)
 
-    @unittest.expectedFailure
     def test_extension_values_follow_git_quoting_comments_and_continuations(
         self,
     ) -> None:
@@ -204,7 +202,6 @@ class ConfigurationRegressionTests(unittest.TestCase):
                 self.assertEqual(expected, "reftable")
                 self.assertEqual(read_extension(repo / ".git", "refStorage"), expected)
 
-    @unittest.expectedFailure
     def test_git_invalid_config_is_refused_even_when_ini_accepts_it(self) -> None:
         base = scratch(self)
         repo = make_repository(base / "repo")
@@ -212,10 +209,45 @@ class ConfigurationRegressionTests(unittest.TestCase):
         _ = config.write_text('[extensions]\nrefStorage = "reftable\\q"\n')
         with self.assertRaises(subprocess.CalledProcessError):
             _ = git(base, "config", "--file", str(config), "--list")
-        with self.assertRaises(ActionError):
+        with self.assertRaises(ActionError) as caught:
             _ = workspace_git_dir(repo)
+        self.assertEqual(
+            str(caught.exception), "cannot parse the workspace's .git/config"
+        )
 
-    @unittest.expectedFailure
+    def test_unknown_storage_and_object_formats_are_refused(self) -> None:
+        repo = make_repository(scratch(self) / "repo")
+        config = repo / ".git" / "config"
+        for name in ("objectFormat", "refStorage"):
+            for value in ("future-format", "", '" files "', '"sha1 "', "FILES", "SHA1"):
+                with self.subTest(name=name, value=value):
+                    _ = config.write_text(f"[extensions]\n{name} = {value}\n")
+                    with self.assertRaises(ActionError):
+                        _ = workspace_git_dir(repo)
+            _ = config.write_text(f"[extensions]\n{name}\n")
+            with self.assertRaises(ActionError):
+                _ = workspace_git_dir(repo)
+
+    def test_parser_ignores_inherited_configuration_and_keeps_nul_records(self) -> None:
+        repo = make_repository(scratch(self) / "repo")
+        config = repo / ".git" / "config"
+        _ = config.write_text(
+            '[other]\nvalue = "first\\n[extensions]\\nrefStorage = reftable"\n'
+            + "[extensions]\nrefStorage = files\n"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "extensions.refstorage",
+                "GIT_CONFIG_VALUE_0": "reftable",
+                "GIT_DIR": str(repo / "absent"),
+                "GIT_CONFIG": str(repo / "absent"),
+            },
+        ):
+            self.assertEqual(read_extension(repo / ".git", "refStorage"), "files")
+            self.assertEqual(workspace_git_dir(repo), repo / ".git")
+
     def test_unconditional_and_conditional_includes_are_refused(self) -> None:
         repo = make_repository(scratch(self) / "repo")
         config = repo / ".git" / "config"
@@ -257,7 +289,6 @@ class SigningRepositoryTests(unittest.TestCase):
         repo.create()
         return repo
 
-    @unittest.expectedFailure
     def test_shared_object_store_disables_automatic_maintenance(self) -> None:
         base = scratch(self)
         workspace = make_repository(base / "workspace")
@@ -384,14 +415,19 @@ class AuthenticatedPushTests(unittest.TestCase):
         remote.parent.mkdir()
         _ = git(base, "init", "-q", "--bare", "--initial-branch=main", str(remote))
         workspace = make_repository(base / "workspace", tag="v1.0.0")
+        _ = git(workspace, "push", "-q", str(remote), "refs/tags/v1.0.0")
         repo = SigningRepository(
             base / "work" / "repo", base / "work" / "home", workspace / ".git"
         )
         repo.create()
-        oid = repo.adopt_workspace_tag("v1.0.0")
         server = GitServer(root, "octocat", "the-token")
         server.start()
         self.addCleanup(server.stop)
+        # Establish the lease anonymously on the very URL used for the push.
+        with mock.patch.object(server, "expected", ""), redirect_stderr(io.StringIO()):
+            self.assertEqual(repo.fetch_tag(f"{server.url}/org/repo.git", "v1.0.0"), "")
+        _ = git(workspace, "tag", "-f", "-a", "v1.0.0", "-m", "updated local tag")
+        oid = repo.adopt_workspace_tag("v1.0.0")
         return repo, server, oid
 
     def push(self, repo: SigningRepository, scope: str, url: str, token: str) -> None:

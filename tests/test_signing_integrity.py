@@ -94,11 +94,25 @@ class RepositoryFixture:
 class TagIntegrityTests(unittest.TestCase):
     def test_an_appended_signature_preserves_the_original_tag(self) -> None:
         fixture = RepositoryFixture(self)
-        signed = fixture.replace_tag(fixture.body + SIGNATURE)
-        self.assertEqual(fixture.repo.signed_oid(TAG, fixture.unsigned), signed)
-        self.assertEqual(fixture.read_tag(signed), fixture.body + SIGNATURE)
+        for original in (
+            fixture.body,
+            fixture.body + SIGNATURE,
+            fixture.body + b"non-UTF-8: \xff\r\n",
+        ):
+            for armor in (
+                SIGNATURE,
+                SIGNATURE.rstrip(b"\n"),
+                SIGNATURE.replace(b"\n\n", b"\nVersion: fixture\n\n", 1).replace(
+                    b"\n", b"\r\n"
+                ),
+            ):
+                with self.subTest(original=original, armor=armor):
+                    unsigned = fixture.replace_tag(original)
+                    fixture.repo.require_annotated(TAG, unsigned)
+                    signed = fixture.replace_tag(original + armor)
+                    self.assertEqual(fixture.repo.signed_oid(TAG, unsigned), signed)
+                    self.assertEqual(fixture.read_tag(signed), original + armor)
 
-    @unittest.expectedFailure
     def test_unterminated_tag_is_refused_before_signing(self) -> None:
         # A10: appending armor to an unterminated message hides its header
         # in the message's final line; Git then finds no signature.
@@ -107,7 +121,6 @@ class TagIntegrityTests(unittest.TestCase):
         with self.assertRaises(ActionError):
             fixture.repo.require_annotated(TAG, unsigned)
 
-    @unittest.expectedFailure
     def test_signed_tag_cannot_change_the_original_payload(self) -> None:
         fixture = RepositoryFixture(self)
         changed = fixture.body.replace(b"tag v1\n", b"tag substituted\n", 1)
@@ -115,7 +128,6 @@ class TagIntegrityTests(unittest.TestCase):
         with self.assertRaises(ActionError):
             _ = fixture.repo.signed_oid(TAG, fixture.unsigned)
 
-    @unittest.expectedFailure
     def test_signed_payload_is_compared_as_bytes_not_normalized_text(self) -> None:
         fixture = RepositoryFixture(self)
         headers, message = fixture.body.split(b"\n\n", 1)
@@ -125,22 +137,29 @@ class TagIntegrityTests(unittest.TestCase):
         with self.assertRaises(ActionError):
             _ = fixture.repo.signed_oid(TAG, unsigned)
 
-    @unittest.expectedFailure
     def test_inline_armor_marker_is_not_an_appended_signature(self) -> None:
         fixture = RepositoryFixture(self)
         _ = fixture.replace_tag(fixture.body + b"not an armor boundary: " + SIGNATURE)
         with self.assertRaises(ActionError):
             _ = fixture.repo.signed_oid(TAG, fixture.unsigned)
 
-    @unittest.expectedFailure
     def test_signature_requires_a_closing_armor_boundary(self) -> None:
         fixture = RepositoryFixture(self)
-        truncated = SIGNATURE.split(b"-----END PGP SIGNATURE-----", 1)[0]
-        _ = fixture.replace_tag(fixture.body + truncated)
-        with self.assertRaises(ActionError):
-            _ = fixture.repo.signed_oid(TAG, fixture.unsigned)
+        for malformed in (
+            SIGNATURE.split(b"-----END PGP SIGNATURE-----", 1)[0],
+            SIGNATURE.replace(b"fixture\n", b""),
+            SIGNATURE.replace(b"\n\nfixture", b"\nVersion: fixture\n\n"),
+            SIGNATURE.replace(b"\n\n", b"\n", 1),
+            SIGNATURE.replace(b"\n-----END", b"-----END"),
+            SIGNATURE + b"trailing garbage\n",
+            SIGNATURE + b"\n",
+            SIGNATURE + SIGNATURE,
+        ):
+            with self.subTest(armor=malformed):
+                _ = fixture.replace_tag(fixture.body + malformed)
+                with self.assertRaises(ActionError):
+                    _ = fixture.repo.signed_oid(TAG, fixture.unsigned)
 
-    @unittest.expectedFailure
     def test_container_refuses_unterminated_tag_without_calling_sigul(self) -> None:
         fixture = RepositoryFixture(self)
         original = fixture.body.rstrip(b"\n")
@@ -163,7 +182,6 @@ class TagIntegrityTests(unittest.TestCase):
             client.assert_not_called()
         self.assertEqual(fixture.repo.tag_oid(TAG), unsigned)
 
-    @unittest.expectedFailure
     def test_container_rejects_a_ref_update_that_changes_the_payload(self) -> None:
         fixture = RepositoryFixture(self)
         changed = fixture.body.replace(b"tag v1\n", b"tag substituted\n", 1)
@@ -184,6 +202,28 @@ class TagIntegrityTests(unittest.TestCase):
                 _ = container_main()
             self.assertEqual(client.call_count, 1)
         self.assertEqual(read_ref(fixture.workspace / ".git", REF), fixture.unsigned)
+
+    def test_valid_ref_update_is_accepted_even_when_sigul_reports_failure(self) -> None:
+        fixture = RepositoryFixture(self)
+        original = fixture.body + b"non-UTF-8: \xff\r\n" + SIGNATURE
+        unsigned = fixture.replace_tag(original)
+
+        def sign(_argv: list[str], _password: str, _timeout: int) -> int:
+            _ = fixture.replace_tag(original + SIGNATURE)
+            return 1
+
+        with (
+            mock.patch.dict(os.environ, fixture.container_environment(), clear=True),
+            mock.patch.object(
+                container_tag, "call_with_password", side_effect=sign
+            ) as client,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(container_main(), 0)
+            self.assertEqual(client.call_count, 1)
+        signed = fixture.repo.signed_oid(TAG, unsigned)
+        self.assertEqual(fixture.read_tag(signed), original + SIGNATURE)
 
 
 class PushFixture(RepositoryFixture):
@@ -218,18 +258,19 @@ class PushLeaseTests(unittest.TestCase):
         self.assertEqual(read_ref(fixture.remote, REF), signed)
         self.assertFalse((fixture.repo.home / "git-credential").exists())
 
-    @unittest.expectedFailure
     def test_push_requires_a_successful_remote_observation(self) -> None:
         # A11: adopting a local tag does not establish a remote lease.
         fixture = PushFixture(self)
         _ = fixture.replace_tag(fixture.body + SIGNATURE)
-        with self.assertRaises(ActionError):
-            fixture.push()
+        with mock.patch("git_tag.os.open", wraps=os.open) as opened:
+            with self.assertRaises(ActionError):
+                fixture.push()
+            opened.assert_not_called()
         self.assertEqual(read_ref(fixture.remote, REF), fixture.unsigned)
 
-    @unittest.expectedFailure
     def test_failed_fetch_does_not_authorize_a_push(self) -> None:
         fixture = PushFixture(self)
+        self.assertEqual(fixture.observe_remote(), "")
         _ = git(fixture.remote, "update-ref", "-d", REF)
         self.assertNotEqual(fixture.observe_remote(), "")
         _ = git(fixture.remote, "update-ref", REF, fixture.unsigned)
@@ -238,7 +279,6 @@ class PushLeaseTests(unittest.TestCase):
             fixture.push()
         self.assertEqual(read_ref(fixture.remote, REF), fixture.unsigned)
 
-    @unittest.expectedFailure
     def test_push_preserves_a_concurrent_remote_tag_replacement(self) -> None:
         fixture = PushFixture(self)
         self.assertEqual(fixture.observe_remote(), "")
@@ -250,7 +290,6 @@ class PushLeaseTests(unittest.TestCase):
             fixture.push()
         self.assertEqual(read_ref(fixture.remote, REF), replacement)
 
-    @unittest.expectedFailure
     def test_push_does_not_recreate_a_concurrently_deleted_tag(self) -> None:
         fixture = PushFixture(self)
         self.assertEqual(fixture.observe_remote(), "")
@@ -260,7 +299,6 @@ class PushLeaseTests(unittest.TestCase):
             fixture.push()
         self.assertIsNone(read_ref(fixture.remote, REF))
 
-    @unittest.expectedFailure
     def test_observation_is_bound_to_the_remote_url(self) -> None:
         fixture = PushFixture(self)
         self.assertEqual(fixture.observe_remote(), "")
