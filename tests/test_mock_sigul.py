@@ -82,35 +82,27 @@ class MockPassphraseTests(unittest.TestCase):
     def test_empty_input_is_rejected(self) -> None:
         self.assert_bad_framing(b"")
 
-    @unittest.expectedFailure
     def test_missing_terminator_is_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE)
 
-    @unittest.expectedFailure
     def test_nul_without_final_newline_is_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\0")
 
-    @unittest.expectedFailure
     def test_newline_without_nul_is_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\n")
 
-    @unittest.expectedFailure
     def test_multiple_nul_terminators_are_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\0\0\n")
 
-    @unittest.expectedFailure
     def test_bytes_between_nul_and_newline_are_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\0trailing\n")
 
-    @unittest.expectedFailure
     def test_bytes_after_complete_frame_are_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\0\ntrailing")
 
-    @unittest.expectedFailure
     def test_additional_line_before_nul_is_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\nsecond line\0\n")
 
-    @unittest.expectedFailure
     def test_additional_newline_after_complete_frame_is_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\0\n\n")
 

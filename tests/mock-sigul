@@ -14,9 +14,9 @@
 #       in the current repository, appends a signature block to the
 #       tag object and moves the ref, as sigul does.
 #
-# It reads the passphrase from stdin up to the NUL and, when
-# MOCK_PASSPHRASE is set, fails unless it matches exactly -- proving the
-# caller sends the first line of sigul-pass and nothing else.
+# When MOCK_PASSPHRASE is set, the complete stdin stream must match it
+# followed by exactly one NUL and one newline, as prepare() writes it.
+# Additional secret lines or trailing bytes must not be normalized away.
 #
 # Induced failures, for the retry paths: a file to sign containing
 # MOCK-FAIL-ALWAYS always fails; one containing MOCK-FAIL-ONCE fails
@@ -57,9 +57,12 @@ done
 key="$1"
 object="$2"
 
-passphrase="$(tr '\000' '\n' | head -n 1)"
-if [ -n "${MOCK_PASSPHRASE:-}" ] && [ "${passphrase}" != "${MOCK_PASSPHRASE}" ]; then
-    die "wrong passphrase on stdin"
+# Shell variables lose NULs and command substitution strips newlines;
+# a lossless byte encoding preserves both for the complete comparison.
+received="$(od -An -v -tx1)"
+if [ -n "${MOCK_PASSPHRASE:-}" ]; then
+    expected="$(printf '%s\000\n' "${MOCK_PASSPHRASE}" | od -An -v -tx1)"
+    [ "${received}" = "${expected}" ] || die "wrong passphrase or framing on stdin"
 fi
 
 state="/tmp/mock-sigul-state"
