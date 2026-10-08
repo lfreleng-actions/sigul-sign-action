@@ -182,6 +182,52 @@ class LiveVerificationTests(WorkflowShellTests):
                 self.assertNotIn("Signature verified", done.stdout)
 
 
+class ExpectedBridgeContractTests(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_expected_bridge_is_optional_and_defaults_to_empty(self) -> None:
+        source = (REPOSITORY / "action.yaml").read_text()
+        field = re.search(r"(?m)^  expected-bridge:\n(?:    .*\n|\n)+", source)
+        self.assertIsNotNone(field, "The optional expected-bridge input is missing")
+        if field is not None:
+            self.assertRegex(field[0], r"(?m)^    required: false$")
+            self.assertRegex(field[0], r"(?m)^    default: (\"\"|'')$")
+
+    @unittest.expectedFailure
+    def test_both_action_steps_receive_the_expected_bridge_input(self) -> None:
+        source = (REPOSITORY / "action.yaml").read_text()
+        steps = re.split(r"(?m)^    - ", source)[1:]
+        for name in ("Validate inputs", "Sign with Sigul"):
+            with self.subTest(step=name):
+                step = named_step(steps, name)
+                self.assertIn("EXPECTED_BRIDGE: ${{ inputs.expected-bridge }}", step)
+
+    @unittest.expectedFailure
+    def test_live_signing_passes_the_approved_host_and_port_as_an_expectation(
+        self,
+    ) -> None:
+        step = named_step(LIVE_STEPS, "Sign with Sigul")
+        self.assertIn(
+            "expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}", step
+        )
+
+
+class LiveBridgeSelectionTests(WorkflowShellTests):
+    def test_existing_allowlist_accepts_only_the_selected_infrastructure(self) -> None:
+        script = shell_body(named_step(LIVE_STEPS, "Check the selected bridge"))
+        for container, host, status in (
+            ("legacy", "sigul-bridge-yul.linuxfoundation.org", 0),
+            ("legacy", "sigul-bridge-us-west-2.linuxfoundation.org", 0),
+            ("modern", "sigul-bridge.opensearch.org", 0),
+            ("modern", "sigul-bridge-yul.linuxfoundation.org", 1),
+            ("legacy", "sigul-bridge.opensearch.org", 1),
+            ("modern", "unapproved-bridge.invalid", 1),
+            ("modern", "", 1),
+        ):
+            with self.subTest(container=container, host=host):
+                done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
+                self.assertEqual(done.returncode, status, done.stdout + done.stderr)
+
+
 class ValidationAssertionTests(WorkflowShellTests):
     def assertion(
         self, outcome: str = "failure", status: str = "rejected"
