@@ -147,6 +147,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # Every case gives credentials that cannot work, so a case that
+      # slipped through validation would still fail, later, at gpg. The
+      # difference is visible: the signing step pulls the client image
+      # before it touches a credential, and validation pulls nothing.
+      - name: "Record the images present"
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image ls -q --no-trunc | sort > "${RUNNER_TEMP}/images-before"
+
       - name: "${{ matrix.case }} (should fail)"
         id: invalid
         continue-on-error: true
@@ -167,7 +177,7 @@ jobs:
           sigul-pass: "not-a-real-passphrase"
           sigul-pki: "not-real-pki-material"
 
-      - name: "Assert it failed"
+      - name: "Assert it failed during validation"
         shell: bash
         env:
           CASE: "${{ matrix.case }}"
@@ -178,7 +188,12 @@ jobs:
             printf 'ERROR: accepted invalid input: %s ❌\n' "${CASE}"
             exit 1
           fi
-          printf 'Rejected: %s ✅\n' "${CASE}"
+          if ! docker image ls -q --no-trunc | sort |
+              cmp -s - "${RUNNER_TEMP}/images-before"; then
+            printf 'ERROR: the signing step ran for: %s ❌\n' "${CASE}"
+            exit 1
+          fi
+          printf 'Rejected during validation: %s ✅\n' "${CASE}"
 
   e2e:
     name: "End to end: ${{ matrix.container }} (${{ matrix.platform }})"
