@@ -113,9 +113,14 @@ class WorkflowShellTests(unittest.TestCase):
 
 
 class LiveVerificationTests(WorkflowShellTests):
-    def verify(self, operation: str, **env: str) -> subprocess.CompletedProcess[str]:
+    def verify(
+        self,
+        operation: str,
+        signature: str = "not a PGP signature\n",
+        **env: str,
+    ) -> subprocess.CompletedProcess[str]:
         _ = (self.root / "payload.txt").write_text("synthetic payload\n")
-        _ = (self.root / "payload.txt.asc").write_text("not a PGP signature\n")
+        _ = (self.root / "payload.txt.asc").write_text(signature)
         return self.shell(
             VERIFY_SCRIPT,
             OPERATION=operation,
@@ -180,6 +185,36 @@ class LiveVerificationTests(WorkflowShellTests):
                 done = self.verify(operation, IMPORT_STATUS="8")
                 self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
                 self.assertNotIn("Signature verified", done.stdout)
+
+    @unittest.expectedFailure
+    def test_unverified_signature_never_reaches_the_summary(self) -> None:
+        done = self.verify("sign-data", VERIFY_STATUS="7")
+        self.assertEqual(done.returncode, 7, done.stdout + done.stderr)
+        summary = self.root / "summary"
+        text = summary.read_text() if summary.exists() else ""
+        self.assertNotIn("not a PGP signature", text)
+
+    @unittest.expectedFailure
+    def test_signature_cannot_escape_its_summary_block(self) -> None:
+        # Armour headers are not covered by the signature, so even a
+        # verified file can carry text that closes a fixed fence.
+        hostile = (
+            "-----BEGIN PGP SIGNATURE-----\n"
+            "Comment: ```\n"
+            "Comment: x\r# Injected after a bare carriage return\n"
+            "```\n"
+            "# Injected heading\n"
+            '<img src="https://example.invalid/x">\n'
+            "-----END PGP SIGNATURE-----\n"
+        )
+        done = self.verify("sign-data", signature=hostile)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        summary = (self.root / "summary").read_text()
+        self.assertIn("# Injected heading", summary)
+        for line in summary.splitlines():
+            if any(mark in line for mark in ("Injected", "<img", "```", "PGP")):
+                with self.subTest(line=line):
+                    self.assertTrue(line.startswith("    "), line)
 
 
 class ExpectedBridgeContractTests(unittest.TestCase):
