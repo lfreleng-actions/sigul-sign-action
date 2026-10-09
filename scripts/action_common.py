@@ -28,9 +28,9 @@ from pathlib import Path
 # distribution's own, as there. Its directories are usually root's
 # alone, but not always: GitHub-hosted Ubuntu runners make
 # /usr/local/bin world-writable, so an earlier step can plant a tool
-# there with no privilege at all. check_runtime() therefore refuses a
-# tool found in a directory the runner's user, or anyone, can write
-# to, and action.yaml makes the same check before starting Python.
+# there with no privilege at all. check_runtime() therefore checks the
+# file, every traversed directory and symlink, and the resolved target.
+# The shell applies the same policy before starting Python.
 #
 # None of this is a boundary between steps. Every step of a job runs
 # as one user, on GitHub-hosted runners one with passwordless sudo, so
@@ -160,34 +160,100 @@ def shred_file(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def is_untrusted_directory(directory: str) -> bool:
-    """Return True when an earlier step of the job could write here.
+def _is_untrusted_node(path: str, status: os.stat_result) -> bool:
+    """Apply the ownership policy without treating symlink mode 0777 as writable.
 
-    World-writable is untrusted outright. Short of that, 'writable'
-    means by the user this process runs as, because every other step
-    of the job runs as that same user. Root can write anywhere, so for
-    root only the mode bits say anything.
+    Every node must be root-owned: any other owner, not only the job's
+    user, can restore write bits on read-only files and directories.
+    Root cannot use W_OK meaningfully; non-root additionally checks it
+    for ACL-granted access. Symlinks require root ownership too, but
+    replacement of the link is governed by its containing directory.
+    """
+    if status.st_uid != 0:
+        return True
+    is_link = stat.S_ISLNK(status.st_mode)
+    if not is_link and status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return True
+    return (
+        os.geteuid() != 0
+        and not is_link
+        and os.access(path, os.W_OK, effective_ids=True)
+    )
+
+
+def is_untrusted_directory(directory: str) -> bool:
+    """Return True for a non-directory or unsafe ownership/write permissions.
+
+    This predicate checks one directory, following a link if supplied.
+    check_trusted_location checks the complete traversal, including links.
     """
     status = os.stat(directory)
-    if status.st_mode & stat.S_IWOTH:
-        return True
-    if os.geteuid() == 0:
-        return False
-    return os.access(directory, os.W_OK)
+    return not stat.S_ISDIR(status.st_mode) or _is_untrusted_node(directory, status)
 
 
 def check_trusted_location(path: str) -> None:
-    """Fail unless path, and whatever it resolves to, lie in directories
-    an earlier step of the job could not have written to."""
-    for directory in sorted(
-        {os.path.dirname(path), os.path.dirname(os.path.realpath(path))}
-    ):
-        if is_untrusted_directory(directory):
-            raise ActionError(
-                f"refusing {path}: {directory} is writable by the user running "
-                + "this job, so an earlier step could have planted it; install "
-                + "the tool in a directory only root can write to"
-            )
+    """Require a protected regular executable and a protected path to it.
+
+    Resolve components in filesystem order: normalising '..' or asking
+    realpath for only the final target would hide traversed locations.
+    Match the shell gate's bounds of 40 symlinks and 256 components.
+    These are metadata checks, not an atomic check-and-exec or a boundary
+    against other steps running with this user's privileges (or sudo).
+    """
+    if not os.path.isabs(path):
+        raise ActionError(f"refusing {path}: an absolute executable path is required")
+    pending = list(reversed(path.split("/")))
+    resolved: list[str] = []
+    links = 0
+    try:
+        if is_untrusted_directory("/"):
+            raise ActionError(f"refusing {path}: the root directory is not protected")
+        for _ in range(256):
+            if not pending:
+                break
+            component = pending.pop()
+            if component in ("", "."):
+                continue
+            if component == "..":
+                if resolved:
+                    _ = resolved.pop()
+                continue
+            node = "/" + "/".join([*resolved, component])
+            status = os.lstat(node)
+            if _is_untrusted_node(node, status):
+                raise ActionError(
+                    f"refusing {path}: {node} has unsafe ownership or write "
+                    + "permissions, so an earlier step could have planted it; "
+                    + "install the tool in a protected root-owned location"
+                )
+            if stat.S_ISLNK(status.st_mode):
+                links += 1
+                if links > 40:
+                    raise ActionError(f"refusing {path}: more than 40 symlink hops")
+                target = os.readlink(node)
+                if os.path.isabs(target):
+                    resolved.clear()
+                pending.extend(reversed(target.split("/")))
+                continue
+            if pending:
+                if not stat.S_ISDIR(status.st_mode):
+                    raise ActionError(f"refusing {path}: {node} is not a directory")
+                resolved.append(component)
+                continue
+            if not stat.S_ISREG(status.st_mode) or not os.access(
+                node, os.X_OK, effective_ids=True
+            ):
+                raise ActionError(
+                    f"refusing {path}: {node} is not a regular executable"
+                )
+            return
+        else:
+            raise ActionError(f"refusing {path}: more than 256 path components")
+    except OSError as exc:
+        raise ActionError(
+            f"refusing {path}: cannot inspect the executable path"
+        ) from exc
+    raise ActionError(f"refusing {path}: not a regular executable")
 
 
 def system_tool(name: str) -> str | None:

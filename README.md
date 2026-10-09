@@ -414,10 +414,10 @@ built from one would send signing nowhere.
   step's secrets. What the action does guard against is an earlier step
   redirecting it by accident, which `setup-*` actions and tool shims do: it
   ignores the job's `PATH`, `BASH_ENV`, `ENV` and the dynamic loader's
-  variables, runs `/bin/bash -p` by absolute path, finds its tools in the
-  system's directories alone, and refuses one in a directory the job's user
-  can write to (see Requirements). Put nothing you distrust in a job that
-  signs.
+  variables, runs `/bin/bash -p` by absolute path, and finds tools in fixed
+  system directories. It checks executable files, parents and intermediate
+  symlinks for root ownership and protected permissions before use (see
+  Requirements). Put nothing you distrust in a job that signs.
 - Credentials use mode-0700 directories and mode-0600 files. The action
   prefers a writable tmpfs mount at `/dev/shm`. Otherwise its work
   directory uses `RUNNER_TEMP`, or the system temporary directory if unset;
@@ -476,19 +476,27 @@ built from one would send signing nowhere.
   vendor-supported runtime and keep its standard library and native
   dependencies patched. The version floor is not a security baseline, and
   extraction no longer depends on historical `tarfile` filter backports.
-- **`python3`, `docker`, `git` and `gpg` in the system's own directories**,
-  and nowhere the job's user can write: Debian's and Ubuntu's default `PATH`
-  of `/usr/local/bin`, `/usr/bin`, `/bin`, their `sbin` siblings and
-  `/snap/bin`. The action never runs a tool from the job's `PATH`, to which
-  an earlier step could add one, and refuses a tool whose directory the
-  runner's user, or anyone, can write to. GitHub-hosted Ubuntu runners leave
-  `/usr/local/bin` world-writable, so the action refuses a tool planted there
-  with no privilege at all, rather than run it; install tools in a directory
-  that root alone can write to. These four tools, and the Docker daemon, are
-  what the action trusts on the runner: the legacy action ran its own logic
-  inside the client container and trusted the daemon alone, so moving the
-  orchestration to the runner, which every other property here depends on,
-  adds the runner's Python, gpg, git and docker CLI to what must be sound.
+- **Root-owned `python3`, `docker`, `git` and `gpg` in fixed system
+  directories**: `/usr/local/bin`, `/usr/bin`, `/bin`, their `sbin` siblings
+  and `/snap/bin`. The action ignores the job's `PATH`. Executables must be
+  regular executable files; their full paths, including intermediate symlinks
+  and parents, must be root-owned. The action rejects group/world-writable
+  files and directories, and ACL-granted write access by a non-root runner.
+  It checks symlink ownership, parents and targets, not Linux symlink
+  permission bits. Traversal stops after 40 links or 256 components.
+  User-owned files and directories fail even without write bits: their
+  owners can restore those permissions. Root-owned `0755` tools remain valid
+  when the runner itself is root; root's ability to write is not a useful
+  permission test.
+- **Bash and GNU coreutils bootstrap**: `/bin/bash`, `/usr/bin/stat` and
+  `/usr/bin/readlink` form the bootstrap trust base, together with the action
+  script and their loader/libraries. The two coreutils paths and their
+  parents must not be symlinks. Shell built-ins check those paths before the
+  helpers run; metadata checks cannot establish the integrity of `stat`
+  itself. Helpers run with empty environments, and the shell resolves and
+  checks Python before executing that exact path. These checks are not
+  atomic check-and-exec and do not isolate steps from a hostile job or sudo.
+  Trust in the runner, its toolchain and the Docker daemon remains essential.
 - **Network access to the bridge**, on port 44334:
 
 <!-- markdownlint-disable MD013 -->

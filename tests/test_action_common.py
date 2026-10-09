@@ -120,6 +120,7 @@ class TrustedLocationTests(unittest.TestCase):
         directory.mkdir()
         tool = directory / "gpg"
         _ = tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
         directory.chmod(mode)
         self.addCleanup(directory.chmod, 0o755)
         return tool
@@ -133,10 +134,9 @@ class TrustedLocationTests(unittest.TestCase):
             check_trusted_location(str(tool))
         self.assertIn("an earlier step could have planted it", str(caught.exception))
 
-    def test_directory_this_user_cannot_write_is_trusted(self) -> None:
-        # Owned by this user but without its write bit, as /usr/bin is
-        # root's without anyone else's.
-        tool = self.make_tool(scratch(self) / "bin", 0o555)
+    def test_root_owned_system_tool_is_trusted(self) -> None:
+        tool = Path("/usr/bin/true")
+        self.assertEqual(tool.stat().st_uid, 0)
         self.assertFalse(is_untrusted_directory(str(tool.parent)))
         check_trusted_location(str(tool))
 
@@ -176,10 +176,11 @@ class TrustedInterpreterShellTests(unittest.TestCase):
             'trusted_python3 && printf "%s" "$TRUSTED_PYTHON3"'
         )
         return subprocess.run(
-            ["bash", "-c", script],
+            ["/bin/bash", "--noprofile", "--norc", "-p", "-c", script],
             env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
             capture_output=True,
             text=True,
+            timeout=10,
             check=False,
         )
 
@@ -201,17 +202,20 @@ class TrustedInterpreterShellTests(unittest.TestCase):
         self.assertIn("::error::refusing", done.stdout)
         self.assertIn("planted it", done.stdout)
 
-    def test_a_directory_nobody_else_can_write_is_accepted(self) -> None:
-        bin_dir = self.planted(0o555)
-        done = self.run_check(bin_dir)
-        self.assertEqual(done.returncode, 0, done.stdout)
-        self.assertEqual(done.stdout, str(bin_dir / "python3"))
+    def test_root_owned_system_interpreter_is_accepted(self) -> None:
+        tool = Path("/usr/bin/python3")
+        if not tool.is_file():
+            self.skipTest("needs the distribution's /usr/bin/python3")
+        self.assertEqual(tool.stat().st_uid, 0)
+        done = self.run_check(tool.parent)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout, str(tool.resolve(strict=True)))
 
     @unittest.skipIf(os.geteuid() == 0, "root is judged by mode bits alone")
     def test_a_directory_this_user_can_write_is_refused(self) -> None:
         done = self.run_check(self.planted(0o755))
         self.assertEqual(done.returncode, 1, done.stdout)
-        self.assertIn("writable by this user", done.stdout)
+        self.assertIn("unsafe ownership or write permissions", done.stdout)
 
 
 if __name__ == "__main__":

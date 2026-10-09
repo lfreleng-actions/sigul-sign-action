@@ -12,6 +12,7 @@ checks are defence in depth within a trusted job, not step isolation.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -78,6 +79,7 @@ class TrustFixture:
         *,
         uid: int | None = None,
         search_path: str = "/usr/bin:/bin",
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         selected_uid = self.job_uid if uid is None else uid
         return subprocess.run(
@@ -87,6 +89,7 @@ class TrustFixture:
                 "LANG": "C",
                 "LC_ALL": "C",
                 "TRUST_TEST_MARKER": str(self.marker),
+                **(extra_env or {}),
             },
             user=selected_uid if os.geteuid() == 0 else None,
             group=selected_uid if os.geteuid() == 0 else None,
@@ -98,7 +101,7 @@ class TrustFixture:
         )
 
     def python_check(
-        self, tool: Path, *, uid: int | None = None
+        self, tool: Path | str, *, uid: int | None = None
     ) -> subprocess.CompletedProcess[str]:
         # This is the test runner's interpreter, never the candidate.
         code = (
@@ -126,10 +129,16 @@ class TrustFixture:
         )
 
     def shell_check(
-        self, tool: Path, *, uid: int | None = None, search_path: str | None = None
+        self,
+        tool: Path,
+        *,
+        uid: int | None = None,
+        search_path: str | None = None,
+        gate: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         script = (
-            'source "$1"; '
+            'set -euo pipefail; source "$1"; '
             "trusted_python3 || exit 1; "
             'printf "selected=%s\\n" "$TRUSTED_PYTHON3"; '
             '"$TRUSTED_PYTHON3" -E -s -c "pass"'
@@ -142,10 +151,15 @@ class TrustFixture:
                 "-c",
                 script,
                 "trust-test",
-                str(REPOSITORY / "scripts/trusted_interpreter.sh"),
+                str(
+                    gate
+                    if gate is not None
+                    else REPOSITORY / "scripts/trusted_interpreter.sh"
+                ),
             ],
             uid=uid,
             search_path=str(tool.parent) if search_path is None else search_path,
+            extra_env=extra_env,
         )
 
     def assert_python_refused(self, done: subprocess.CompletedProcess[str]) -> None:
@@ -172,6 +186,29 @@ class TrustFixture:
             self.case.assertFalse(status.st_mode & 0o022, str(path))
         return tool
 
+    def instrumented_gate(self) -> Path:
+        """Redirect only literal helper paths in a disposable copy of the gate."""
+        script = (REPOSITORY / "scripts/trusted_interpreter.sh").read_text()
+        helpers = self.base / "coreutils"
+        helpers.mkdir()
+        for name in ("stat", "readlink"):
+            wrapper = helpers / name
+            called = shlex.quote(str(self.marker.parent / f"{name}-called"))
+            leaked = shlex.quote(str(self.marker.parent / "leaked"))
+            _ = wrapper.write_text(
+                "#!/bin/bash\n"
+                + f"printf called >> {called}\n"
+                + "if [[ -v SIGUL_PASS || -v TRUST_TEST_SECRET || -v TRUST_TEST_MARKER ]]; then\n"
+                + f"    printf leaked > {leaked}\n"
+                + "fi\n"
+                + f'exec -c /usr/bin/{name} "$@"\n'
+            )
+            wrapper.chmod(0o755)
+            script = script.replace(f"/usr/bin/{name}", str(wrapper))
+        copied = self.base / "trusted_interpreter.sh"
+        _ = copied.write_text(script)
+        return copied
+
     def replaceable_ancestor(self) -> Path:
         tool = self.tool("replaceable/bin/python3", owner=0)
         tool.parent.parent.chmod(0o777)
@@ -189,7 +226,6 @@ class TrustFixture:
 
 
 class PythonTrustedToolTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_nonroot_writable_file_in_readonly_parent_is_refused(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool()
@@ -198,19 +234,16 @@ class PythonTrustedToolTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(tool.parent.stat().st_mode), 0o555)
         fixture.assert_python_refused(fixture.python_check(tool))
 
-    @unittest.expectedFailure
     def test_nonroot_self_owned_readonly_file_is_refused(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_python_refused(fixture.python_check(fixture.tool(mode=0o555)))
 
-    @unittest.expectedFailure
     def test_nonroot_writable_resolved_file_is_refused(self) -> None:
         fixture = TrustFixture(self)
         target = fixture.tool("target/python3")
         fixture.assert_python_refused(fixture.python_check(fixture.link(target)))
 
     @unittest.skipIf(os.geteuid() == 0, "requires a non-root owner")
-    @unittest.expectedFailure
     def test_self_owned_readonly_directory_is_untrusted(self) -> None:
         fixture = TrustFixture(self)
         directory = fixture.tool().parent
@@ -218,13 +251,11 @@ class PythonTrustedToolTests(unittest.TestCase):
         self.assertEqual(directory.stat().st_uid, os.geteuid())
         self.assertTrue(is_untrusted_directory(str(directory)))
 
-    @unittest.expectedFailure
     def test_nonexecutable_regular_file_is_refused(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(mode=0o644, owner=0)
         fixture.assert_python_refused(fixture.python_check(tool))
 
-    @unittest.expectedFailure
     def test_directory_is_not_an_executable_file(self) -> None:
         fixture = TrustFixture(self)
         directory = fixture.tool(owner=0).with_name("directory")
@@ -233,7 +264,6 @@ class PythonTrustedToolTests(unittest.TestCase):
         directory.parent.chmod(0o555)
         fixture.assert_python_refused(fixture.python_check(directory))
 
-    @unittest.expectedFailure
     def test_missing_file_is_refused(self) -> None:
         fixture = TrustFixture(self)
         missing = fixture.tool(owner=0).with_name("missing")
@@ -251,29 +281,24 @@ class PythonTrustedToolTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "needs Linux and GNU coreutils")
 class ShellTrustedToolTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_nonroot_writable_file_is_refused_before_execution(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_shell_refused(fixture.shell_check(fixture.tool()))
 
-    @unittest.expectedFailure
     def test_nonroot_self_owned_readonly_file_is_refused_before_execution(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_shell_refused(fixture.shell_check(fixture.tool(mode=0o555)))
 
-    @unittest.expectedFailure
     def test_nonroot_writable_resolved_file_is_refused_before_execution(self) -> None:
         fixture = TrustFixture(self)
         target = fixture.tool("target/python3")
         fixture.assert_shell_refused(fixture.shell_check(fixture.link(target)))
 
-    @unittest.expectedFailure
     def test_writable_resolved_parent_is_refused_before_execution(self) -> None:
         fixture = TrustFixture(self)
         target = fixture.tool("target/python3", owner=0, directory_mode=0o777)
         fixture.assert_shell_refused(fixture.shell_check(fixture.link(target)))
 
-    @unittest.expectedFailure
     def test_nonexecutable_file_is_refused_without_running_it(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_shell_refused(fixture.shell_check(fixture.tool(mode=0o644)))
@@ -294,8 +319,29 @@ class ShellTrustedToolTests(unittest.TestCase):
             with self.subTest(uid=uid):
                 done = fixture.shell_check(tool, uid=uid)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-                self.assertEqual(done.stdout, f"selected={tool}\n")
+                self.assertEqual(done.stdout, f"selected={tool.resolve(strict=True)}\n")
                 self.assertFalse(fixture.marker.exists())
+
+    def test_refusal_clears_a_previously_selected_interpreter(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.tool()
+        script = (
+            'set -euo pipefail; source "$1"; TRUSTED_PYTHON3=stale; '
+            'if trusted_python3; then exit 7; fi; [[ -z "$TRUSTED_PYTHON3" ]]'
+        )
+        done = fixture.run_as(
+            [
+                "/bin/bash",
+                "-c",
+                script,
+                "trust-test",
+                str(REPOSITORY / "scripts/trusted_interpreter.sh"),
+            ],
+            search_path=str(tool.parent),
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("::error::refusing", done.stdout)
+        self.assertFalse(fixture.marker.exists())
 
     def test_path_helpers_are_not_used_to_validate_a_safe_interpreter(self) -> None:
         fixture = TrustFixture(self)
@@ -309,7 +355,7 @@ class ShellTrustedToolTests(unittest.TestCase):
                 done = fixture.shell_check(tool, uid=uid, search_path=search_path)
                 self.assertFalse(fixture.marker.exists(), "a PATH helper ran")
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-                self.assertEqual(done.stdout, f"selected={tool}\n")
+                self.assertEqual(done.stdout, f"selected={tool.resolve(strict=True)}\n")
 
 
 @unittest.skipUnless(
@@ -317,93 +363,112 @@ class ShellTrustedToolTests(unittest.TestCase):
     "needs root on Linux to create isolated ownership fixtures and drop to UID 501",
 )
 class RootTrustPolicyTests(unittest.TestCase):
-    @unittest.expectedFailure
+    def test_python_nonroot_refuses_other_user_readonly_file(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.tool(owner=502, mode=0o555)
+        fixture.assert_python_refused(fixture.python_check(tool))
+
+    def test_shell_nonroot_refuses_other_user_readonly_file(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.tool(owner=502, mode=0o555)
+        fixture.assert_shell_refused(fixture.shell_check(tool))
+
+    def test_python_nonroot_refuses_other_user_readonly_directory(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.tool(owner=0, mode=0o555)
+        os.chown(tool.parent, 502, -1)
+        fixture.assert_python_refused(fixture.python_check(tool))
+
+    def test_shell_nonroot_refuses_other_user_readonly_directory(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.tool(owner=0, mode=0o555)
+        os.chown(tool.parent, 502, -1)
+        fixture.assert_shell_refused(fixture.shell_check(tool))
+
+    def test_python_nonroot_refuses_other_user_symlink(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.link(fixture.system_python())
+        os.chown(tool, 502, -1, follow_symlinks=False)
+        fixture.assert_python_refused(fixture.python_check(tool))
+
+    def test_shell_nonroot_refuses_other_user_symlink(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.link(fixture.system_python())
+        os.chown(tool, 502, -1, follow_symlinks=False)
+        fixture.assert_shell_refused(fixture.shell_check(tool))
+
     def test_python_root_refuses_nonroot_owned_readonly_file(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_python_refused(
             fixture.python_check(fixture.tool(mode=0o555), uid=0)
         )
 
-    @unittest.expectedFailure
     def test_shell_root_refuses_nonroot_owned_readonly_file(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_shell_refused(
             fixture.shell_check(fixture.tool(mode=0o555), uid=0)
         )
 
-    @unittest.expectedFailure
     def test_python_root_refuses_group_writable_file(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, mode=0o775)
         fixture.assert_python_refused(fixture.python_check(tool, uid=0))
 
-    @unittest.expectedFailure
     def test_shell_root_refuses_group_writable_file(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, mode=0o775)
         fixture.assert_shell_refused(fixture.shell_check(tool, uid=0))
 
-    @unittest.expectedFailure
     def test_python_nonroot_refuses_file_writable_by_another_group(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, mode=0o775)
         fixture.assert_python_refused(fixture.python_check(tool))
 
-    @unittest.expectedFailure
     def test_shell_nonroot_refuses_file_writable_by_another_group(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, mode=0o775)
         fixture.assert_shell_refused(fixture.shell_check(tool))
 
-    @unittest.expectedFailure
     def test_python_root_refuses_world_writable_file(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, mode=0o757)
         fixture.assert_python_refused(fixture.python_check(tool, uid=0))
 
-    @unittest.expectedFailure
     def test_shell_root_refuses_world_writable_file(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, mode=0o757)
         fixture.assert_shell_refused(fixture.shell_check(tool, uid=0))
 
-    @unittest.expectedFailure
     def test_root_considers_nonroot_owned_readonly_directory_untrusted(self) -> None:
         fixture = TrustFixture(self)
         directory = fixture.owner_changeable_directory().parent
         self.assertTrue(is_untrusted_directory(str(directory)))
 
-    @unittest.expectedFailure
     def test_shell_root_refuses_nonroot_owned_readonly_directory(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.owner_changeable_directory()
         fixture.assert_shell_refused(fixture.shell_check(tool, uid=0))
 
-    @unittest.expectedFailure
     def test_root_considers_group_writable_directory_untrusted(self) -> None:
         fixture = TrustFixture(self)
         directory = fixture.tool(owner=0, directory_mode=0o775).parent
         self.assertTrue(is_untrusted_directory(str(directory)))
 
-    @unittest.expectedFailure
     def test_shell_root_refuses_group_writable_directory(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, directory_mode=0o775)
         fixture.assert_shell_refused(fixture.shell_check(tool, uid=0))
 
-    @unittest.expectedFailure
     def test_python_nonroot_refuses_directory_writable_by_another_group(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, directory_mode=0o775)
         fixture.assert_python_refused(fixture.python_check(tool))
 
-    @unittest.expectedFailure
     def test_shell_nonroot_refuses_directory_writable_by_another_group(self) -> None:
         fixture = TrustFixture(self)
         tool = fixture.tool(owner=0, directory_mode=0o775)
         fixture.assert_shell_refused(fixture.shell_check(tool))
 
-    @unittest.expectedFailure
     def test_python_nonroot_refuses_self_owned_readonly_parent_of_safe_tool(
         self,
     ) -> None:
@@ -412,7 +477,6 @@ class RootTrustPolicyTests(unittest.TestCase):
             fixture.python_check(fixture.owner_changeable_directory())
         )
 
-    @unittest.expectedFailure
     def test_shell_nonroot_refuses_self_owned_readonly_parent_of_safe_tool(
         self,
     ) -> None:
@@ -421,33 +485,154 @@ class RootTrustPolicyTests(unittest.TestCase):
             fixture.shell_check(fixture.owner_changeable_directory())
         )
 
-    @unittest.expectedFailure
     def test_python_refuses_replaceable_ancestor_above_readonly_parent(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_python_refused(
             fixture.python_check(fixture.replaceable_ancestor())
         )
 
-    @unittest.expectedFailure
     def test_shell_refuses_replaceable_ancestor_above_readonly_parent(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_shell_refused(
             fixture.shell_check(fixture.replaceable_ancestor())
         )
 
-    @unittest.expectedFailure
     def test_python_refuses_replaceable_intermediate_symlink_location(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_python_refused(
             fixture.python_check(fixture.replaceable_symlink_chain())
         )
 
-    @unittest.expectedFailure
     def test_shell_refuses_replaceable_intermediate_symlink_location(self) -> None:
         fixture = TrustFixture(self)
         fixture.assert_shell_refused(
             fixture.shell_check(fixture.replaceable_symlink_chain())
         )
+
+    def test_protected_relative_symlink_chain_is_accepted(self) -> None:
+        fixture = TrustFixture(self)
+        target = fixture.system_python()
+        _ = fixture.link(target, "target/python3")
+        candidate = fixture.link(Path("../target/python3"))
+        for uid in (0, fixture.job_uid):
+            with self.subTest(uid=uid):
+                python = fixture.python_check(candidate, uid=uid)
+                self.assertEqual(python.returncode, 0, python.stdout + python.stderr)
+                shell = fixture.shell_check(candidate, uid=uid)
+                self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
+                self.assertEqual(
+                    shell.stdout, f"selected={target.resolve(strict=True)}\n"
+                )
+
+    def test_parent_component_is_resolved_after_the_symlink(self) -> None:
+        fixture = TrustFixture(self)
+        target = fixture.system_python()
+        leaf = fixture.base / "real/leaf"
+        leaf.mkdir(parents=True)
+        (leaf.parent / "python3").symlink_to(target)
+        (fixture.base / "alias").symlink_to(leaf)
+        candidate = fixture.base / "alias/../python3"
+        python = fixture.python_check(candidate)
+        self.assertEqual(python.returncode, 0, python.stdout + python.stderr)
+        shell = fixture.shell_check(candidate)
+        self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
+        self.assertEqual(shell.stdout, f"selected={target.resolve(strict=True)}\n")
+        # '..' must not erase the requirement to trust the directory visited.
+        leaf.chmod(0o777)
+        fixture.assert_python_refused(fixture.python_check(candidate))
+        fixture.assert_shell_refused(fixture.shell_check(candidate))
+
+    def test_link_target_with_trailing_newline_is_not_truncated(self) -> None:
+        fixture = TrustFixture(self)
+        target = fixture.system_python()
+        directory = fixture.base / "target\n"
+        directory.mkdir()
+        (directory / "python3").symlink_to(target)
+        (fixture.base / "bin").symlink_to(directory)
+        candidate = fixture.base / "bin/python3"
+        python = fixture.python_check(candidate)
+        self.assertEqual(python.returncode, 0, python.stdout + python.stderr)
+        shell = fixture.shell_check(candidate)
+        self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
+        self.assertEqual(shell.stdout, f"selected={target.resolve(strict=True)}\n")
+
+    def test_symlink_hop_bound_accepts_40_and_refuses_41(self) -> None:
+        for count in (40, 41):
+            with self.subTest(hops=count):
+                fixture = TrustFixture(self)
+                target = fixture.system_python().resolve(strict=True)
+                directory = fixture.base / "bin"
+                directory.mkdir()
+                for index in range(count):
+                    name = "python3" if index == 0 else f"link-{index}"
+                    destination = (
+                        target if index == count - 1 else Path(f"link-{index + 1}")
+                    )
+                    (directory / name).symlink_to(destination)
+                candidate = directory / "python3"
+                python = fixture.python_check(candidate)
+                shell = fixture.shell_check(candidate)
+                if count == 40:
+                    self.assertEqual(
+                        python.returncode, 0, python.stdout + python.stderr
+                    )
+                    self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
+                    self.assertEqual(shell.stdout, f"selected={target}\n")
+                else:
+                    fixture.assert_python_refused(python)
+                    fixture.assert_shell_refused(shell)
+
+    def test_component_walk_is_bounded(self) -> None:
+        fixture = TrustFixture(self)
+        tool = fixture.system_python()
+        directory = f"{tool.parent}/" + "./" * 256
+        fixture.assert_python_refused(fixture.python_check(directory + tool.name))
+        fixture.assert_shell_refused(fixture.shell_check(tool, search_path=directory))
+
+    def test_coreutils_never_receive_the_signing_environment(self) -> None:
+        fixture = TrustFixture(self)
+        gate = fixture.instrumented_gate()
+        tool = fixture.system_python()
+        # Start as the witness directory's owner so root can append later.
+        for uid in (fixture.job_uid, 0):
+            with self.subTest(uid=uid):
+                done = fixture.shell_check(
+                    tool,
+                    uid=uid,
+                    gate=gate,
+                    extra_env={
+                        "SIGUL_PASS": "synthetic-pass",
+                        "TRUST_TEST_SECRET": "synthetic-input",
+                    },
+                )
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(done.stdout, f"selected={tool.resolve(strict=True)}\n")
+                self.assertTrue((fixture.marker.parent / "stat-called").exists())
+                self.assertTrue((fixture.marker.parent / "readlink-called").exists())
+                self.assertFalse((fixture.marker.parent / "leaked").exists())
+
+    def test_nonroot_bootstraps_helpers_before_executing_them(self) -> None:
+        for unsafe in ("owner", "writable", "symlink", "parent"):
+            with self.subTest(unsafe=unsafe):
+                fixture = TrustFixture(self)
+                gate = fixture.instrumented_gate()
+                helper = fixture.base / "coreutils/stat"
+                if unsafe == "owner":
+                    helper.chmod(0o555)
+                    os.chown(helper, fixture.job_uid, -1)
+                elif unsafe == "writable":
+                    helper.chmod(0o777)
+                elif unsafe == "symlink":
+                    helper.unlink()
+                    helper.symlink_to("/usr/bin/stat")
+                else:
+                    helper.parent.chmod(0o555)
+                    os.chown(helper.parent, fixture.job_uid, -1)
+                fixture.assert_shell_refused(
+                    fixture.shell_check(fixture.system_python(), gate=gate)
+                )
+                self.assertFalse((fixture.marker.parent / "stat-called").exists())
+                self.assertFalse((fixture.marker.parent / "readlink-called").exists())
 
 
 if __name__ == "__main__":
