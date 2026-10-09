@@ -570,7 +570,8 @@ layers:
 - **Unit and regression tests** cover input rules, authenticated GPG bundles,
   bounded extraction, configuration parsing, cancellation and cleanup, and
   tag payloads and publication leases in throwaway repositories, under
-  Python 3.10 and 3.12.
+  Python 3.10 and 3.12. A dedicated root invocation exercises protected
+  filesystem fixtures and runs trust checks under unprivileged UIDs too.
 - **Validation** runs the action against inputs it must refuse. Assertions
   require both a failed step and `validation_status: rejected`; a later
   image-pull or credential failure is not a validation rejection.

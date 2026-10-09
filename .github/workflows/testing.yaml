@@ -85,6 +85,15 @@ jobs:
           python3 --version
           python3 -m unittest discover -s tests -t . -v
 
+      - name: "Test protected tool paths across ownership boundaries"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Synthetic fixtures need root ownership and checks under other UIDs.
+          # No signing credentials or production services exist in this job.
+          /usr/bin/sudo -n -- /usr/bin/python3 -B -m unittest \
+            tests.test_trusted_tools -v
+
   # Every call fails during validation, before any credential is
   # written; scripts/action_inputs.py's unit tests check each message.
   validation:
