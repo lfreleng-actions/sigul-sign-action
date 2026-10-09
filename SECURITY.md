@@ -20,6 +20,13 @@ the latest tagged release for security patches.
 | Latest tagged release | :white_check_mark: |
 | Older releases/tags   | :x:                |
 
+Action support does not extend upstream support to the optional legacy
+client: its CentOS 7 and Python 2 dependencies no longer receive upstream
+security updates. Every built-in legacy run requires `allow-legacy: "true"`,
+including dry runs. Running it requires an approved, time-bounded risk
+exception with a named owner, a retirement or migration date, and an isolated
+signing runner. Opting in does not make that image supported or secure.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in this project, please report it
@@ -74,4 +81,14 @@ published advisory unless they request to remain anonymous.
 This policy covers the source code, configuration, and documentation
 in this repository. Please report vulnerabilities in upstream
 dependencies to their respective maintainers; this project will update
-affected dependencies once fixes become available.
+affected dependencies as fixes become available. Client-image pins require
+upstream publication of a fixed image; source fixes or draft releases alone
+do not update a pinned image. The unsupported legacy client's end-of-life
+dependencies are an exception to that update commitment.
+
+As of 9 October 2026, the modern pin is `v2.6.2`, which carries the OpenSSL
+fix and no longer ships pip or its vendored urllib3. Tracking the latest
+action release still does not establish dependency remediation on its own:
+each pin update needs a digest review and rescan. See the [client-image status
+in the README](README.md#choosing-the-sigul-client) for the current pin and
+the production prerequisites.

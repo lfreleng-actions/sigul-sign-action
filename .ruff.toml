@@ -40,3 +40,25 @@ ignore = [
 # `@patch` decorators: unittest.mock injects its mocks positionally, so a
 # keyword-only signature is impossible, not merely inconvenient.
 "tests/**/*.py" = ["S101", "ARG", "PLR0913", "PLR0917", "PLR2004"]
+
+# Container-side scripts, valid under BOTH Python 2.7 and 3.x.
+#
+# The legacy client image is CentOS 7 and ships Python 2.7 only; the
+# modern one is Fedora-based and ships Python 3 only. One source serves
+# both, so there is no second implementation to keep in step. These
+# rules cannot be satisfied without breaking that:
+#
+#   UP032  f-strings do not exist before Python 3.6
+#   UP010  the __future__ import is what makes print() a function
+#          under 2.7, so it is load-bearing rather than vestigial
+#   UP024  IOError is distinct from OSError under 2.7
+#   UP031  %-formatting appears where Python 2's own idiom is clearest
+#
+# Everything else in the UP category still applies, and UP030 is
+# satisfied: Python 2.7 supports implicit format field numbering.
+#
+# Remove this entry, the __future__ imports and the .format() calls
+# together once the legacy Sigul infrastructure retires. Nothing else
+# in the repository is constrained this way: the rest of scripts/ runs
+# on the runner and is modern Python 3.
+"scripts/container/*.py" = ["UP032", "UP010", "UP024", "UP031"]

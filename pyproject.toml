@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Tool configuration only: this repository is not a Python package,
+# and the tests use the standard library's unittest, so there are no
+# dependencies to install or lock.
+#
+# basedpyright checks this repository in its default strict mode,
+# which is right for everything under scripts/ that runs on the
+# runner: modern Python 3, fully annotated.
+#
+# scripts/container/ cannot meet it. Those scripts run inside the
+# Sigul client image and are valid under BOTH Python 2.7 and 3.x by
+# design -- the legacy image is CentOS 7 with Python 2.7 and no
+# python3, while the modern one ships python3 and no bare python -- so
+# one source serves both. Annotation syntax does not exist in 2.7 and
+# typing is not in its standard library, and the dry-run probe imports
+# sigul's own modules, which only exist inside the image. 'ignore'
+# rather than 'exclude' because the pre-commit hook passes filenames
+# explicitly, and 'exclude' only applies to files basedpyright
+# discovers for itself. ruff still checks them; .ruff.toml records the
+# rules exempted there for the same reason.
+#
+# Remove the ignore, the __future__ imports and the .ruff.toml
+# per-file-ignores together once the legacy Sigul infrastructure
+# retires and those scripts can become Python 3 only.
+#
+# The runner-side modules import one another from scripts/, as Python
+# does when sigul_action.py runs; extraPaths and mypy_path tell the
+# type checkers, and the tests, to look there too, and in
+# scripts/container for the one test module that imports the
+# container-side helpers directly. Both check for Linux, the only
+# platform the action runs on, whatever the developer's own machine is.
+[tool.basedpyright]
+pythonVersion = "3.10"
+pythonPlatform = "Linux"
+ignore = ["scripts/container"]
+extraPaths = ["scripts", "scripts/container"]
+
+[tool.mypy]
+python_version = "3.10"
+platform = "linux"
+mypy_path = "scripts:scripts/container"
+exclude = ["^scripts/container/"]

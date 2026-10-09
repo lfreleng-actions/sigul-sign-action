@@ -34,9 +34,6 @@ paths:
 
   .github/workflows/testing.yaml:
     ignore:
-      # Ignore deliberate test failure
-      - 'input "invalid_input" is not defined in action .+'
-      - 'missing input "input" which is required by action .+'
       # GitHub introduced the self-repository 'uses: $/...' syntax in
       # July 2026, and zizmor's self-repository audit (v1.30.0+) reports
       # the older workspace-relative './' form as a finding. This fork of
@@ -52,4 +49,10 @@ paths:
       # missing': this fork reports the bare case differently. The
       # closing quote sits immediately after '$/', so malformed
       # extra-slash forms such as '$//' are still reported.
+      - 'specifying action "\$/" in invalid format because path is missing'
+
+  # The live-signing workflow calls this action the same way; see the
+  # testing.yaml entry above for why a bare '$/' is correct.
+  .github/workflows/live-signing.yaml:
+    ignore:
       - 'specifying action "\$/" in invalid format because path is missing'
