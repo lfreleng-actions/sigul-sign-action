@@ -186,7 +186,6 @@ class LiveVerificationTests(WorkflowShellTests):
                 self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
                 self.assertNotIn("Signature verified", done.stdout)
 
-    @unittest.expectedFailure
     def test_unverified_signature_never_reaches_the_summary(self) -> None:
         done = self.verify("sign-data", VERIFY_STATUS="7")
         self.assertEqual(done.returncode, 7, done.stdout + done.stderr)
@@ -194,7 +193,6 @@ class LiveVerificationTests(WorkflowShellTests):
         text = summary.read_text() if summary.exists() else ""
         self.assertNotIn("not a PGP signature", text)
 
-    @unittest.expectedFailure
     def test_signature_cannot_escape_its_summary_block(self) -> None:
         # Armour headers are not covered by the signature, so even a
         # verified file can carry text that closes a fixed fence.

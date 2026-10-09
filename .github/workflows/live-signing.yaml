@@ -198,14 +198,7 @@ jobs:
             echo "::error::SIGUL_PUBLIC_KEY is required to verify the signature"
             exit 1
           fi
-          if [ "${OPERATION}" = "sign-data" ]; then
-            {
-              echo "### Signature"
-              echo '```text'
-              cat "${OBJECT}.asc"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
+          if [ "${OPERATION}" = "sign-git-tag" ]; then
             git cat-file tag "refs/tags/${OBJECT}" |
               grep -q "BEGIN PGP SIGNATURE" ||
               { echo "::error::the tag carries no signature"; exit 1; }
@@ -216,6 +209,15 @@ jobs:
           printf '%s\n' "${PUBLIC_KEY}" | gpg --batch --quiet --import
           if [ "${OPERATION}" = "sign-data" ]; then
             gpg --batch --verify "${OBJECT}.asc" "${OBJECT}"
+            # Only after verification, and indented rather than fenced:
+            # armour headers sit outside the signed data, so a fence could
+            # still be closed from inside a verified file. Markdown also
+            # ends a line at a bare CR, so split those before indenting.
+            {
+              printf '### Signature\n\n'
+              tr '\r' '\n' < "${OBJECT}.asc" | sed 's/^/    /'
+              printf '\n'
+            } >> "$GITHUB_STEP_SUMMARY"
           else
             git verify-tag "${OBJECT}"
           fi
