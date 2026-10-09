@@ -85,19 +85,18 @@ builds them. Dependabot proposes release updates after a seven-day cooldown;
 the test workflow exercises the proposed images, not real-server signing.
 Neither pinning nor a passing smoke test certifies their dependencies.
 
-As of **8 October 2026**, the modern pin remains `v2.6.1`, with digest
-`sha256:07e89d1322cf8e2ac4e33103d964982a96d1e0c7fe8ba55cd1e988e7a51ba502`.
-`v2.6.2` remains a draft release; upstream has not published a newer fixed
-modern image.
-Known dependency work remains: `openssl-libs` 3.5.8 needs 3.5.9, and pip's
-vendored `urllib3` 2.7 needs 2.8. Updating a separate `urllib3` installation
-does not update pip's bundled copy. **Dependency remediation is incomplete.**
+As of **9 October 2026**, the modern pin is `v2.6.2`, with digest
+`sha256:f6ff1c879f9c2fd9f9f6ff3ffc41bdbb6a9a682ffb65033bb22b5fc816fab2dd`.
+That release ships `openssl-libs` 3.5.9 and Python 3.14.8, and removes pip,
+whose vendored `urllib3` no pip release had fixed. Its build provenance
+verifies against that index digest, which fixes both the `linux/amd64` and
+`linux/arm64` images, and Grype and Trivy rescans of each reported no finding.
+A clean scan proves nothing beyond the day it ran, so every later digest update
+needs the same review and rescan.
 
-An external image rebuild and publication, followed by a reviewed digest
-update and rescan of the supported architectures, remain production
-prerequisites for the modern client. A bespoke image needs its own dependency
-and protocol review. The legacy image remains an unsupported exception with
-an owner and retirement plan, not a security-maintained fallback.
+A bespoke image needs its own dependency and protocol review. The legacy image
+remains an unsupported exception with an owner and retirement plan, not a
+security-maintained fallback.
 
 ## Usage
 
@@ -542,9 +541,9 @@ bundled override and before a connection attempt.
 
 ### Production prerequisites
 
-- Resolve the [client-image dependency work](#choosing-the-sigul-client): a
-  fixed modern image must be rebuilt and published upstream, then its digest
-  reviewed, updated and rescanned here. Legacy use instead requires the
+- Use a reviewed [client image](#choosing-the-sigul-client). The modern
+  `v2.6.2` digest has passed review and rescan; repeat both for every later
+  digest update and for any bespoke image. Legacy use instead requires the
   documented unsupported-client exception, owner, retirement date and
   isolated runner; that exception does not resolve dependency findings.
 - Create and protect the signing environment before adding credentials.
