@@ -45,6 +45,18 @@ class TrustFixture:
         if os.geteuid() == 0:
             os.chown(witness, self.job_uid, -1)
         self.marker: Path = witness / "executed"
+        # Root runs drop checks to job_uid, which cannot traverse a private
+        # checkout: a GitHub runner's home is mode 0750. Run the real gate
+        # code from a readable copy inside the fixture instead.
+        code = self.base / "code"
+        code.mkdir()
+        code.chmod(0o755)
+        for name in ("action_common.py", "trusted_interpreter.sh"):
+            copied = code / name
+            _ = shutil.copyfile(REPOSITORY / "scripts" / name, copied)
+            copied.chmod(0o644)
+        self.scripts: Path = code
+        self.gate: Path = code / "trusted_interpreter.sh"
 
     def tool(
         self,
@@ -122,7 +134,7 @@ class TrustFixture:
                 "-s",
                 "-c",
                 code,
-                str(REPOSITORY / "scripts"),
+                str(self.scripts),
                 str(tool),
             ],
             uid=uid,
@@ -151,11 +163,7 @@ class TrustFixture:
                 "-c",
                 script,
                 "trust-test",
-                str(
-                    gate
-                    if gate is not None
-                    else REPOSITORY / "scripts/trusted_interpreter.sh"
-                ),
+                str(gate if gate is not None else self.gate),
             ],
             uid=uid,
             search_path=str(tool.parent) if search_path is None else search_path,
@@ -335,7 +343,7 @@ class ShellTrustedToolTests(unittest.TestCase):
                 "-c",
                 script,
                 "trust-test",
-                str(REPOSITORY / "scripts/trusted_interpreter.sh"),
+                str(fixture.gate),
             ],
             search_path=str(tool.parent),
         )
