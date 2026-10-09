@@ -13,7 +13,6 @@ from tests.helpers import git, make_repository, scratch
 
 
 class FixtureGitIsolationTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_inherited_git_variables_cannot_redirect_fixtures(self) -> None:
         # git exports GIT_DIR and GIT_INDEX_FILE to hooks, so a suite run
         # from inside one inherits them pointing at the caller's repository.

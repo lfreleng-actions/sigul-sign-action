@@ -40,8 +40,16 @@ def scratch(case: unittest.TestCase) -> Path:
 
 
 def git(cwd: Path, *args: str, env: dict[str, str] | None = None) -> str:
-    """Run git in a fixture repository and return its stripped output."""
-    full = dict(os.environ, **GIT_FIXTURE_ENV, **(env or {}))
+    """Run git in a fixture repository and return its stripped output.
+
+    Inherited GIT_* variables are dropped first: git exports GIT_DIR and
+    GIT_INDEX_FILE to hooks, and either would aim a fixture at the
+    caller's repository.
+    """
+    inherited = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    full = {**inherited, **GIT_FIXTURE_ENV, **(env or {})}
     done = subprocess.run(
         ["git", *args], cwd=cwd, env=full, capture_output=True, text=True, check=True
     )
