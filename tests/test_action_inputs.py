@@ -38,6 +38,22 @@ class ScalarTests(unittest.TestCase):
         with self.assertRaises(InputError):
             _ = parse_int("max-retries", "0", 1)
 
+    @unittest.expectedFailure
+    def test_non_ascii_digits_are_input_errors(self) -> None:
+        # str.isdigit() accepts these, but int() rejects them with ValueError.
+        for raw in ("\u00b2", "1\u00b2", "\u0663", "\uff15"):
+            with self.subTest(raw=raw), self.assertRaises(InputError):
+                _ = parse_int("retry-delay", raw, 0)
+
+    @unittest.expectedFailure
+    def test_integer_inputs_are_bounded(self) -> None:
+        self.assertEqual(parse_int("attempt-timeout", "86400", 0), 86400)
+        self.assertEqual(parse_int("retry-delay", "000015", 0), 15)
+        # 5000 digits exceeds int()'s conversion limit and raises ValueError.
+        for raw in ("86401", "9" * 5000):
+            with self.subTest(digits=len(raw)), self.assertRaises(InputError):
+                _ = parse_int("attempt-timeout", raw, 0)
+
 
 class ImageTests(unittest.TestCase):
     def test_split_reference(self) -> None:
@@ -399,6 +415,18 @@ class BuildPlanTests(unittest.TestCase):
         for raw in ("-1", "soon", "1.5"):
             with self.subTest(raw=raw), self.assertRaises(InputError):
                 _ = build_plan(base_env(root, ATTEMPT_TIMEOUT=raw), PINS_DIR)
+
+    @unittest.expectedFailure
+    def test_unconvertible_integer_inputs_reject_the_plan(self) -> None:
+        root = scratch(self)
+        _ = (root / "a.txt").write_text("a")
+        for name in ("MAX_RETRIES", "RETRY_DELAY", "ATTEMPT_TIMEOUT"):
+            for raw in ("\u00b2", "9" * 5000):
+                with (
+                    self.subTest(name=name, digits=len(raw)),
+                    self.assertRaises(InputError),
+                ):
+                    _ = build_plan(base_env(root, **{name: raw}), PINS_DIR)
 
     def test_required_inputs(self) -> None:
         root = scratch(self)
