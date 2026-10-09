@@ -295,7 +295,10 @@ def container_argv(
         "PYTHONUNBUFFERED": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    for key, value in {**base, **environment}.items():
+    base.update(environment)
+    # Even an empty plan overrides image ENV; mode-specific values cannot weaken it.
+    base["EXPECTED_BRIDGE"] = run.plan.expected_bridge
+    for key, value in base.items():
         argv += ["--env", f"{key}={value}"]
     argv += [
         "--entrypoint",

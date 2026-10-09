@@ -30,8 +30,9 @@
 #   SIGUL_PKI    the encrypted PKI bundle
 #   SIGUL_IP     optional: with SIGUL_URI, a hosts entry for the bridge
 #   SIGUL_URI    required here for the egress policy; may be a variable
-#               instead of a secret. Must match bridge-hostname in
-#               SIGUL_CONF and one approved bridge below.
+#               instead of a secret. Must name one approved bridge below;
+#               expected-bridge checks the effective configuration after
+#               the bundle's user configuration overrides SIGUL_CONF.
 #
 # A non-dry run also requires SIGUL_PUBLIC_KEY as a variable: the trusted
 # signing key's armoured public half, against which signatures are verified.
@@ -182,6 +183,7 @@ jobs:
           sigul-pki: ${{ secrets.SIGUL_PKI }}
           sigul-ip: ${{ secrets.SIGUL_IP }}
           sigul-uri: ${{ env.BRIDGE_HOST }}
+          expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
 
       - name: "Verify the signature"
         if: ${{ !inputs.dry-run }}

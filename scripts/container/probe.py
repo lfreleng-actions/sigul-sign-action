@@ -11,7 +11,8 @@ hosts entries and environment a real run gets. It checks, in order:
   1. the sigul client runs;
   2. sigul's own configuration loader accepts the client configuration
      -- the caller's client.conf layered under the bundle's
-     .sigul/client.conf, as the legacy action layered them;
+     .sigul/client.conf, as the legacy action layered them -- and the
+     effective bridge matches EXPECTED_BRIDGE, when supplied;
   3. sigul's own NSS initialisation opens the database and accepts its
      password;
   4. the client certificate named in the configuration is present,
@@ -37,16 +38,20 @@ Environment (required unless noted):
   MANIFEST        NUL-separated source/output pairs (sign-data)
   GIT_TAG         tag to sign (sign-git-tag)
   SIGULPATH       where sigul's modules live (optional)
+  EXPECTED_BRIDGE normalized DNS_HOST:PORT guard (optional, empty disables)
 """
 
 from __future__ import print_function
 
-import getpass
 import os
 import socket
 import subprocess
-import sys
 
+from client_configuration import (
+    check_expected_bridge,
+    load_configuration,
+    load_sigul_modules,
+)
 from container_common import (
     fail,
     git_output,
@@ -56,20 +61,6 @@ from container_common import (
     set_default_user,
 )
 
-# sigul's own default for '-c', so the probe reads the same files.
-SIGUL_USER_CONFIG = "~/.sigul/client.conf"
-
-
-class PromptRefused(Exception):
-    """Raised in place of an interactive prompt."""
-
-
-def refuse_prompt(prompt=""):
-    """Stand in for getpass.getpass, which sigul calls when nss-password
-    is unset: a batch run has no terminal to answer it, and in a real
-    run it would consume the key passphrase from stdin instead."""
-    raise PromptRefused(prompt)
-
 
 def check_client_runs():
     """sigul --version exits zero."""
@@ -77,35 +68,8 @@ def check_client_runs():
         fail("the sigul client does not run in this image")
 
 
-def load_sigul_modules():
-    """Import sigul's client and utils modules."""
-    sigulpath = os.environ.get("SIGULPATH", "/usr/share/sigul")
-    sys.path.insert(0, sigulpath)
-    try:
-        import client
-        import utils
-    except ImportError as error:
-        fail(
-            "cannot load sigul's modules from {} ({}); set SIGULPATH if this "
-            "image installs them elsewhere".format(sigulpath, error)
-        )
-    return client, utils
-
-
-def load_configuration(client, utils):
-    """Load the configuration exactly as the sigul command would."""
-    getpass.getpass = refuse_prompt
-    config_error = getattr(utils, "ConfigurationError", Exception)
-    try:
-        config = client.ClientConfiguration(SIGUL_USER_CONFIG)
-    except PromptRefused:
-        fail(
-            "no nss-password is set, in sigul-conf or in the bundle's "
-            ".sigul/client.conf; sigul would prompt for it, which a batch "
-            "run cannot answer"
-        )
-    except config_error:
-        fail("sigul rejected the client configuration; check its sections and options")
+def report_configuration(config):
+    """Describe the loaded configuration only after the endpoint guard passes."""
     info(
         "configuration: bridge {}:{}, server {}, user {}, certificate '{}'".format(
             config.bridge_hostname,
@@ -116,7 +80,6 @@ def load_configuration(client, utils):
         )
     )
     info("NSS database: " + config.nss_dir)
-    return config
 
 
 def check_nss(utils, config):
@@ -210,6 +173,8 @@ def main():
     check_client_runs()
     client, utils = load_sigul_modules()
     config = load_configuration(client, utils)
+    check_expected_bridge(config, os.environ.get("EXPECTED_BRIDGE", ""))
+    report_configuration(config)
     check_nss(utils, config)
     check_bridge(config)
     if mode == "sign-data":

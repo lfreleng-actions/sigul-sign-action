@@ -26,6 +26,7 @@ Environment (required unless noted):
   ATTEMPT_TIMEOUT seconds an attempt may take, 0 for no limit
                   (optional, default 0)
   COUNT_FILE      where to record how many files were signed (optional)
+  EXPECTED_BRIDGE normalized DNS_HOST:PORT guard (optional, empty disables)
 """
 
 from __future__ import print_function
@@ -92,6 +93,11 @@ def main():
     password_file = require_env("SIGUL_PASSWORD")
     retry = retry_policy()
     count_file = os.environ.get("COUNT_FILE", "")
+    expected = os.environ.get("EXPECTED_BRIDGE", "")
+    if expected:
+        from client_configuration import enforce_expected_bridge
+
+        enforce_expected_bridge(expected)
 
     pairs = read_manifest(manifest)
     info("signing {} file(s)".format(len(pairs)))

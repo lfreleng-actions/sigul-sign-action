@@ -359,6 +359,7 @@ jobs:
         id: dry_data
         uses: $/
         with:
+          expected-bridge: "sigul-bridge.test:44334"
           allow-legacy: "true"
           container: ${{ matrix.container }}
           sign-object: "e2e/dist"
@@ -375,6 +376,7 @@ jobs:
         id: dry_tag
         uses: $/
         with:
+          expected-bridge: "sigul-bridge.test:44334"
           allow-legacy: "true"
           container: ${{ matrix.container }}
           sign-type: "sign-git-tag"
@@ -388,6 +390,44 @@ jobs:
           sigul-conf: ${{ steps.setup.outputs.conf }}
           sigul-pass: ${{ steps.setup.outputs.passphrase }}
           sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      # The same image and credentials just passed both probes. Only the
+      # expected port differs, so refusal must be after structural validation.
+      - name: "Refuse an unexpected bridge (should fail)"
+        id: unexpected_bridge
+        continue-on-error: true
+        uses: $/
+        with:
+          allow-legacy: "true"
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          expected-bridge: "sigul-bridge.test:44335"
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Assert the bridge mismatch was refused"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.unexpected_bridge.outcome }}
+          VALIDATION_STATUS: >-
+            ${{ steps.unexpected_bridge.outputs.validation_status }}
+          IMAGE: ${{ steps.unexpected_bridge.outputs.container_image }}
+          PIN: ${{ steps.setup.outputs.pin }}
+        run: |
+          set -euo pipefail
+          if [ "${OUTCOME}" != "failure" ] ||
+              [ "${VALIDATION_STATUS}" != "passed" ] ||
+              [ "${IMAGE}" != "${PIN}" ]; then
+            echo "ERROR: the pinned client did not refuse the bridge mismatch"
+            exit 1
+          fi
+          echo "Bridge mismatch refused after structural validation ✅"
 
       - name: "Assert the dry runs changed nothing"
         shell: bash
@@ -422,6 +462,7 @@ jobs:
         id: sign_data
         uses: $/
         with:
+          expected-bridge: "sigul-bridge.test:44334"
           allow-legacy: "true"
           container-image: ${{ steps.setup.outputs.mock_image }}
           container-tag: "mock"
@@ -447,6 +488,7 @@ jobs:
       - name: "Sign the tag with the mock client"
         uses: $/
         with:
+          expected-bridge: "sigul-bridge.test:44334"
           allow-legacy: "true"
           container-image: ${{ steps.setup.outputs.mock_image }}
           container-digest: ${{ steps.setup.outputs.mock_digest }}

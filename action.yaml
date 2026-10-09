@@ -121,6 +121,15 @@ inputs:
       'true' for any container; 'false' never.
     required: false
     default: "auto"
+  expected-bridge:
+    description: >
+      Optional expected effective bridge as DNS_HOST:PORT (port 1-65535).
+      Checked using Sigul's configuration loader, including the bundle's
+      override, before signing or dry-run NSS/DNS checks. Host names are
+      case-insensitive and may have one trailing dot. Empty disables the
+      guard; this does not change sigul-uri or hosts entries.
+    required: false
+    default: ""
   push-tag:
     description: >
       For 'sign-git-tag': push the signed tag back to the repository, as
@@ -192,9 +201,8 @@ runs:
     # Structural rejection happens before materialization; decryption
     # and credential-content checks belong to the signing step.
     #
-    # Nothing an earlier step changes through GITHUB_ENV or GITHUB_PATH
-    # redirects either step, where the signing step holds the secret
-    # inputs:
+    # Reduce accidental redirection through the job environment before
+    # the signing process receives its secret inputs:
     #   - /bin/bash by absolute path, so a 'bash' earlier on PATH is not
     #     the shell;
     #   - -p, so it ignores BASH_ENV, SHELLOPTS and exported functions,
@@ -203,13 +211,13 @@ runs:
     #     for the shell and anything it starts;
     #   - PATH reset to the system's directories before python3 is
     #     found, and sigul_action.py looks up docker, git and gpg there;
-    #   - a python3 found in a directory an earlier step could have
-    #     written to is refused before it runs: GitHub-hosted Ubuntu
-    #     runners leave /usr/local/bin world-writable, so an earlier
-    #     step could plant one there with no privilege. The shell does
-    #     this itself (scripts/trusted_interpreter.sh), for root by the
-    #     directory's mode bits, and sigul_action.py applies the same
-    #     rule to every tool it runs.
+    #   - trusted_interpreter.sh checks the executable, parents and
+    #     intermediate links for root ownership and protected permissions
+    #     before running the resolved interpreter. Fixed coreutils run
+    #     with empty environments, never candidate Python or PATH helpers;
+    #   - Python repeats the path checks for every primary runner tool.
+    #     The shell, action code and fixed coreutils remain the bootstrap
+    #     trust base; metadata checks cannot establish their integrity.
     #
     # This is defence in depth against an earlier step redirecting the
     # action by accident, not a boundary between steps: every step of a
@@ -229,6 +237,7 @@ runs:
         SIGN_OBJECT: ${{ inputs.sign-object }}
         SIGUL_IP: ${{ inputs.sigul-ip }}
         SIGUL_URI: ${{ inputs.sigul-uri }}
+        EXPECTED_BRIDGE: ${{ inputs.expected-bridge }}
         SIGUL_KEY_NAME: ${{ inputs.sigul-key-name }}
         GH_USER: ${{ inputs.gh-user }}
         CONTAINER: ${{ inputs.container }}
@@ -271,6 +280,7 @@ runs:
         SIGN_OBJECT: ${{ inputs.sign-object }}
         SIGUL_IP: ${{ inputs.sigul-ip }}
         SIGUL_URI: ${{ inputs.sigul-uri }}
+        EXPECTED_BRIDGE: ${{ inputs.expected-bridge }}
         SIGUL_KEY_NAME: ${{ inputs.sigul-key-name }}
         GH_USER: ${{ inputs.gh-user }}
         CONTAINER: ${{ inputs.container }}

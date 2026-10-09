@@ -24,7 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from action_common import ActionError, InputError, Messages
-from client_image import HostEntry, Image, resolve_hosts, resolve_image
+from client_image import (
+    HostEntry,
+    Image,
+    parse_expected_bridge,
+    resolve_hosts,
+    resolve_image,
+)
 from git_tag import check_tag_name, workspace_git_dir
 from sign_targets import SignTarget, plan_sign_data
 
@@ -50,6 +56,7 @@ class Plan:
     gh_user: str
     workspace: Path
     messages: Messages
+    expected_bridge: str = ""
 
 
 def parse_bool(name: str, raw: str) -> bool:
@@ -110,6 +117,7 @@ def build_plan(
     max_retries = parse_int("max-retries", env.get("MAX_RETRIES", "5"), 1)
     retry_delay = parse_int("retry-delay", env.get("RETRY_DELAY", "15"), 0)
     attempt_timeout = parse_int("attempt-timeout", env.get("ATTEMPT_TIMEOUT", "600"), 0)
+    expected_bridge = parse_expected_bridge(env.get("EXPECTED_BRIDGE", ""))
 
     image = resolve_image(
         env.get("CONTAINER", ""),
@@ -175,4 +183,5 @@ def build_plan(
         gh_user=gh_user or "x-access-token",
         workspace=workspace,
         messages=messages,
+        expected_bridge=expected_bridge,
     )

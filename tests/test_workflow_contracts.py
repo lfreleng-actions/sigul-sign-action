@@ -183,7 +183,6 @@ class LiveVerificationTests(WorkflowShellTests):
 
 
 class ExpectedBridgeContractTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_expected_bridge_is_optional_and_defaults_to_empty(self) -> None:
         source = (REPOSITORY / "action.yaml").read_text()
         field = re.search(r"(?m)^  expected-bridge:\n(?:    .*\n|\n)+", source)
@@ -192,7 +191,6 @@ class ExpectedBridgeContractTests(unittest.TestCase):
             self.assertRegex(field[0], r"(?m)^    required: false$")
             self.assertRegex(field[0], r"(?m)^    default: (\"\"|'')$")
 
-    @unittest.expectedFailure
     def test_both_action_steps_receive_the_expected_bridge_input(self) -> None:
         source = (REPOSITORY / "action.yaml").read_text()
         steps = re.split(r"(?m)^    - ", source)[1:]
@@ -201,7 +199,6 @@ class ExpectedBridgeContractTests(unittest.TestCase):
                 step = named_step(steps, name)
                 self.assertIn("EXPECTED_BRIDGE: ${{ inputs.expected-bridge }}", step)
 
-    @unittest.expectedFailure
     def test_live_signing_passes_the_approved_host_and_port_as_an_expectation(
         self,
     ) -> None:

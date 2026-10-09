@@ -67,6 +67,7 @@ SIGNING_ENVIRONMENT = (
     "SIGN_OBJECT",
     "SIGUL_IP",
     "SIGUL_URI",
+    "EXPECTED_BRIDGE",
     "SIGUL_KEY_NAME",
     "GH_USER",
     "CONTAINER",
@@ -114,10 +115,9 @@ def check_runtime() -> None:
     Every tool is looked up in SYSTEM_PATH and refused where an earlier
     step of the job could have planted it (see action_common.SYSTEM_PATH),
     gpgconf included, because the cleanup that runs it must never fail
-    part-way. The interpreter running this code was judged by the
-    shell before it started (scripts/trusted_interpreter.sh); the check
-    is repeated here for the directory its symlink resolves to, which
-    the shell did not look at.
+    part-way. The shell checked the interpreter file and its complete
+    path before executing it (scripts/trusted_interpreter.sh). Repeat
+    that policy here and apply it to the other primary runner tools.
     """
     runner_os = os.environ.get("RUNNER_OS", "Linux")
     if runner_os != "Linux":

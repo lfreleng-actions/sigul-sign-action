@@ -213,11 +213,12 @@ A dry run:
 2. checks data-output directory permissions on the host and pulls the image;
 3. decrypts and validates the credential archive, and resolves an annotated
    tag in a private repository when signing a tag;
-4. has the Sigul client's own code load the configuration, open the NSS
-   database with its password, and find the client certificate and its key,
-   checking the certificate's validity dates;
-5. resolves the bridge's hostname, honouring any hosts entry;
-6. checks file readability and output-directory presence inside the client,
+4. loads the configuration through Sigul's own code and checks the effective
+   endpoint against `expected-bridge` when supplied;
+5. opens the NSS database with its password, finds the client certificate
+   and key, and checks the certificate's validity dates;
+6. resolves the bridge's hostname, honouring any hosts entry;
+7. checks file readability and output-directory presence inside the client,
    or that the tag resolves there.
 
 A data dry run uses a `readonly` workspace bind mount. The probe opens source
@@ -256,6 +257,7 @@ valid returned signature.
 | `container-tag`     |                     | Tag for `container-image`                                                                                    |
 | `container-digest`  |                     | Digest for `container-image`, as `sha256:<64 hex digits>`                                                    |
 | `sigul-hosts-entry` | `auto`              | `auto` adds the hosts entry for `legacy`; `true` for any container; `false` never                            |
+| `expected-bridge`   | empty               | Require the effective Sigul bridge to match `DNS_HOST:PORT` before connection; empty disables the check      |
 | `push-tag`          | `true`              | Push a signed tag back to the repository                                                                     |
 | `dry-run`           | `false`             | Check local prerequisites without signing or contacting the bridge                                           |
 | `exclude-globs`     | `global-jjb`'s list | File name patterns skipped inside a directory                                                                |
@@ -403,6 +405,27 @@ The `SIGUL_BRIDGE_IP` values some projects keep in their Jenkins
 configuration now name addresses the bridges no longer use, and a hosts entry
 built from one would send signing nowhere.
 
+### Expected bridge endpoint
+
+Set `expected-bridge`, for example
+`sigul-bridge.opensearch.org:44334`, to require a specific endpoint.
+The host validates the DNS hostname and port range 1–65535, normalizing
+hostname case, one trailing dot and the decimal port. This input does not
+change the configuration, DNS, or `sigul-uri` hosts-entry behavior.
+
+After decryption, the client image's own `ClientConfiguration` loader combines
+`sigul-conf` with the bundle's `.sigul/client.conf`. Both signing modes check
+that effective hostname and port before invoking Sigul. Dry runs check it
+before reporting configuration values, opening NSS or resolving the bridge.
+A mismatch fails without printing the unexpected configuration values.
+
+Empty or omitted expectations add no configuration preflight to real signing,
+preserving bespoke clients without importable Sigul modules. Opting into this
+check requires those modules. The live workflow supplies the approved
+`SIGUL_URI` and port 44334 as its expectation; the firewall remains a separate
+protection. This is a pre-connection check after credentials exist, not
+validation of encrypted configuration before materialization.
+
 ### Handling
 
 - The validation step receives credential-presence flags, not the secret
@@ -512,9 +535,10 @@ built from one would send signing nowhere.
 Restrict signing-job egress to the selected bridge, required image registries
 and GitHub checkout endpoints. The live workflow uses an inline block policy
 for one approved bridge and the selected registry, not the organisation's
-broader allow-list. Its required `SIGUL_URI` must match the effective client
-configuration, including any bundled override, and one bridge above for the
-selected infrastructure.
+broader allow-list. Its required `SIGUL_URI` must name a bridge above for the
+selected infrastructure. The workflow passes that hostname and port 44334 as
+`expected-bridge`, which checks the effective client configuration after any
+bundled override and before a connection attempt.
 
 ### Production prerequisites
 

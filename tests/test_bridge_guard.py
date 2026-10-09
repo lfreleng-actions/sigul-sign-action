@@ -11,6 +11,8 @@ This tests the configuration boundary without importing a not-yet-added helper.
 
 from __future__ import annotations
 
+import getpass
+import importlib
 import io
 import json
 import os
@@ -18,7 +20,8 @@ import subprocess
 import sys
 import textwrap
 import unittest
-from contextlib import redirect_stdout
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from functools import cached_property
 from pathlib import Path
 from typing import cast
@@ -41,6 +44,15 @@ from tests.helpers import (
 )
 
 CONTAINER_SCRIPTS = REPOSITORY / "scripts" / "container"
+if str(CONTAINER_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(CONTAINER_SCRIPTS))
+
+# The container-only Sigul SDK is not installed for host-side type checking.
+load_configuration = cast(
+    Callable[[object, object], object],
+    importlib.import_module("client_configuration").load_configuration,
+)
+
 BRIDGE = "sigul-bridge.test"
 EXPECTED = BRIDGE + ":44334"
 OTHER_BRIDGE = "private-unapproved-bridge.invalid"
@@ -314,59 +326,45 @@ class EffectiveBridgeTests(unittest.TestCase):
         ):
             self.assertNotIn(value, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_data_refuses_a_mismatching_system_bridge(self) -> None:
         self.assert_refused("sign-data", host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_tag_refuses_a_mismatching_system_bridge(self) -> None:
         self.assert_refused("sign-git-tag", host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_data_refuses_a_bundle_override_of_an_approved_bridge(self) -> None:
         self.assert_refused("sign-data", user_host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_tag_refuses_a_bundle_override_of_an_approved_bridge(self) -> None:
         self.assert_refused("sign-git-tag", user_host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_data_compares_the_effective_port_too(self) -> None:
         self.assert_refused("sign-data", user_port="44335")
 
-    @unittest.expectedFailure
     def test_tag_compares_the_effective_port_too(self) -> None:
         self.assert_refused("sign-git-tag", user_port="44335")
 
-    @unittest.expectedFailure
     def test_data_does_not_strip_multiple_trailing_dots(self) -> None:
         self.assert_refused("sign-data", user_host=BRIDGE + "..")
 
-    @unittest.expectedFailure
     def test_tag_does_not_strip_multiple_trailing_dots(self) -> None:
         self.assert_refused("sign-git-tag", user_host=BRIDGE + "..")
 
-    @unittest.expectedFailure
     def test_data_probe_refuses_a_system_mismatch_before_nss_or_dns(self) -> None:
         self.assert_refused("sign-data", dry_run=True, host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_tag_probe_refuses_a_system_mismatch_before_nss_or_dns(self) -> None:
         self.assert_refused("sign-git-tag", dry_run=True, host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_data_probe_checks_the_bundle_override(self) -> None:
         self.assert_refused("sign-data", dry_run=True, user_host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_tag_probe_checks_the_bundle_override(self) -> None:
         self.assert_refused("sign-git-tag", dry_run=True, user_host=OTHER_BRIDGE)
 
-    @unittest.expectedFailure
     def test_data_probe_compares_the_effective_port_too(self) -> None:
         self.assert_refused("sign-data", dry_run=True, user_port="44335")
 
-    @unittest.expectedFailure
     def test_tag_probe_compares_the_effective_port_too(self) -> None:
         self.assert_refused("sign-git-tag", dry_run=True, user_port="44335")
 
@@ -461,11 +459,9 @@ class EffectiveBridgeTests(unittest.TestCase):
         self.assertEqual(fixture.events("connect"), [])
         self.assertTrue(fixture.events("client-import"))
 
-    @unittest.expectedFailure
     def test_data_opt_in_refuses_unavailable_sigul_modules(self) -> None:
         self.assert_missing_modules_refused("sign-data")
 
-    @unittest.expectedFailure
     def test_tag_opt_in_refuses_unavailable_sigul_modules(self) -> None:
         self.assert_missing_modules_refused("sign-git-tag")
 
@@ -480,17 +476,65 @@ class EffectiveBridgeTests(unittest.TestCase):
         self.assertNotIn("private-invalid-port", done.stdout + done.stderr)
         self.assert_configuration_not_disclosed(done)
 
-    @unittest.expectedFailure
     def test_data_fails_closed_when_client_configuration_rejects_the_bundle(
         self,
     ) -> None:
         self.assert_loader_failure_refused("sign-data")
 
-    @unittest.expectedFailure
     def test_tag_fails_closed_when_client_configuration_rejects_the_bundle(
         self,
     ) -> None:
         self.assert_loader_failure_refused("sign-git-tag")
+
+
+class ConfigurationLoaderTests(unittest.TestCase):
+    def test_successful_loading_restores_the_prompt_handler(self) -> None:
+        config = object()
+        with mock.patch("getpass.getpass") as original:
+
+            def construct(path: str) -> object:
+                self.assertEqual(path, "~/.sigul/client.conf")
+                self.assertIsNot(getpass.getpass, original)
+                return config
+
+            client = mock.Mock(ClientConfiguration=construct)
+            utils = mock.Mock(ConfigurationError=ValueError)
+            self.assertIs(load_configuration(client, utils), config)
+            self.assertIs(getpass.getpass, original)
+            original.assert_not_called()
+
+    def test_loader_errors_restore_the_prompt_handler_without_disclosing_values(
+        self,
+    ) -> None:
+        for error in (
+            ValueError("private-config-value"),
+            RuntimeError("private-config-value"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                stderr = io.StringIO()
+                client = mock.Mock(ClientConfiguration=mock.Mock(side_effect=error))
+                utils = mock.Mock(ConfigurationError=ValueError)
+                with mock.patch("getpass.getpass") as original, redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        _ = load_configuration(client, utils)
+                    self.assertIs(getpass.getpass, original)
+                    original.assert_not_called()
+                self.assertNotIn("private-config-value", stderr.getvalue())
+
+    def test_refused_prompts_also_restore_the_original_handler(self) -> None:
+        def construct(_path: str) -> str:
+            return getpass.getpass("private-prompt-text")
+
+        stderr = io.StringIO()
+        client = mock.Mock(ClientConfiguration=construct)
+        utils = mock.Mock(ConfigurationError=ValueError)
+        with mock.patch("getpass.getpass") as original, redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                _ = load_configuration(client, utils)
+            self.assertIs(getpass.getpass, original)
+            original.assert_not_called()
+        self.assertIn("nss-password", stderr.getvalue())
+        self.assertNotIn("private-prompt-text", stderr.getvalue())
 
 
 class ExpectedBridgeInputTests(unittest.TestCase):
@@ -504,14 +548,12 @@ class ExpectedBridgeInputTests(unittest.TestCase):
     def env(self) -> dict[str, str]:
         return base_env(self.workspace, CONTAINER="modern")
 
-    @unittest.expectedFailure
     def test_plan_defaults_to_an_empty_expectation(self) -> None:
         for overrides in ({}, {"EXPECTED_BRIDGE": ""}):
             with self.subTest(overrides=overrides):
                 plan = build_plan({**self.env, **overrides}, PINS_DIR)
-                self.assertEqual(getattr(plan, "expected_bridge", None), "")
+                self.assertEqual(plan.expected_bridge, "")
 
-    @unittest.expectedFailure
     def test_plan_normalizes_the_expected_endpoint(self) -> None:
         for raw, normalized in (
             ("Sigul-Bridge.Test.:044334", EXPECTED),
@@ -521,9 +563,8 @@ class ExpectedBridgeInputTests(unittest.TestCase):
         ):
             with self.subTest(raw=raw):
                 plan = build_plan({**self.env, "EXPECTED_BRIDGE": raw}, PINS_DIR)
-                self.assertEqual(getattr(plan, "expected_bridge", None), normalized)
+                self.assertEqual(plan.expected_bridge, normalized)
 
-    @unittest.expectedFailure
     def test_malformed_expectations_are_input_errors(self) -> None:
         for raw in (
             "bridge.test",
@@ -578,7 +619,6 @@ class ExpectedBridgeInputTests(unittest.TestCase):
                 self.assertEqual(after.hosts, before.hosts)
                 self.assertEqual(after.messages, before.messages)
 
-    @unittest.expectedFailure
     def test_validation_reports_a_malformed_expectation_as_rejected(self) -> None:
         output = self.workspace / "validation-output"
         env = {
@@ -595,7 +635,6 @@ class ExpectedBridgeInputTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(output.read_text(), "validation_status=rejected\n")
 
-    @unittest.expectedFailure
     def test_handoff_rejects_bad_structure_before_materializing_credentials(
         self,
     ) -> None:
@@ -641,7 +680,6 @@ class ExpectedBridgeInputTests(unittest.TestCase):
 
 
 class ExpectedBridgeWiringTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_signing_reexec_keeps_the_expected_bridge(self) -> None:
         captured: dict[str, str] = {}
 
@@ -729,11 +767,9 @@ class ExpectedBridgeWiringTests(unittest.TestCase):
                     if dry_run:
                         self.assertEqual(env.get("MODE"), operation)
 
-    @unittest.expectedFailure
     def test_both_modes_and_dry_runs_receive_the_planned_endpoint(self) -> None:
         self.assert_container_expectation("Sigul-Bridge.Test.:044334", EXPECTED)
 
-    @unittest.expectedFailure
     def test_empty_plan_explicitly_disables_an_image_or_ambient_expectation(
         self,
     ) -> None:

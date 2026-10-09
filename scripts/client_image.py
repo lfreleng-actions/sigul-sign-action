@@ -55,6 +55,26 @@ class HostEntry:
     address: str
 
 
+def parse_expected_bridge(raw: str) -> str:
+    """Validate an optional DNS_HOST:PORT guard without changing hosts entries."""
+    value = raw.strip()
+    if not value:
+        return ""
+    message = "expected-bridge must be DNS_HOST:PORT with a port from 1 to 65535"
+    host, separator, port = value.partition(":")
+    if (
+        not separator
+        or not _HOSTNAME.fullmatch(host)
+        or not re.fullmatch(r"[0-9]+", port)
+    ):
+        raise InputError(message)
+    # Bound conversion even for a very long integer, while accepting leading zeros.
+    port = port.lstrip("0") or "0"
+    if len(port) > 5 or not 1 <= int(port) <= 65535:
+        raise InputError(message)
+    return f"{host.removesuffix('.').lower()}:{int(port)}"
+
+
 def split_reference(raw: str) -> tuple[str, str, str]:
     """Split an image reference into (name, tag, digest), as Docker does:
     a ':' after the last '/' starts the tag."""

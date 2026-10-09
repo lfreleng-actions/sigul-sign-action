@@ -22,10 +22,12 @@ Environment (required unless noted):
   RETRY_DELAY     seconds between attempts (optional, default 15)
   ATTEMPT_TIMEOUT seconds an attempt may take, 0 for no limit
                   (optional, default 0)
+  EXPECTED_BRIDGE normalized DNS_HOST:PORT guard (optional, empty disables)
 """
 
 from __future__ import print_function
 
+import os
 import subprocess
 import time
 
@@ -68,6 +70,11 @@ def main():
     key = require_env("SIGUL_KEY")
     password_file = require_env("SIGUL_PASSWORD")
     retry = retry_policy()
+    expected = os.environ.get("EXPECTED_BRIDGE", "")
+    if expected:
+        from client_configuration import enforce_expected_bridge
+
+        enforce_expected_bridge(expected)
 
     unsigned = tag_oid(tag)
     status, kind = git_output(["cat-file", "-t", unsigned])
