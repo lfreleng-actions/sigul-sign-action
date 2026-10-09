@@ -162,19 +162,19 @@ inputs:
       maven-metadata.xml
       maven-metadata-local.xml
   max-retries:
-    description: "Attempts per signing operation"
+    description: "Attempts per signing operation, 1 to 86400"
     required: false
     default: "5"
   retry-delay:
-    description: "Seconds between attempts"
+    description: "Seconds between attempts, 0 to 86400"
     required: false
     default: "15"
   attempt-timeout:
     description: >
       Seconds a single attempt may take before it is stopped and
-      retried; 0 waits as long as the client does. A bridge that
-      accepts a connection and then says nothing otherwise holds the
-      step until the job's own timeout, retries and all.
+      retried, at most 86400; 0 waits as long as the client does. A
+      bridge that accepts a connection and then says nothing otherwise
+      holds the step until the job's own timeout, retries and all.
     required: false
     default: "600"
 

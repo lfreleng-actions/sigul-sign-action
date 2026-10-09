@@ -38,14 +38,12 @@ class ScalarTests(unittest.TestCase):
         with self.assertRaises(InputError):
             _ = parse_int("max-retries", "0", 1)
 
-    @unittest.expectedFailure
     def test_non_ascii_digits_are_input_errors(self) -> None:
         # str.isdigit() accepts these, but int() rejects them with ValueError.
         for raw in ("\u00b2", "1\u00b2", "\u0663", "\uff15"):
             with self.subTest(raw=raw), self.assertRaises(InputError):
                 _ = parse_int("retry-delay", raw, 0)
 
-    @unittest.expectedFailure
     def test_integer_inputs_are_bounded(self) -> None:
         self.assertEqual(parse_int("attempt-timeout", "86400", 0), 86400)
         self.assertEqual(parse_int("retry-delay", "000015", 0), 15)
@@ -416,7 +414,6 @@ class BuildPlanTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(InputError):
                 _ = build_plan(base_env(root, ATTEMPT_TIMEOUT=raw), PINS_DIR)
 
-    @unittest.expectedFailure
     def test_unconvertible_integer_inputs_reject_the_plan(self) -> None:
         root = scratch(self)
         _ = (root / "a.txt").write_text("a")

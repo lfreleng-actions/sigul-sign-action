@@ -260,9 +260,9 @@ valid returned signature.
 | `push-tag`          | `true`              | Push a signed tag back to the repository                                                                     |
 | `dry-run`           | `false`             | Check local prerequisites without signing or contacting the bridge                                           |
 | `exclude-globs`     | `global-jjb`'s list | File name patterns skipped inside a directory                                                                |
-| `max-retries`       | `5`                 | Attempts per signing operation                                                                               |
-| `retry-delay`       | `15`                | Seconds between attempts                                                                                     |
-| `attempt-timeout`   | `600`               | Seconds one attempt may take before the action stops and retries it; `0` for no limit                        |
+| `max-retries`       | `5`                 | Attempts per signing operation, from 1 to 86400                                                              |
+| `retry-delay`       | `15`                | Seconds between attempts, from 0 to 86400                                                                    |
+| `attempt-timeout`   | `600`               | Seconds one attempt may take before the action stops and retries it, at most 86400; `0` for no limit         |
 
 <!-- markdownlint-enable MD013 -->
 

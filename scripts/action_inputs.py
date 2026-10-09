@@ -19,6 +19,7 @@ selects the files and checks output dependencies.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,9 @@ from sign_targets import SignTarget, plan_sign_data
 
 SIGN_TYPES = ("sign-data", "sign-git-tag")
 CREDENTIAL_INPUTS = ("sigul-conf", "sigul-pass", "sigul-pki")
+# One day: longer than any job may run, and well inside what sleep and
+# deadline arithmetic accept.
+INTEGER_LIMIT = 86_400
 
 
 @dataclass(frozen=True)
@@ -68,13 +72,17 @@ def parse_bool(name: str, raw: str) -> bool:
 
 
 def parse_int(name: str, raw: str, minimum: int) -> int:
-    """Parse a non-negative integer input with a lower bound."""
+    """Parse a non-negative integer input between minimum and INTEGER_LIMIT."""
     value = raw.strip()
-    if not value.isdigit():
+    # str.isdigit() admits characters int() rejects, or reads as other
+    # numerals; the length cap keeps int() clear of its digit limit.
+    if not re.fullmatch(r"[0-9]{1,9}", value):
         raise InputError(f"{name} must be a non-negative integer (got '{raw}')")
     number = int(value)
     if number < minimum:
         raise InputError(f"{name} must be at least {minimum}")
+    if number > INTEGER_LIMIT:
+        raise InputError(f"{name} must be at most {INTEGER_LIMIT}")
     return number
 
 
