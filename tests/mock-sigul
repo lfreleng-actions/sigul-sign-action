@@ -1,0 +1,110 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+#
+# A stand-in for the sigul client, for tests. Never contacts a server.
+#
+# Mirrors the real client's command line for the two commands the
+# action uses, and its effects:
+#
+#   sigul [--batch] [-c FILE] sign-data [-a] -o OUT -- KEY FILE
+#       writes an armoured "signature" to OUT through a 0600 temporary
+#       file, as sigul's write_new_file does;
+#   sigul [--batch] [-c FILE] sign-git-tag -- KEY TAG
+#       in the current repository, appends a signature block to the
+#       tag object and moves the ref, as sigul does.
+#
+# When MOCK_PASSPHRASE is set, the complete stdin stream must match it
+# followed by exactly one NUL and one newline, as prepare() writes it.
+# Additional secret lines or trailing bytes must not be normalized away.
+#
+# Induced failures, for the retry paths: a file to sign containing
+# MOCK-FAIL-ALWAYS always fails; one containing MOCK-FAIL-ONCE fails
+# its first attempt in this container; one containing MOCK-HANG-ONCE
+# hangs its first attempt, as a client does on a bridge that accepts
+# the connection and says nothing, until the action's attempt timeout
+# stops it. MOCK_FAIL_TAG_ONCE=1 does the same as MOCK-FAIL-ONCE for
+# sign-git-tag.
+
+set -eu
+
+die() {
+    echo "mock sigul: $*" >&2
+    exit 1
+}
+
+command=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --batch) shift ;;
+        -c) shift 2 ;;
+        --version) echo "client.py mock"; exit 0 ;;
+        sign-data | sign-git-tag) command="$1"; shift; break ;;
+        *) die "unexpected argument: $1" ;;
+    esac
+done
+
+output=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -a) shift ;;
+        -o) output="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) die "expected '--' before the key and object, got: $1" ;;
+    esac
+done
+[ $# -eq 2 ] || die "expected KEY and one object after '--'"
+key="$1"
+object="$2"
+
+# Shell variables lose NULs and command substitution strips newlines;
+# a lossless byte encoding preserves both for the complete comparison.
+received="$(od -An -v -tx1)"
+if [ -n "${MOCK_PASSPHRASE:-}" ]; then
+    expected="$(printf '%s\000\n' "${MOCK_PASSPHRASE}" | od -An -v -tx1)"
+    [ "${received}" = "${expected}" ] || die "wrong passphrase or framing on stdin"
+fi
+
+state="/tmp/mock-sigul-state"
+mkdir -p "${state}"
+
+signature() {
+    printf -- '-----BEGIN PGP SIGNATURE-----\n\nmock signature by %s\n' "${key}"
+    printf -- '-----END PGP SIGNATURE-----\n'
+}
+
+case "${command}" in
+    sign-data)
+        [ -n "${output}" ] || die "sign-data needs -o"
+        [ -f "${object}" ] || die "cannot open ${object}"
+        if grep -q MOCK-FAIL-ALWAYS "${object}"; then
+            die "induced failure: ${object}"
+        fi
+        marker="${state}/$(printf '%s' "${object}" | cksum | cut -d' ' -f1)"
+        if grep -q MOCK-FAIL-ONCE "${object}" && [ ! -e "${marker}" ]; then
+            : > "${marker}"
+            die "induced transient failure: ${object}"
+        fi
+        if grep -q MOCK-HANG-ONCE "${object}" && [ ! -e "${marker}" ]; then
+            : > "${marker}"
+            echo "mock sigul: induced hang: ${object}" >&2
+            sleep 3600
+        fi
+        temporary="$(umask 077; mktemp "${output}.XXXXXX")"
+        signature > "${temporary}"
+        mv -f "${temporary}" "${output}"
+        ;;
+    sign-git-tag)
+        git status >/dev/null 2>&1 || die "not inside a git repository"
+        if [ "${MOCK_FAIL_TAG_ONCE:-0}" = 1 ] && [ ! -e "${state}/tag" ]; then
+            : > "${state}/tag"
+            die "induced transient failure: ${object}"
+        fi
+        unsigned="$(git show-ref -s "refs/tags/${object}")" ||
+            die "no such tag: ${object}"
+        signed="$( { git cat-file -p "${unsigned}"; signature; } |
+            git hash-object -t tag -w --stdin)"
+        git update-ref "refs/tags/${object}" "${signed}" "${unsigned}"
+        ;;
+    *) die "no command given" ;;
+esac

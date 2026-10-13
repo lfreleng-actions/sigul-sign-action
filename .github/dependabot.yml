@@ -16,3 +16,20 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 15
+
+  # The Sigul client images the action pins, by tag and digest, in
+  # containers/*/Dockerfile. Each bump re-runs the testing workflow
+  # inside the new image before it can reach a caller. Major versions
+  # are proposed too; whether one speaks the deployed protocol is a
+  # review decision, and the tests run either way.
+  - package-ecosystem: "docker"
+    directories:
+      - "/containers/legacy"
+      - "/containers/modern"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "Build(docker)"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
