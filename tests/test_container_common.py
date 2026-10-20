@@ -78,7 +78,13 @@ def is_running(pid: int) -> bool:
         return False
     status = Path(f"/proc/{pid}/status")
     if status.exists():
-        for line in status.read_text().splitlines():
+        # Reaped since the probe: ENOENT if gone before the open, ESRCH
+        # if gone after it. Any other error is not evidence it stopped.
+        try:
+            text = status.read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        for line in text.splitlines():
             if line.startswith("State:"):
                 return not line.split()[1].startswith("Z")
         return False
@@ -130,12 +136,10 @@ class IsRunningTests(unittest.TestCase):
         self.assertTrue(self.check(True, "Name:\tx\nState:\tS (sleeping)\n"))
         self.assertFalse(self.check(True, "Name:\tx\nState:\tZ (zombie)\n"))
 
-    @unittest.expectedFailure
     def test_reaped_between_the_check_and_the_read(self) -> None:
         reaped = FileNotFoundError(2, "synthetic process reaped")
         self.assertFalse(self.check(True, reaped))
 
-    @unittest.expectedFailure
     def test_reaped_while_the_status_is_open(self) -> None:
         # Linux reports ESRCH, not ENOENT, for a status file opened
         # before its process went away.
