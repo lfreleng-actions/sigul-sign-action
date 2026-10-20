@@ -12,6 +12,8 @@ from pathlib import PurePosixPath
 from action_common import ActionError
 
 MAX_CONFIG_BYTES = 1024 * 1024
+# Room for a configuration at the byte limit once base64 encoded.
+MAX_CONFIG_TEXT_CHARACTERS = 2 * MAX_CONFIG_BYTES
 
 
 def parse_configuration(text: str) -> configparser.RawConfigParser:

@@ -13,15 +13,18 @@ import re
 import shutil
 import subprocess
 import tarfile
+import textwrap
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 from action_common import ActionError
+from credential_config import parse_configuration
 from gpg_bundle import UnprotectedBundleError, kill_gpg_agent
 from prepare_credentials import (
     check_configuration,
+    decode_config,
     decode_pki,
     first_line,
     prepare,
@@ -55,6 +58,14 @@ zqSiu3ExJRTO
 =EKwW
 -----END PGP MESSAGE-----
 """
+
+
+def encode(text: str, wrap: int = 0) -> str:
+    """Base64 encode text, wrapped every 'wrap' characters as base64(1) does."""
+    encoded = base64.b64encode(text.encode()).decode()
+    if not wrap:
+        return encoded
+    return "\n".join(textwrap.wrap(encoded, wrap)) + "\n"
 
 
 def gpg_version() -> tuple[int, ...]:
@@ -148,6 +159,43 @@ class PureFunctionTests(unittest.TestCase):
         )
         self.assertEqual(decode_pki("not base64!"), b"not base64!")
 
+    def test_decode_config_accepts_base64(self) -> None:
+        for config in (HEAD, HEAD + ONAP_NSS, "[nss]\nnss-dir: /a\n"):
+            for wrap in (0, 76):
+                with self.subTest(config=config, wrap=wrap):
+                    self.assertEqual(decode_config(encode(config, wrap)), config)
+
+    def test_decode_config_never_decodes_a_raw_configuration(self) -> None:
+        # Every configuration Sigul can parse carries '[', '#' or ';',
+        # none of them base64, so each passes through byte for byte.
+        # The last cases are as near to base64 as a configuration gets.
+        for config in (
+            HEAD,
+            HEAD + ONAP_NSS,
+            "[nss]\nNSS-Dir = /home/jenkins/sigul\n",
+            "# comment\n[client]\n",
+            "[nss]",
+            "[AAAA]",
+            "[QUFB]\nQUFB=QUFB\n",
+        ):
+            with self.subTest(config=config):
+                _ = parse_configuration(config)
+                self.assertEqual(decode_config(config), config)
+
+    def test_decode_config_passes_undecodable_input_through(self) -> None:
+        # Not UTF-8 once decoded, or not strict base64: INI validation
+        # then refuses it without the value ever being decoded.
+        for raw in (base64.b64encode(b"\xff\xfe\x00").decode(), "QUFB!", "QUF"):
+            with self.subTest(raw=raw):
+                self.assertEqual(decode_config(raw), raw)
+                with self.assertRaises(ActionError):
+                    check_configuration(decode_config(raw))
+
+    def test_decode_config_bounds_its_input(self) -> None:
+        with self.assertRaises(ActionError) as caught:
+            _ = decode_config("A" * (2 * 1024 * 1024 + 1))
+        self.assertIn("exceeds 2 MiB", str(caught.exception))
+
     def test_rewrite_nss_dir(self) -> None:
         # Serialization may change whitespace, never other effective values.
         # Strict parsing of the result also proves duplicates were removed.
@@ -205,6 +253,8 @@ class PrepareTests(unittest.TestCase):
         ]
 
     def test_bundle_layouts(self) -> None:
+        # A base64 encoded sigul-conf gives the same client.conf as the
+        # raw one it encodes, nss-dir rewrite included.
         cases = [
             ("sigul", True, "/sigul-creds/pki/sigul"),
             ("sigul", False, "/sigul-creds/pki/sigul"),
@@ -212,16 +262,20 @@ class PrepareTests(unittest.TestCase):
             ("", True, "/sigul-creds/pki"),
         ]
         for layout, armour, expected in cases:
-            with self.subTest(layout=layout, armour=armour):
-                creds, nss_dir = self.prepare(
-                    HEAD + ONAP_NSS,
-                    PASSPHRASE,
-                    build_bundle(self, layout, armour=armour),
-                )
-                self.assertEqual(nss_dir, expected)
-                config = (creds / "client.conf").read_text()
-                self.assertEqual(self.nss_dirs(config), [expected])
-                self.assertIn("bridge.example.org", config)
+            pki = build_bundle(self, layout, armour=armour)
+            written: dict[str, str] = {}
+            for form, config in (
+                ("raw", HEAD + ONAP_NSS),
+                ("base64", encode(HEAD + ONAP_NSS)),
+                ("wrapped base64", encode(HEAD + ONAP_NSS, wrap=76)),
+            ):
+                with self.subTest(layout=layout, armour=armour, form=form):
+                    creds, nss_dir = self.prepare(config, PASSPHRASE, pki)
+                    self.assertEqual(nss_dir, expected)
+                    written[form] = (creds / "client.conf").read_text()
+                    self.assertEqual(self.nss_dirs(written[form]), [expected])
+                    self.assertIn("bridge.example.org", written[form])
+                    self.assertEqual(written[form], written["raw"])
 
     def test_passphrase_file_holds_the_first_line(self) -> None:
         # A secret stored with a trailing newline, or extra lines, still
@@ -316,6 +370,15 @@ class PrepareTests(unittest.TestCase):
                 _ = self.prepare(config, password, bundle)
         with self.assertRaises(ActionError):
             _ = self.prepare(HEAD + "user-name: $SIGUL_CONFIG_USR\n", PASSPHRASE, pki)
+        # Encoding hides neither a blank configuration nor a placeholder.
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(encode(" \n"), PASSPHRASE, pki)
+        self.assertIn("'sigul-conf' is required", str(caught.exception))
+        with self.assertRaises(ActionError) as caught:
+            _ = self.prepare(
+                encode(HEAD + "user-name: $SIGUL_CONFIG_USR\n"), PASSPHRASE, pki
+            )
+        self.assertIn("sigul-config-credentials", str(caught.exception))
 
     def test_top_level_client_conf_cannot_replace_the_callers(self) -> None:
         pki = build_bundle(
@@ -328,15 +391,19 @@ class PrepareTests(unittest.TestCase):
 
     def test_bundle_user_configuration_is_layered(self) -> None:
         # sigul_setup_client keeps nss-password in ~/.sigul/client.conf;
-        # with HOME at the bundle root, sigul reads it over sigul-conf.
+        # with HOME at the bundle root, sigul reads it over sigul-conf,
+        # however sigul-conf arrived.
         user = "[nss]\nnss-dir: /home/someone/.sigul\nnss-password: p\n"
         pki = build_bundle(self, ".sigul", extra={".sigul/client.conf": user})
-        creds, nss_dir = self.prepare(HEAD, PASSPHRASE, pki)
-        layered = (creds / "pki" / ".sigul" / "client.conf").read_text()
-        self.assertEqual(self.nss_dirs(layered), [nss_dir])
-        parser = configparser.RawConfigParser()
-        parser.read_string(layered)
-        self.assertEqual(parser.get("nss", "nss-password"), "p")
+        for config in (HEAD, encode(HEAD)):
+            with self.subTest(config=config):
+                creds, nss_dir = self.prepare(config, PASSPHRASE, pki)
+                layered = (creds / "pki" / ".sigul" / "client.conf").read_text()
+                self.assertEqual(self.nss_dirs(layered), [nss_dir])
+                parser = configparser.RawConfigParser()
+                parser.read_string(layered)
+                self.assertEqual(parser.get("nss", "nss-password"), "p")
+                self.assertIn("bridge.example.org", (creds / "client.conf").read_text())
 
     def test_symlinked_user_configuration_is_refused(self) -> None:
         # Even an in-tree configuration link must be rejected during
