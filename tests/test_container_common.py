@@ -92,6 +92,67 @@ def is_running(pid: int) -> bool:
     return bool(state) and not state.startswith("Z")
 
 
+# Never signalled: os.kill is mocked wherever it is used.
+SYNTHETIC_PID = 4194304
+
+
+class IsRunningTests(unittest.TestCase):
+    """The helper above, driven through mocks rather than real processes.
+
+    A race between the procfs existence check and the read cannot be
+    hit on demand with a real child, so each state is injected.
+    """
+
+    def check(
+        self,
+        exists: bool,
+        read: str | BaseException = "",
+        ps: str = "",
+        kill: BaseException | None = None,
+    ) -> bool:
+        with (
+            mock.patch.object(os, "kill", side_effect=kill),
+            mock.patch.object(Path, "exists", return_value=exists),
+            mock.patch.object(Path, "read_text", side_effect=[read]),
+            mock.patch.object(
+                subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout=ps),
+            ),
+        ):
+            return is_running(SYNTHETIC_PID)
+
+    def test_absent_at_the_signal_probe(self) -> None:
+        self.assertFalse(self.check(True, kill=ProcessLookupError()))
+
+    def test_procfs_states(self) -> None:
+        self.assertTrue(self.check(True, "Name:\tx\nState:\tR (running)\n"))
+        self.assertTrue(self.check(True, "Name:\tx\nState:\tS (sleeping)\n"))
+        self.assertFalse(self.check(True, "Name:\tx\nState:\tZ (zombie)\n"))
+
+    @unittest.expectedFailure
+    def test_reaped_between_the_check_and_the_read(self) -> None:
+        reaped = FileNotFoundError(2, "synthetic process reaped")
+        self.assertFalse(self.check(True, reaped))
+
+    @unittest.expectedFailure
+    def test_reaped_while_the_status_is_open(self) -> None:
+        # Linux reports ESRCH, not ENOENT, for a status file opened
+        # before its process went away.
+        self.assertFalse(self.check(True, ProcessLookupError(3, "reaped")))
+
+    def test_other_read_failures_are_not_termination(self) -> None:
+        with self.assertRaises(PermissionError):
+            _ = self.check(True, PermissionError(13, "denied"))
+        with self.assertRaises(OSError):
+            _ = self.check(True, OSError(5, "I/O error"))
+
+    def test_fallback_without_procfs(self) -> None:
+        self.assertTrue(self.check(False, ps="S\n"))
+        self.assertFalse(self.check(False, ps="Z\n"))
+        self.assertFalse(self.check(False, ps=""))
+
+
 class CallWithPasswordTests(unittest.TestCase):
     def password_file(self) -> str:
         path = scratch(self) / "password"
