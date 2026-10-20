@@ -11,4 +11,4 @@
 # the tag and digest current (.github/dependabot.yml). The testing
 # workflow runs the container-side scripts inside whatever this pins,
 # so a bump is exercised before it can reach a caller.
-FROM ghcr.io/lfreleng-actions/sigul-docker-k8s/client:v2.6.2@sha256:f6ff1c879f9c2fd9f9f6ff3ffc41bdbb6a9a682ffb65033bb22b5fc816fab2dd
+FROM ghcr.io/lfreleng-actions/sigul-docker-k8s/client:v2.6.3@sha256:b4fce197383b0b9b8e8d61f838953d1a69dea90e9674005b4d710487313716d4
