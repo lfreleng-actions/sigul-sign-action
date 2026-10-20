@@ -588,6 +588,28 @@ jobs:
             echo "nss-password: not-the-nss-password"
             echo "${delimiter}"
           } >> "$GITHUB_OUTPUT"
+          # One line, as a 1Password concealed field holds it.
+          printf 'conf_base64=%s\n' \
+            "$(printf '%s\n' "${CONF}" | openssl base64 -A)" >> "$GITHUB_OUTPUT"
+
+      # The legacy layout keeps the NSS password in sigul-conf, so this
+      # passes only if the action decodes it; expected-bridge checks the
+      # decoded endpoint on both layouts.
+      - name: "Dry run: base64 encoded sigul-conf"
+        uses: $/
+        with:
+          expected-bridge: "sigul-bridge.test:44334"
+          allow-legacy: "true"
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.variants.outputs.conf_base64 }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
 
       - name: "Refuse Jenkins placeholders (should fail)"
         id: placeholder

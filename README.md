@@ -191,6 +191,70 @@ action.
     sigul-pki: ${{ secrets.SIGUL_PKI }}
 ```
 
+### Load the credentials from 1Password
+
+`lfreleng-actions/credential-load-action` v2.1.0 and later can read one field
+of a 1Password item, so one `sigul` item can hold all three Sigul secrets:
+
+| Item `sigul` field | Action input |
+| ------------------ | ------------ |
+| `config`           | `sigul-conf` |
+| `password`         | `sigul-pass` |
+| `pki`              | `sigul-pki`  |
+
+Store `config` and `pki` base64 encoded, as
+[Credentials](#credentials) explains. The item name differs from the
+repository's, so it needs a grant in `CREDENTIAL_LOAD_GRANTS`:
+
+<!-- markdownlint-disable MD013 -->
+
+```yaml
+- name: "Load Sigul configuration"
+  id: sigul-conf
+  uses: lfreleng-actions/credential-load-action@2748d6e79cd70f8d3b7befee38468bd851eab51d # v2.1.0
+  with:
+    op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+    credential_name: "sigul"
+    credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
+    field: "config"
+
+- name: "Load Sigul key passphrase"
+  id: sigul-pass
+  uses: lfreleng-actions/credential-load-action@2748d6e79cd70f8d3b7befee38468bd851eab51d # v2.1.0
+  with:
+    op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+    credential_name: "sigul"
+    credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
+    field: "password"
+
+- name: "Load Sigul PKI bundle"
+  id: sigul-pki
+  uses: lfreleng-actions/credential-load-action@2748d6e79cd70f8d3b7befee38468bd851eab51d # v2.1.0
+  with:
+    op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+    credential_name: "sigul"
+    credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
+    field: "pki"
+
+- uses: lfreleng-actions/sigul-sign-action@<commit-sha> # vX.Y.Z
+  with:
+    container: modern
+    sign-object: dist
+    sigul-key-name: ${{ vars.SIGUL_KEY }}
+    sigul-conf: ${{ steps.sigul-conf.outputs.credential }}
+    sigul-pass: ${{ steps.sigul-pass.outputs.credential }}
+    sigul-pki: ${{ steps.sigul-pki.outputs.credential }}
+```
+
+<!-- markdownlint-enable MD013 -->
+
+Signing credentials belong in a vault of their own, read by a service account
+whose token reaches the signing job alone, for example as a protected
+environment's secret; `credential-load-action` documents the arrangement.
+
 ### Check a configuration without signing
 
 ```yaml
@@ -243,7 +307,7 @@ valid returned signature.
 | `sign-type`         | `sign-data`         | `sign-data` or `sign-git-tag`                                                                                |
 | `sign-object`       |                     | **Required.** Files to sign, one per line, or a directory; or the tag to sign                                |
 | `sigul-key-name`    |                     | **Required.** Name of the signing key on the server                                                          |
-| `sigul-conf`        |                     | **Required.** Body of the client configuration, `client.conf`                                                |
+| `sigul-conf`        |                     | **Required.** Body of the client configuration, `client.conf`, raw or base64                                 |
 | `sigul-pass`        |                     | **Required.** Key passphrase, which also decrypts `sigul-pki`; Sigul gets its first line                     |
 | `sigul-pki`         |                     | **Required.** GPG-encrypted `tar.xz` of the NSS database, ASCII-armoured or base64                           |
 | `sigul-ip`          |                     | Bridge IP address, for the hosts entry                                                                       |
@@ -337,6 +401,20 @@ Three inputs carry Sigul credentials: `sigul-conf`, `sigul-pass` and
 `sigul-pki`. `gh-key` is a secret too, a GitHub token that `sign-git-tag`
 needs to push. `sigul-key-name` names a key rather than containing one.
 
+- **Store `sigul-conf` and `sigul-pki` base64 encoded.** The runner masks a
+  secret's whole value and also each of its lines, so a raw `client.conf`
+  masks short, common lines such as `[client]` or `[nss]` wherever they
+  appear in the job log. Base64 makes each one a single opaque line with one
+  mask, which is also easier to enter and check in a 1Password concealed
+  field. Encode with `base64 -w0 client.conf` (GNU) or `base64 -i client.conf`
+  (macOS).
+- **Both inputs accept either form, detected rather than declared.** The
+  action decodes `sigul-conf` when strict base64 decoding yields UTF-8 text,
+  and takes it as given otherwise. A working configuration always holds a
+  `[section]` header or a comment, and none of `[`, `#` or `;` is base64, so
+  a raw configuration copied from Jenkins never decodes by mistake.
+  `sigul-pki` decodes the same way unless ASCII-armoured. Every check below
+  applies to the decoded configuration.
 - **Reuse existing Jenkins configuration values.** The action locates one
   NSS database in the unpacked bundle by its file names (`cert8.db`,
   `cert9.db`, `key3.db`, `key4.db`, `secmod.db` or `pkcs11.txt`), and rewrites
@@ -375,9 +453,9 @@ filters, and it does not apply archive ownership or permission metadata.
 
 The limits apply to dry runs too:
 
-- Each INI configuration is at most **1 MiB**. `sigul-pki` accepts at most
-  **2,097,152 input characters** and **1 MiB of ciphertext** after any outer
-  base64 decoding.
+- Each INI configuration is at most **1 MiB**. `sigul-conf` and `sigul-pki`
+  each accept at most **2,097,152 input characters**, and `sigul-pki` at most
+  **1 MiB of ciphertext** after any outer base64 decoding.
 - An archive has at most **256 file/directory members**, **16 MiB per file**
   and **32 MiB total expanded file contents**.
 - Paths must be relative and printable, with no parent traversal,

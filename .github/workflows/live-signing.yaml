@@ -25,9 +25,10 @@
 # lfit/releng-reusable-workflows uses:
 #
 #   SIGUL_KEY    key name (or set it as a variable instead)
-#   SIGUL_CONF   client.conf, with any Jenkins $SIGUL_CONFIG_* filled in
+#   SIGUL_CONF   client.conf, with any Jenkins $SIGUL_CONFIG_* filled in;
+#               raw or base64 encoded (base64 keeps log masking sane)
 #   SIGUL_PASS   key passphrase, which also decrypts SIGUL_PKI
-#   SIGUL_PKI    the encrypted PKI bundle
+#   SIGUL_PKI    the encrypted PKI bundle, ASCII-armoured or base64
 #   SIGUL_IP     optional: with SIGUL_URI, a hosts entry for the bridge
 #   SIGUL_URI    required here for the egress policy; may be a variable
 #               instead of a secret. Must name one approved bridge below;

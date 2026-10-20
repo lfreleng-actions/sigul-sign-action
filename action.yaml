@@ -56,7 +56,9 @@ inputs:
     required: false
     default: ""
   sigul-conf:
-    description: "Body of the Sigul client configuration (client.conf)"
+    description: >
+      Body of the Sigul client configuration (client.conf), raw or
+      base64-encoded; the action detects which.
     required: true
   sigul-key-name:
     description: "Name of the signing key held on the Sigul server"

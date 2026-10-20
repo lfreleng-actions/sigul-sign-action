@@ -23,7 +23,11 @@ from pathlib import Path
 
 from action_common import ActionError, info, shred_file
 from credential_archive import extract_bundle as extract_bundle
-from credential_config import MAX_CONFIG_BYTES, parse_configuration
+from credential_config import (
+    MAX_CONFIG_BYTES,
+    MAX_CONFIG_TEXT_CHARACTERS,
+    parse_configuration,
+)
 from credential_config import rewrite_nss_dir as rewrite_nss_dir
 from credential_files import write_private as write_private
 from gpg_bundle import UnprotectedBundleError, decrypt_bundle
@@ -73,6 +77,25 @@ def check_configuration(body: str) -> None:
             + "$SIGUL_CONFIG_PSW with its password before storing sigul-conf"
         )
     _ = parse_configuration(body)
+
+
+def decode_config(raw: str) -> str:
+    """Return sigul-conf as given, or decoded when it is base64 UTF-8 text.
+
+    A configuration Sigul can parse needs a section header or comment,
+    and '[', '#' and ';' are outside the base64 alphabet, so a working
+    raw configuration never decodes. Anything that fails strict decoding
+    or UTF-8 passes through for INI validation to judge.
+    """
+    if len(raw) > MAX_CONFIG_TEXT_CHARACTERS:
+        raise ActionError("sigul-conf input exceeds 2 MiB of text")
+    compact = "".join(raw.split())
+    if not compact:
+        return raw
+    try:
+        return base64.b64decode(compact, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return raw
 
 
 def decode_pki(raw: str) -> bytes:
@@ -184,7 +207,7 @@ def _prepare(
     pki_raw: str,
 ) -> PreparedCredentials:
     """Materialise the credentials; the caller erases both directories on exit."""
-    config_body = require("sigul-conf", config_body)
+    config_body = require("sigul-conf", decode_config(config_body))
     password = require("sigul-pass", password)
     pki_raw = require("sigul-pki", pki_raw)
     check_configuration(config_body)
