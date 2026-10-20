@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import os
 import shutil
@@ -12,7 +13,14 @@ import subprocess
 import sys
 import time
 import unittest
-from contextlib import redirect_stdout
+from collections.abc import Callable, Generator
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    contextmanager,
+    redirect_stderr,
+    redirect_stdout,
+)
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -49,6 +57,7 @@ from signing import (
 from sigul_action import (
     LISTING_LIMIT,
     check_hosts_against_dns,
+    check_runtime,
     main,
     read_handoff,
     report_plan,
@@ -413,6 +422,48 @@ class CommandLineTests(unittest.TestCase):
         }
         self.assertEqual(read_handoff(write_handoff(values)), values)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "memfd_create is Linux-only")
+    def test_handoff_reaches_a_receiving_process(self) -> None:
+        # The receiving process reads every byte, then holds no handoff
+        # descriptor by the time it could start a child tool.
+        values = {
+            "SIGUL_CONF": "[client]\nx: 1\n",
+            "SIGUL_PASS": os.fsdecode(b"pass\xe9word"),
+            "SIGUL_PKI": os.fsdecode(b"pki\xff"),
+            "GH_KEY": "",
+        }
+        receiver = (
+            "import os, sys\n"
+            + f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+            + "from sigul_action import read_handoff\n"
+            + "descriptor = int(sys.argv[1])\n"
+            + "values = read_handoff(descriptor)\n"
+            + "links = []\n"
+            + "for fd in os.listdir('/proc/self/fd'):\n"
+            + "    try:\n"
+            + "        links.append(os.readlink(f'/proc/self/fd/{fd}'))\n"
+            + "    except FileNotFoundError:\n"
+            + "        pass\n"
+            + "assert not any('sigul-handoff' in link for link in links), links\n"
+            + "sys.stdout.buffer.write("
+            + "b'\\0'.join(os.fsencode(values[k]) for k in sorted(values)))\n"
+        )
+        descriptor = write_handoff(values)
+        try:
+            done = subprocess.run(
+                [sys.executable, "-c", receiver, str(descriptor)],
+                pass_fds=(descriptor,),
+                capture_output=True,
+                check=False,
+            )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            done.stdout,
+            b"\0".join(os.fsencode(values[k]) for k in sorted(values)),
+        )
+
     def test_long_listings_are_cut_short(self) -> None:
         root = scratch(self)
         for index in range(LISTING_LIMIT + 3):
@@ -427,6 +478,169 @@ class CommandLineTests(unittest.TestCase):
             sum(1 for line in lines if line.endswith(".jar")), LISTING_LIMIT
         )
         self.assertIn("INFO:   … and 3 more", lines)
+
+
+@contextmanager
+def memfd_absent() -> Generator[None, None, None]:
+    """Run as Python does where it was built without os.memfd_create."""
+    saved = getattr(os, "memfd_create", None)
+    if saved is None:
+        yield
+        return
+    del os.memfd_create
+    try:
+        yield
+    finally:
+        os.memfd_create = saved
+
+
+MEMFD_FAULTS = ("absent", "ENOSYS", "EPERM")
+
+
+def memfd_fault(name: str) -> AbstractContextManager[object]:
+    """Make anonymous in-memory files unavailable, as named."""
+    if name == "absent":
+        return memfd_absent()
+    error = {
+        "ENOSYS": OSError(errno.ENOSYS, os.strerror(errno.ENOSYS)),
+        "EPERM": PermissionError(errno.EPERM, os.strerror(errno.EPERM)),
+    }[name]
+    return mock.patch.object(os, "memfd_create", create=True, side_effect=error)
+
+
+def recording_memfd(created: list[int]) -> Callable[..., int]:
+    """Wrap the real os.memfd_create, noting each descriptor it returns."""
+    real = os.memfd_create
+
+    def record(name: str, flags: int = os.MFD_CLOEXEC) -> int:
+        created.append(real(name, flags))
+        return created[-1]
+
+    return record
+
+
+SYNTHETIC_SECRETS = {
+    "SIGUL_CONF": "synthetic-conf-value",
+    "SIGUL_PASS": "synthetic-pass-value",
+    "SIGUL_PKI": "synthetic-pki-value",
+    "GH_KEY": "synthetic-token-value",
+}
+
+
+class HandoffCapabilityTests(unittest.TestCase):
+    """A runtime without usable anonymous in-memory files fails with an
+    explanation, before any credential is handed on."""
+
+    def assert_safe(self, text: str) -> None:
+        self.assertIn("memfd_create", text)
+        self.assertNotIn("Traceback", text)
+        for value in SYNTHETIC_SECRETS.values():
+            self.assertNotIn(value, text)
+
+    def trusted_tools(self) -> AbstractContextManager[object]:
+        stack = ExitStack()
+        _ = stack.enter_context(
+            mock.patch("sigul_action.system_tool", return_value="/usr/bin/tool")
+        )
+        _ = stack.enter_context(mock.patch("sigul_action.check_trusted_location"))
+        return stack
+
+    def test_write_handoff_explains_each_fault(self) -> None:
+        for name in MEMFD_FAULTS:
+            with (
+                self.subTest(fault=name),
+                memfd_fault(name),
+                self.assertRaises(ActionError) as caught,
+            ):
+                _ = write_handoff(SYNTHETIC_SECRETS)
+            self.assert_safe(str(caught.exception))
+
+    def test_sign_stops_before_reexec_on_each_fault(self) -> None:
+        for name in MEMFD_FAULTS:
+            output = io.StringIO()
+            with (
+                self.subTest(fault=name),
+                mock.patch.dict(os.environ, SYNTHETIC_SECRETS, clear=True),
+                memfd_fault(name),
+                mock.patch("sigul_action.os.execve") as execve,
+                mock.patch("sigul_action.sign") as materialize,
+                redirect_stdout(output),
+                redirect_stderr(output),
+            ):
+                status = main(["sign"])
+            self.assertEqual(status, 1)
+            execve.assert_not_called()
+            materialize.assert_not_called()
+            self.assert_safe(output.getvalue())
+
+    def test_runtime_check_reports_each_fault(self) -> None:
+        for name in MEMFD_FAULTS:
+            with (
+                self.subTest(fault=name),
+                mock.patch.dict(os.environ, {"RUNNER_OS": "Linux"}),
+                self.trusted_tools(),
+                memfd_fault(name),
+                self.assertRaises(ActionError) as caught,
+            ):
+                check_runtime()
+            self.assert_safe(str(caught.exception))
+
+    def test_unusable_runtime_is_not_a_rejection(self) -> None:
+        # validation_status=rejected means the inputs are malformed;
+        # these are not.
+        for name in MEMFD_FAULTS:
+            root = scratch(self)
+            _ = (root / "a.txt").write_text("a")
+            output = root / "github-output"
+            env = base_env(root, SIGN_OBJECT="a.txt", GITHUB_OUTPUT=str(output))
+            with (
+                self.subTest(fault=name),
+                mock.patch.dict(os.environ, env, clear=True),
+                self.trusted_tools(),
+                memfd_fault(name),
+                mock.patch("sigul_action.check_hosts_against_dns"),
+                redirect_stdout(io.StringIO()),
+            ):
+                status = main(["validate"])
+            self.assertEqual(status, 1)
+            self.assertFalse(output.exists() and output.read_text())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "memfd_create is Linux-only")
+    def test_runtime_probe_holds_nothing_and_closes(self) -> None:
+        created: list[int] = []
+        with (
+            mock.patch.dict(os.environ, {"RUNNER_OS": "Linux"}),
+            self.trusted_tools(),
+            mock.patch.object(os, "memfd_create", side_effect=recording_memfd(created)),
+            mock.patch.object(os, "write", wraps=os.write) as write,
+        ):
+            check_runtime()
+        self.assertTrue(created, "check_runtime never probed memfd_create")
+        write.assert_not_called()
+        for descriptor in created:
+            with self.assertRaises(OSError):
+                _ = os.fstat(descriptor)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "memfd_create is Linux-only")
+    def test_failed_handoff_closes_its_descriptor(self) -> None:
+        for step in ("set_inheritable", "write", "lseek"):
+            created: list[int] = []
+            with (
+                self.subTest(step=step),
+                mock.patch.object(
+                    os, "memfd_create", side_effect=recording_memfd(created)
+                ),
+                mock.patch.object(
+                    os, step, side_effect=OSError(errno.EIO, os.strerror(errno.EIO))
+                ),
+                self.assertRaises(ActionError) as caught,
+            ):
+                _ = write_handoff(SYNTHETIC_SECRETS)
+            for value in SYNTHETIC_SECRETS.values():
+                self.assertNotIn(value, str(caught.exception))
+            self.assertEqual(len(created), 1)
+            with self.assertRaises(OSError):
+                _ = os.fstat(created[0])
 
 
 def interpreter_is_trusted() -> bool:

@@ -498,6 +498,15 @@ validation of encrypted configuration before materialization.
   vendor-supported runtime and keep its standard library and native
   dependencies patched. The version floor is not a security baseline, and
   extraction no longer depends on historical `tarfile` filter backports.
+- **Anonymous in-memory files (`memfd_create`)**. The signing step hands
+  its secret inputs to a fresh process through one. Python must provide
+  `os.memfd_create`, and the kernel and any seccomp, SELinux or AppArmor
+  policy must allow the system call. Linux 3.17 and glibc 2.27 or later
+  support it, but the action probes the running environment rather than
+  trusting versions. Where the probe fails, validation and signing stop with
+  an explanation before the action passes on any secret, and leave
+  `validation_status` empty, not `rejected`. There is no disk-backed
+  fallback.
 - **Root-owned `python3`, `docker`, `git` and `gpg` in fixed system
   directories**: `/usr/local/bin`, `/usr/bin`, `/bin`, their `sbin` siblings
   and `/snap/bin`. The action ignores the job's `PATH`. Executables must be
