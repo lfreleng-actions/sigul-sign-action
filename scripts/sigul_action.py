@@ -118,10 +118,13 @@ def check_runtime() -> None:
     part-way. The shell checked the interpreter file and its complete
     path before executing it (scripts/trusted_interpreter.sh). Repeat
     that policy here and apply it to the other primary runner tools.
+    It also probes, with no secret data, for the anonymous in-memory
+    files that the 'sign' command hands its secrets through.
     """
     runner_os = os.environ.get("RUNNER_OS", "Linux")
     if runner_os != "Linux":
         raise ActionError(f"this action needs a Linux runner (this one is {runner_os})")
+    check_handoff()
     if sys.executable:
         check_trusted_location(sys.executable)
     for tool in ("docker", "git", "gpg"):
@@ -238,19 +241,59 @@ def command_sign() -> None:
         ) from None
 
 
+HANDOFF_REQUIREMENT = (
+    "the signing step hands the secret inputs to a fresh process through "
+    + "an anonymous in-memory file, so it needs a Python with "
+    + "os.memfd_create on a Linux kernel and security policy (seccomp, "
+    + "SELinux, AppArmor) that allow the memfd_create system call"
+)
+
+
+def create_handoff_file() -> int:
+    """Return a descriptor for a new, empty anonymous in-memory file,
+    or explain why this runtime cannot make one."""
+    if not hasattr(os, "memfd_create"):
+        raise ActionError(
+            f"this Python does not provide os.memfd_create: {HANDOFF_REQUIREMENT}"
+        )
+    try:
+        return os.memfd_create("sigul-handoff")
+    except OSError as exc:
+        raise ActionError(
+            f"memfd_create failed ({exc.strerror or exc.errno}): {HANDOFF_REQUIREMENT}"
+        ) from None
+
+
+def check_handoff() -> None:
+    """Fail before any secret is read where the handoff cannot work.
+    Later calls can still fail, so write_handoff() checks again."""
+    os.close(create_handoff_file())
+
+
 def write_handoff(values: dict[str, str]) -> int:
     """Return an inheritable descriptor for an anonymous file holding
     the secrets, positioned at its start."""
-    descriptor = os.memfd_create("sigul-handoff")
-    os.set_inheritable(descriptor, True)
-    # NUL-separated: an environment value cannot contain one. Encoded
-    # as the environment was decoded, so bytes that are not UTF-8 --
-    # which Python carries as surrogates -- survive the trip rather
-    # than fail it.
-    data = memoryview(b"\0".join(os.fsencode(values[name]) for name in SECRET_INPUTS))
-    while data:
-        data = data[os.write(descriptor, data) :]
-    _ = os.lseek(descriptor, 0, os.SEEK_SET)
+    descriptor = create_handoff_file()
+    try:
+        os.set_inheritable(descriptor, True)
+        # NUL-separated: an environment value cannot contain one.
+        # Encoded as the environment was decoded, so bytes that are not
+        # UTF-8 -- which Python carries as surrogates -- survive the
+        # trip rather than fail it.
+        data = memoryview(
+            b"\0".join(os.fsencode(values[name]) for name in SECRET_INPUTS)
+        )
+        while data:
+            data = data[os.write(descriptor, data) :]
+        _ = os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as exc:
+        os.close(descriptor)
+        raise ActionError(
+            f"cannot write the secret handoff ({exc.strerror or exc.errno})"
+        ) from None
+    except BaseException:
+        os.close(descriptor)
+        raise
     return descriptor
 
 

@@ -545,7 +545,6 @@ class HandoffCapabilityTests(unittest.TestCase):
         _ = stack.enter_context(mock.patch("sigul_action.check_trusted_location"))
         return stack
 
-    @unittest.expectedFailure
     def test_write_handoff_explains_each_fault(self) -> None:
         for name in MEMFD_FAULTS:
             with (
@@ -556,7 +555,6 @@ class HandoffCapabilityTests(unittest.TestCase):
                 _ = write_handoff(SYNTHETIC_SECRETS)
             self.assert_safe(str(caught.exception))
 
-    @unittest.expectedFailure
     def test_sign_stops_before_reexec_on_each_fault(self) -> None:
         for name in MEMFD_FAULTS:
             output = io.StringIO()
@@ -575,7 +573,6 @@ class HandoffCapabilityTests(unittest.TestCase):
             materialize.assert_not_called()
             self.assert_safe(output.getvalue())
 
-    @unittest.expectedFailure
     def test_runtime_check_reports_each_fault(self) -> None:
         for name in MEMFD_FAULTS:
             with (
@@ -588,7 +585,6 @@ class HandoffCapabilityTests(unittest.TestCase):
                 check_runtime()
             self.assert_safe(str(caught.exception))
 
-    @unittest.expectedFailure
     def test_unusable_runtime_is_not_a_rejection(self) -> None:
         # validation_status=rejected means the inputs are malformed;
         # these are not.
@@ -610,7 +606,6 @@ class HandoffCapabilityTests(unittest.TestCase):
             self.assertFalse(output.exists() and output.read_text())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "memfd_create is Linux-only")
-    @unittest.expectedFailure
     def test_runtime_probe_holds_nothing_and_closes(self) -> None:
         created: list[int] = []
         with (
@@ -627,7 +622,6 @@ class HandoffCapabilityTests(unittest.TestCase):
                 _ = os.fstat(descriptor)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "memfd_create is Linux-only")
-    @unittest.expectedFailure
     def test_failed_handoff_closes_its_descriptor(self) -> None:
         for step in ("set_inheritable", "write", "lseek"):
             created: list[int] = []
