@@ -298,7 +298,6 @@ class LiveCredentialTests(WorkflowShellTests):
         for secret in (PHRASE, CONFIG, PKI, *secrets):
             self.assertNotIn(secret, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_valid_document_writes_every_field(self) -> None:
         done = self.unpack(credentials(**VALID))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -309,13 +308,11 @@ class LiveCredentialTests(WorkflowShellTests):
         for value in VALID.values():
             self.assertIn(f"::add-mask::{value}\n", done.stdout)
 
-    @unittest.expectedFailure
     def test_line_wrapped_base64_is_accepted(self) -> None:
         wrapped = "\n".join(textwrap.wrap(credentials(**VALID), 76))
         done = self.unpack(wrapped)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_every_field_is_masked_before_any_output_is_written(self) -> None:
         # An unwritable output file fails at the write; the masks must be out.
         done = self.shell(
@@ -327,22 +324,18 @@ class LiveCredentialTests(WorkflowShellTests):
         for value in VALID.values():
             self.assertIn(f"::add-mask::{value}\n", done.stdout)
 
-    @unittest.expectedFailure
     def test_non_base64_is_refused(self) -> None:
         self.assert_refused(f"!{PHRASE}!")
 
-    @unittest.expectedFailure
     def test_non_json_is_refused(self) -> None:
         text = base64.b64encode(f"not json {PHRASE}".encode()).decode()
         self.assert_refused(text)
 
-    @unittest.expectedFailure
     def test_unsupported_versions_are_refused(self) -> None:
         for version in (None, 0, 2, "1"):
             with self.subTest(version=version):
                 self.assert_refused(credentials(**{**VALID, "version": version}))
 
-    @unittest.expectedFailure
     def test_missing_empty_or_multi_line_fields_are_refused(self) -> None:
         for key in VALID:
             for value in (None, "", 7, f"{PHRASE}\nsecond", f"{PHRASE}\rsecond"):
@@ -357,7 +350,6 @@ class LiveCredentialTests(WorkflowShellTests):
                     for secret in VALID.values():
                         self.assertNotIn(secret, done.stderr)
 
-    @unittest.expectedFailure
     def test_percent_escapes_are_masked_literally(self) -> None:
         # The runner percent-decodes command data, so "%25" in the mask
         # must arrive as "%2525" to register the value itself.
@@ -395,7 +387,6 @@ class LiveBridgePinTests(WorkflowShellTests):
             probe.bind(("127.0.0.1", 0))
             return bound_port(probe)
 
-    @unittest.expectedFailure
     def test_first_accepting_address_is_pinned(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
@@ -405,7 +396,6 @@ class LiveBridgePinTests(WorkflowShellTests):
         self.assertEqual((self.root / "output").read_text(), "address=127.0.0.1\n")
         self.assertIn("::notice::Pinned localhost to 127.0.0.1", done.stdout)
 
-    @unittest.expectedFailure
     def test_no_accepting_address_fails(self) -> None:
         done = self.pin("localhost", self.closed_port())
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
@@ -413,7 +403,6 @@ class LiveBridgePinTests(WorkflowShellTests):
         self.assertIn("127.0.0.1", done.stdout + done.stderr)
         self.assertFalse((self.root / "output").exists())
 
-    @unittest.expectedFailure
     def test_a_name_the_resolver_rejects_fails(self) -> None:
         # glibc refuses a name with a space before any lookup, so this
         # stays off the network on every runner.
@@ -441,14 +430,12 @@ class LiveProjectConfigurationTests(WorkflowShellTests):
             **{**COMPLETE_PROJECT, **env},
         )
 
-    @unittest.expectedFailure
     def test_complete_configuration_passes(self) -> None:
         for container in ("legacy", "modern"):
             with self.subTest(container=container):
                 done = self.check(CONTAINER=container)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_each_missing_item_fails_and_is_named(self) -> None:
         for variable, value, item in (
             ("CONTAINER", "", "container"),
@@ -464,7 +451,6 @@ class LiveProjectConfigurationTests(WorkflowShellTests):
                 self.assertIn("::error::", done.stdout)
                 self.assertIn(item, done.stdout)
 
-    @unittest.expectedFailure
     def test_every_missing_item_is_named_in_one_error(self) -> None:
         done = self.check(
             CONTAINER="", HAVE_CREDENTIALS="false", SIGUL_KEY="", BRIDGE_HOST=""
@@ -480,7 +466,6 @@ LIVE_SOURCE = (REPOSITORY / ".github" / "workflows" / "live-signing.yaml").read_
 
 
 class LiveSigningWiringTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_signing_uses_the_unpacked_credentials_and_the_pin(self) -> None:
         step = named_step(LIVE_STEPS, "Sign with Sigul")
         for line in (
@@ -497,7 +482,6 @@ class LiveSigningWiringTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertRegex(step, rf"(?m)^          {re.escape(line)}$")
 
-    @unittest.expectedFailure
     def test_retired_secrets_and_inputs_are_gone(self) -> None:
         for retired in (
             "secrets.SIGUL_CONF",
@@ -513,7 +497,6 @@ class LiveSigningWiringTests(unittest.TestCase):
             with self.subTest(retired=retired):
                 self.assertNotIn(retired, LIVE_SOURCE)
 
-    @unittest.expectedFailure
     def test_job_runs_in_the_selected_project_environment(self) -> None:
         self.assertRegex(
             LIVE_SOURCE, r"(?m)^    environment: \$\{\{ inputs\.project \}\}$"

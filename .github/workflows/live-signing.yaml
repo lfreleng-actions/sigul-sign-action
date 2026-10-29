@@ -15,43 +15,47 @@
 # credentials and runs the selected image, so requires a trusted job.
 # Untick it to sign and verify against the expected public key.
 #
-# CREDENTIALS. Each infrastructure has its own environment, which also
-# carries any protection rules (required reviewers, say):
+# CREDENTIALS. Each project has its own environment -- onap,
+# opendaylight, o-ran-sc and opensearch -- which admits only the main
+# branch and carries any other protection rules. Pick one with the
+# 'project' input. Each environment holds:
 #
-#   sigul-legacy   the CentOS 7 bridges, e.g. ONAP's credentials
-#   sigul-modern   the sigul-docker-k8s stack, e.g. OpenSearch's
+#   SIGUL_CREDENTIALS  secret: base64 of the compact JSON document
+#                      {"version":1,"config":<base64 client.conf>,
+#                       "password":<one line>,"pki":<base64 armoured
+#                       bundle>}; every field is masked before use
+#   SIGUL_KEY          variable: the signing key name
+#   SIGUL_URI          variable: the bridge host name, no port. Must name
+#                      one approved bridge below; expected-bridge checks
+#                      the effective configuration after the bundle's
+#                      user configuration overrides client.conf.
+#   SIGUL_PUBLIC_KEY   variable: the trusted signing key's armoured public
+#                      half. A non-dry run requires it and verifies the
+#                      signature against it.
 #
-# Each environment holds the secrets the action takes, under the names
-# lfit/releng-reusable-workflows uses:
+# The repository variable SIGUL_LIVE_PROJECTS, a JSON object keyed by
+# environment name, gives each project's client as its 'container':
+# 'legacy' or 'modern'. Listing a project as legacy records its approved
+# unsupported-client exception, so it also sets allow-legacy. This
+# manual workflow ignores the object's 'enabled' flag.
 #
-#   SIGUL_KEY    key name (or set it as a variable instead)
-#   SIGUL_CONF   client.conf, with any Jenkins $SIGUL_CONFIG_* filled in;
-#               raw or base64 encoded (base64 keeps log masking sane)
-#   SIGUL_PASS   key passphrase, which also decrypts SIGUL_PKI
-#   SIGUL_PKI    the encrypted PKI bundle, ASCII-armoured or base64
-#   SIGUL_IP     optional: with SIGUL_URI, a hosts entry for the bridge
-#   SIGUL_URI    required here for the egress policy; may be a variable
-#               instead of a secret. Must name one approved bridge below;
-#               expected-bridge checks the effective configuration after
-#               the bundle's user configuration overrides SIGUL_CONF.
-#
-# A non-dry run also requires SIGUL_PUBLIC_KEY as a variable: the trusted
-# signing key's armoured public half, against which signatures are verified.
+# Sigul's client fails on a bridge name that resolves to several
+# addresses (lfreleng-actions/sigul-docker-k8s#102), so the workflow pins
+# the name to the first address that accepts a connection and passes it
+# to the action as a hosts entry. That check opens a TCP connection to
+# the bridge, dry run or not. This is interim, until the action does it
+# itself (lfreleng-actions/sigul-sign-action#32).
 name: "Live signing 🔏"
 
 # yamllint disable-line rule:truthy
 on:
   workflow_dispatch:
     inputs:
-      container:
-        description: "Signing infrastructure, and its environment"
+      project:
+        description: "Project, and its environment"
         type: choice
-        options: ["legacy", "modern"]
-        default: "legacy"
-      allow-legacy:
-        description: "Accept the unsupported legacy client for this run"
-        type: boolean
-        default: false
+        options: ["onap", "opendaylight", "o-ran-sc", "opensearch"]
+        default: "onap"
       operation:
         description: "What to sign"
         type: choice
@@ -71,15 +75,29 @@ concurrency:
 jobs:
   live:
     # yamllint disable-line rule:line-length
-    name: "${{ inputs.dry-run && 'Dry run' || 'Sign' }}: ${{ inputs.operation }} (${{ inputs.container }})"
+    name: "${{ inputs.dry-run && 'Dry run' || 'Sign' }}: ${{ inputs.operation }} (${{ inputs.project }})"
     # amd64, which the legacy client image requires.
     runs-on: ubuntu-24.04
-    environment: "sigul-${{ inputs.container }}"
+    environment: ${{ inputs.project }}
     permissions:
       contents: read
     timeout-minutes: 20
     env:
-      BRIDGE_HOST: ${{ secrets.SIGUL_URI || vars.SIGUL_URI }}
+      BRIDGE_HOST: ${{ vars.SIGUL_URI }}
+      # The project's client from SIGUL_LIVE_PROJECTS. One literal key per
+      # project, as zizmor reports a computed index as obfuscation.
+      CONTAINER: >-
+        ${{
+          inputs.project == 'onap' &&
+          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}').onap.container ||
+          inputs.project == 'opendaylight' &&
+          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}').opendaylight.container ||
+          inputs.project == 'o-ran-sc' &&
+          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}')['o-ran-sc'].container ||
+          inputs.project == 'opensearch' &&
+          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}').opensearch.container ||
+          ''
+        }}
     steps:
       # The firewall starts in a pre hook, before checkout. Keep its policy
       # inline: the organisation loader adds unrelated publishing endpoints.
@@ -91,21 +109,21 @@ jobs:
           egress-policy: 'block'
           allowed-endpoints: >-
             github.com:443
-            ${{ inputs.container == 'modern' &&
+            ${{ env.CONTAINER == 'modern' &&
                 'ghcr.io:443 pkg-containers.githubusercontent.com:443' || '' }}
-            ${{ inputs.container == 'legacy' &&
+            ${{ env.CONTAINER == 'legacy' &&
                 'auth.docker.io:443 registry-1.docker.io:443' || '' }}
-            ${{ inputs.container == 'legacy' &&
+            ${{ env.CONTAINER == 'legacy' &&
                 'production.cloudflare.docker.com:443' || '' }}
-            ${{ inputs.container == 'legacy' &&
+            ${{ env.CONTAINER == 'legacy' &&
                 'production.cloudfront.docker.com:443' || '' }}
-            ${{ inputs.container == 'legacy' &&
+            ${{ env.CONTAINER == 'legacy' &&
                 (env.BRIDGE_HOST ==
                   'sigul-bridge-yul.linuxfoundation.org' ||
                  env.BRIDGE_HOST ==
                   'sigul-bridge-us-west-2.linuxfoundation.org') &&
                 format('{0}:44334', env.BRIDGE_HOST) || '' }}
-            ${{ inputs.container == 'modern' &&
+            ${{ env.CONTAINER == 'modern' &&
                 env.BRIDGE_HOST == 'sigul-bridge.opensearch.org' &&
                 'sigul-bridge.opensearch.org:44334' || '' }}
 
@@ -127,10 +145,36 @@ jobs:
             exit 1
           fi
 
+      - name: "Check the project configuration"
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          CONTAINER: ${{ env.CONTAINER }}
+          HAVE_CREDENTIALS: ${{ secrets.SIGUL_CREDENTIALS != '' }}
+          SIGUL_KEY: ${{ vars.SIGUL_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          case "${CONTAINER}" in
+            legacy | modern) ;;
+            *) missing+=("SIGUL_LIVE_PROJECTS container (legacy or modern)") ;;
+          esac
+          [ "${HAVE_CREDENTIALS}" = "true" ] ||
+            missing+=("secret SIGUL_CREDENTIALS")
+          [ -n "${SIGUL_KEY//[[:space:]]/}" ] ||
+            missing+=("variable SIGUL_KEY")
+          [ -n "${BRIDGE_HOST//[[:space:]]/}" ] ||
+            missing+=("variable SIGUL_URI")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            list="$(printf '%s, ' "${missing[@]}")"
+            echo "::error::Project ${PROJECT} lacks: ${list%, }"
+            exit 1
+          fi
+
       - name: "Check the selected bridge"
         shell: bash
         env:
-          CONTAINER: ${{ inputs.container }}
+          CONTAINER: ${{ env.CONTAINER }}
         run: |
           set -euo pipefail
           case "${CONTAINER}:${BRIDGE_HOST}" in
@@ -142,6 +186,42 @@ jobs:
               exit 1
               ;;
           esac
+
+      # Interim workaround for lfreleng-actions/sigul-docker-k8s#102, until
+      # lfreleng-actions/sigul-sign-action#32 pins inside the action.
+      - name: "Pin the bridge address"
+        id: pin
+        shell: bash
+        env:
+          BRIDGE_PORT: "44334"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, socket, sys
+          output = os.environ["GITHUB_OUTPUT"]
+          host = os.environ["BRIDGE_HOST"]
+          port = int(os.environ["BRIDGE_PORT"])
+          try:
+              found = socket.getaddrinfo(
+                  host, port, socket.AF_INET, socket.SOCK_STREAM)
+          except OSError as error:
+              sys.exit(f"::error::Cannot resolve {host}: {error}")
+          addresses = list(dict.fromkeys(entry[4][0] for entry in found))
+          for number, address in enumerate(addresses, 1):
+              try:
+                  socket.create_connection((address, port), timeout=5).close()
+              except OSError:
+                  continue
+              with open(output, "a", encoding="utf-8") as out:
+                  out.write(f"address={address}\n")
+              print(f"::notice::Pinned {host} to {address} ({number} of "
+                    f"{len(addresses)} addresses) for this run")
+              break
+          else:
+              tried = ", ".join(addresses) or "none"
+              sys.exit(f"::error::No address of {host} accepts connections "
+                       f"on port {port}; tried {tried}")
+          PY
 
       - name: "Make something to sign"
         id: target
@@ -168,22 +248,55 @@ jobs:
             echo "object=${tag}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: "Unpack Sigul credentials"
+        id: creds
+        shell: bash
+        env:
+          SIGUL_CREDENTIALS: ${{ secrets.SIGUL_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, binascii, json, os, sys
+          encoded = "".join(os.environ["SIGUL_CREDENTIALS"].split())
+          try:
+              doc = json.loads(base64.b64decode(encoded, validate=True))
+          except (binascii.Error, ValueError):
+              sys.exit("::error::SIGUL_CREDENTIALS is not base64 encoded JSON")
+          if doc.get("version") != 1:
+              sys.exit("::error::SIGUL_CREDENTIALS has an unsupported version")
+          lines = []
+          for key in ("config", "password", "pki"):
+              value = doc.get(key)
+              if (not isinstance(value, str) or not value
+                      or "\n" in value or "\r" in value):
+                  sys.exit(f"::error::SIGUL_CREDENTIALS.{key} "
+                           "must be one non-empty line")
+              # The runner percent-decodes command data: escape it, or a
+              # value holding "%25" would register a different string as
+              # its mask.
+              print("::add-mask::" + value.replace("%", "%25"))
+              lines.append(f"{key}={value}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("\n".join(lines) + "\n")
+          PY
+
       - name: "Sign with Sigul"
         id: sign
         uses: $/
         with:
-          container: ${{ inputs.container }}
-          allow-legacy: ${{ inputs.allow-legacy }}
+          container: ${{ env.CONTAINER }}
+          allow-legacy: ${{ env.CONTAINER == 'legacy' }}
           sign-type: ${{ inputs.operation }}
           sign-object: ${{ steps.target.outputs.object }}
           push-tag: "false"
           dry-run: ${{ inputs.dry-run }}
-          sigul-key-name: ${{ secrets.SIGUL_KEY || vars.SIGUL_KEY }}
-          sigul-conf: ${{ secrets.SIGUL_CONF }}
-          sigul-pass: ${{ secrets.SIGUL_PASS }}
-          sigul-pki: ${{ secrets.SIGUL_PKI }}
-          sigul-ip: ${{ secrets.SIGUL_IP }}
+          sigul-key-name: ${{ vars.SIGUL_KEY }}
+          sigul-conf: ${{ steps.creds.outputs.config }}
+          sigul-pass: ${{ steps.creds.outputs.password }}
+          sigul-pki: ${{ steps.creds.outputs.pki }}
+          sigul-ip: ${{ steps.pin.outputs.address }}
           sigul-uri: ${{ env.BRIDGE_HOST }}
+          sigul-hosts-entry: "true"
           expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
 
       - name: "Verify the signature"
