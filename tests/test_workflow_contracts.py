@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import re
+import socket
 import subprocess
 import textwrap
 import unittest
 from functools import cached_property
 from pathlib import Path
+from typing import cast
 
 from tests.helpers import REPOSITORY, scratch
 
@@ -256,6 +260,252 @@ class LiveBridgeSelectionTests(WorkflowShellTests):
             with self.subTest(container=container, host=host):
                 done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
                 self.assertEqual(done.returncode, status, done.stdout + done.stderr)
+
+
+def live_script(name: str) -> str:
+    """Look a new step up per test, so its absence is the expected failure."""
+    return shell_body(named_step(LIVE_STEPS, name))
+
+
+def credentials(**fields: object) -> str:
+    """Encode a SIGUL_CREDENTIALS document the way maintainers store it."""
+    document = {"version": 1, **fields}
+    return base64.b64encode(json.dumps(document).encode()).decode()
+
+
+# Synthetic values, each distinctive enough to spot if an error leaks it.
+CONFIG = base64.b64encode(b"[client]\nbridge-hostname: bridge.invalid\n").decode()
+PHRASE = "synthetic phrase"
+PKI = base64.b64encode(b"-----BEGIN PGP MESSAGE-----\nsynthetic\n").decode()
+VALID = {"config": CONFIG, "password": PHRASE, "pki": PKI}
+
+
+class LiveCredentialTests(WorkflowShellTests):
+    def unpack(self, value: str) -> subprocess.CompletedProcess[str]:
+        done = self.shell(
+            live_script("Unpack Sigul credentials"),
+            SIGUL_CREDENTIALS=value,
+            GITHUB_OUTPUT=str(self.root / "output"),
+        )
+        self.addCleanup(self.assertNotIn, "Traceback", done.stdout + done.stderr)
+        return done
+
+    def assert_refused(self, value: str, *secrets: str) -> None:
+        done = self.unpack(value)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("::error::", done.stdout + done.stderr)
+        self.assertFalse((self.root / "output").exists())
+        for secret in (PHRASE, CONFIG, PKI, *secrets):
+            self.assertNotIn(secret, done.stdout + done.stderr)
+
+    def test_valid_document_writes_every_field(self) -> None:
+        done = self.unpack(credentials(**VALID))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(
+            (self.root / "output").read_text(),
+            f"config={CONFIG}\npassword={PHRASE}\npki={PKI}\n",
+        )
+        for value in VALID.values():
+            self.assertIn(f"::add-mask::{value}\n", done.stdout)
+
+    def test_line_wrapped_base64_is_accepted(self) -> None:
+        wrapped = "\n".join(textwrap.wrap(credentials(**VALID), 76))
+        done = self.unpack(wrapped)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_every_field_is_masked_before_any_output_is_written(self) -> None:
+        # An unwritable output file fails at the write; the masks must be out.
+        done = self.shell(
+            live_script("Unpack Sigul credentials"),
+            SIGUL_CREDENTIALS=credentials(**VALID),
+            GITHUB_OUTPUT=str(self.root / "missing" / "output"),
+        )
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        for value in VALID.values():
+            self.assertIn(f"::add-mask::{value}\n", done.stdout)
+
+    def test_non_base64_is_refused(self) -> None:
+        self.assert_refused(f"!{PHRASE}!")
+
+    def test_non_json_is_refused(self) -> None:
+        text = base64.b64encode(f"not json {PHRASE}".encode()).decode()
+        self.assert_refused(text)
+
+    def test_unsupported_versions_are_refused(self) -> None:
+        for version in (None, 0, 2, "1"):
+            with self.subTest(version=version):
+                self.assert_refused(credentials(**{**VALID, "version": version}))
+
+    def test_missing_empty_or_multi_line_fields_are_refused(self) -> None:
+        for key in VALID:
+            for value in (None, "", 7, f"{PHRASE}\nsecond", f"{PHRASE}\rsecond"):
+                with self.subTest(key=key, value=value):
+                    fields: dict[str, object] = {**VALID, key: value}
+                    if value is None:
+                        del fields[key]
+                    done = self.unpack(credentials(**fields))
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertIn(f"SIGUL_CREDENTIALS.{key}", done.stderr)
+                    self.assertFalse((self.root / "output").exists())
+                    for secret in VALID.values():
+                        self.assertNotIn(secret, done.stderr)
+
+    def test_percent_escapes_are_masked_literally(self) -> None:
+        # The runner percent-decodes command data, so "%25" in the mask
+        # must arrive as "%2525" to register the value itself.
+        phrase = "prefix:%25suffix"
+        done = self.unpack(credentials(**{**VALID, "password": phrase}))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("::add-mask::prefix:%2525suffix\n", done.stdout)
+        self.assertNotIn(f"::add-mask::{phrase}\n", done.stdout)
+        self.assertEqual(
+            (self.root / "output").read_text(),
+            f"config={CONFIG}\npassword={phrase}\npki={PKI}\n",
+        )
+
+
+def bound_port(sock: socket.socket) -> int:
+    """Return the port an IPv4 socket is bound to."""
+    _, port = cast(tuple[str, int], sock.getsockname())
+    return port
+
+
+class LiveBridgePinTests(WorkflowShellTests):
+    def pin(self, host: str, port: int) -> subprocess.CompletedProcess[str]:
+        done = self.shell(
+            live_script("Pin the bridge address"),
+            BRIDGE_HOST=host,
+            BRIDGE_PORT=str(port),
+            GITHUB_OUTPUT=str(self.root / "output"),
+        )
+        self.addCleanup(self.assertNotIn, "Traceback", done.stdout + done.stderr)
+        return done
+
+    def closed_port(self) -> int:
+        """Return a loopback port nothing listens on."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return bound_port(probe)
+
+    def test_first_accepting_address_is_pinned(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(4)
+            done = self.pin("localhost", bound_port(listener))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual((self.root / "output").read_text(), "address=127.0.0.1\n")
+        self.assertIn("::notice::Pinned localhost to 127.0.0.1", done.stdout)
+
+    def test_no_accepting_address_fails(self) -> None:
+        done = self.pin("localhost", self.closed_port())
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("::error::", done.stdout + done.stderr)
+        self.assertIn("127.0.0.1", done.stdout + done.stderr)
+        self.assertFalse((self.root / "output").exists())
+
+    def test_a_name_the_resolver_rejects_fails(self) -> None:
+        # glibc refuses a name with a space before any lookup, so this
+        # stays off the network on every runner.
+        done = self.pin("bad name.invalid", self.closed_port())
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("::error::", done.stdout + done.stderr)
+        self.assertIn("bad name.invalid", done.stdout + done.stderr)
+        self.assertFalse((self.root / "output").exists())
+
+
+# The configuration check's environment when the project is fully set up.
+COMPLETE_PROJECT = {
+    "PROJECT": "opensearch",
+    "CONTAINER": "modern",
+    "HAVE_CREDENTIALS": "true",
+    "SIGUL_KEY": "synthetic-key",
+    "BRIDGE_HOST": "sigul-bridge.opensearch.org",
+}
+
+
+class LiveProjectConfigurationTests(WorkflowShellTests):
+    def check(self, **env: str) -> subprocess.CompletedProcess[str]:
+        return self.shell(
+            live_script("Check the project configuration"),
+            **{**COMPLETE_PROJECT, **env},
+        )
+
+    def test_complete_configuration_passes(self) -> None:
+        for container in ("legacy", "modern"):
+            with self.subTest(container=container):
+                done = self.check(CONTAINER=container)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_each_missing_item_fails_and_is_named(self) -> None:
+        for variable, value, item in (
+            ("CONTAINER", "", "container"),
+            ("CONTAINER", "bespoke", "container"),
+            ("HAVE_CREDENTIALS", "false", "SIGUL_CREDENTIALS"),
+            ("SIGUL_KEY", "", "SIGUL_KEY"),
+            ("SIGUL_KEY", " ", "SIGUL_KEY"),
+            ("BRIDGE_HOST", "", "SIGUL_URI"),
+        ):
+            with self.subTest(variable=variable, value=value):
+                done = self.check(**{variable: value})
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("::error::", done.stdout)
+                self.assertIn(item, done.stdout)
+
+    def test_every_missing_item_is_named_in_one_error(self) -> None:
+        done = self.check(
+            CONTAINER="", HAVE_CREDENTIALS="false", SIGUL_KEY="", BRIDGE_HOST=""
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        errors = [line for line in done.stdout.splitlines() if "::error::" in line]
+        self.assertEqual(len(errors), 1, done.stdout)
+        for item in ("container", "SIGUL_CREDENTIALS", "SIGUL_KEY", "SIGUL_URI"):
+            self.assertIn(item, errors[0])
+
+
+LIVE_SOURCE = (REPOSITORY / ".github" / "workflows" / "live-signing.yaml").read_text()
+
+
+class LiveSigningWiringTests(unittest.TestCase):
+    def test_signing_uses_the_unpacked_credentials_and_the_pin(self) -> None:
+        step = named_step(LIVE_STEPS, "Sign with Sigul")
+        for line in (
+            "container: ${{ env.CONTAINER }}",
+            "allow-legacy: ${{ env.CONTAINER == 'legacy' }}",
+            "sigul-key-name: ${{ vars.SIGUL_KEY }}",
+            "sigul-conf: ${{ steps.creds.outputs.config }}",
+            "sigul-pass: ${{ steps.creds.outputs.password }}",
+            "sigul-pki: ${{ steps.creds.outputs.pki }}",
+            "sigul-ip: ${{ steps.pin.outputs.address }}",
+            "sigul-uri: ${{ env.BRIDGE_HOST }}",
+            'sigul-hosts-entry: "true"',
+        ):
+            with self.subTest(line=line):
+                self.assertRegex(step, rf"(?m)^          {re.escape(line)}$")
+
+    def test_retired_secrets_and_inputs_are_gone(self) -> None:
+        for retired in (
+            "secrets.SIGUL_CONF",
+            "secrets.SIGUL_PASS",
+            "secrets.SIGUL_PKI",
+            "secrets.SIGUL_IP",
+            "secrets.SIGUL_URI",
+            "secrets.SIGUL_KEY",
+            "inputs.container",
+            "inputs.allow-legacy",
+            "sigul-${{",
+        ):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, LIVE_SOURCE)
+
+    def test_job_runs_in_the_selected_project_environment(self) -> None:
+        self.assertRegex(
+            LIVE_SOURCE, r"(?m)^    environment: \$\{\{ inputs\.project \}\}$"
+        )
+        self.assertRegex(
+            LIVE_SOURCE,
+            r"(?m)^      project:\n(?:        .*\n)*?"
+            + r'        options: \["onap", "opendaylight", "o-ran-sc", "opensearch"\]$',
+        )
 
 
 class ValidationAssertionTests(WorkflowShellTests):

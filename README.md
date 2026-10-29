@@ -678,19 +678,36 @@ layers:
 ### Live signing
 
 Run `.github/workflows/live-signing.yaml` by hand to test real infrastructure
-with a throwaway file or a local tag that it never pushes. `dry-run` defaults
-to `true`; `allow-legacy` defaults to `false`. Set the latter to `true` under
-the approved exception for any built-in legacy run, including a dry run.
+with a throwaway file or a local tag that it never pushes. Dispatch it from
+`main` with a `project` (`onap`, `opendaylight`, `o-ran-sc` or `opensearch`),
+an `operation` and `dry-run`, which defaults to `true`.
 
-Before dispatching, create and protect `sigul-legacy` or `sigul-modern` as
-described in the production prerequisites. Configure the credentials listed
-in the workflow's opening comment. The checked-in workflow does not create
-reviewer or ref-protection rules.
+Each project has its own GitHub environment, named after it, which admits the
+`main` branch and no other. Protect it as described in the production prerequisites;
+the checked-in workflow does not create reviewer or ref-protection rules. The
+workflow's opening comment lists what each environment holds:
 
-- **Set `SIGUL_URI` for this workflow** as a GitHub environment secret or
-  variable, even for dry runs. It must identify one approved bridge for the
-  selected infrastructure and match `bridge-hostname` in the effective
-  client configuration. `SIGUL_IP` remains optional for a hosts entry.
+- **The secret `SIGUL_CREDENTIALS`**: base64 of a compact JSON document
+  carrying `version` 1, the base64 `config`, the one-line `password` and the
+  base64 armoured `pki`. The workflow masks every field before passing it on.
+- **The variables `SIGUL_KEY` and `SIGUL_URI`**, even for dry runs. The
+  workflow names every missing item in one error. `SIGUL_URI` is the bridge
+  host name without a port; it must identify one approved bridge for the
+  project's client and match `bridge-hostname` in the effective client
+  configuration.
+- **The client** comes from the repository variable `SIGUL_LIVE_PROJECTS`, a
+  JSON object keyed by project whose `container` is `legacy` or `modern`.
+  Listing a project as `legacy` records its approved unsupported-client
+  exception, so the workflow sets `allow-legacy` for it, dry runs included.
+  This workflow ignores the object's `enabled` flag.
+- **Sigul's client fails on a bridge name that resolves to more than one
+  address**
+  ([sigul-docker-k8s#102](https://github.com/lfreleng-actions/sigul-docker-k8s/issues/102)).
+  Until the action handles this itself
+  ([#32](https://github.com/lfreleng-actions/sigul-sign-action/issues/32)),
+  the workflow pins the name to the first address that accepts a TCP
+  connection on port 44334 and passes it to the action as a hosts entry. That
+  check connects to the bridge even in a dry run.
 - The inline harden-runner policy blocks egress except for that selected
   bridge on port 44334, the selected image registry's endpoints and GitHub
   checkout over HTTPS. It does not enable all bridges or unrelated
