@@ -257,7 +257,6 @@ def harden_runner_allowlist() -> str:
 
 
 class LiveAllowlistTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_allowlist_is_one_expression(self) -> None:
         # harden-runner's agent splits allowed-endpoints on spaces only. A
         # folded block keeps the line breaks around its indented
