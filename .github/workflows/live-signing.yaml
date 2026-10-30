@@ -107,25 +107,31 @@ jobs:
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
+          # One expression, so the list reaches the agent as a single
+          # line: it splits entries on spaces only, and the line breaks a
+          # folded block keeps around continuation lines fuse neighbours
+          # into one entry, leaving the bridge off the list.
           allowed-endpoints: >-
-            github.com:443
-            ${{ env.CONTAINER == 'modern' &&
-                'ghcr.io:443 pkg-containers.githubusercontent.com:443' || '' }}
-            ${{ env.CONTAINER == 'legacy' &&
-                'auth.docker.io:443 registry-1.docker.io:443' || '' }}
-            ${{ env.CONTAINER == 'legacy' &&
-                'production.cloudflare.docker.com:443' || '' }}
-            ${{ env.CONTAINER == 'legacy' &&
-                'production.cloudfront.docker.com:443' || '' }}
-            ${{ env.CONTAINER == 'legacy' &&
-                (env.BRIDGE_HOST ==
-                  'sigul-bridge-yul.linuxfoundation.org' ||
-                 env.BRIDGE_HOST ==
-                  'sigul-bridge-us-west-2.linuxfoundation.org') &&
-                format('{0}:44334', env.BRIDGE_HOST) || '' }}
-            ${{ env.CONTAINER == 'modern' &&
-                env.BRIDGE_HOST == 'sigul-bridge.opensearch.org' &&
-                'sigul-bridge.opensearch.org:44334' || '' }}
+            ${{ format('{0} {1} {2} {3} {4} {5} {6}',
+                'github.com:443',
+                env.CONTAINER == 'modern' &&
+                  'ghcr.io:443 pkg-containers.githubusercontent.com:443' ||
+                  '',
+                env.CONTAINER == 'legacy' &&
+                  'auth.docker.io:443 registry-1.docker.io:443' || '',
+                env.CONTAINER == 'legacy' &&
+                  'production.cloudflare.docker.com:443' || '',
+                env.CONTAINER == 'legacy' &&
+                  'production.cloudfront.docker.com:443' || '',
+                env.CONTAINER == 'legacy' &&
+                  (env.BRIDGE_HOST ==
+                    'sigul-bridge-yul.linuxfoundation.org' ||
+                   env.BRIDGE_HOST ==
+                    'sigul-bridge-us-west-2.linuxfoundation.org') &&
+                  format('{0}:44334', env.BRIDGE_HOST) || '',
+                env.CONTAINER == 'modern' &&
+                  env.BRIDGE_HOST == 'sigul-bridge.opensearch.org' &&
+                  'sigul-bridge.opensearch.org:44334' || '') }}
 
       - name: "Checkout repository"
         # yamllint disable-line rule:line-length

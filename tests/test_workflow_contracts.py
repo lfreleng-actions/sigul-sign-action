@@ -245,6 +245,51 @@ class ExpectedBridgeContractTests(unittest.TestCase):
         )
 
 
+def harden_runner_allowlist() -> str:
+    """The live workflow's allowed-endpoints value, as written in YAML."""
+    step = named_step(LIVE_STEPS, "Harden runner (block)")
+    found = re.search(
+        r"(?m)^          allowed-endpoints: >-\n((?:            .*\n)+)", step
+    )
+    if found is None:
+        raise ValueError("Expected a folded allowed-endpoints block")
+    return found[1]
+
+
+class LiveAllowlistTests(unittest.TestCase):
+    def test_allowlist_is_one_expression(self) -> None:
+        # harden-runner's agent splits allowed-endpoints on spaces only. A
+        # folded block keeps the line breaks around its indented
+        # continuation lines, so separate lines reach the agent joined by
+        # newlines and fuse into one entry: the bridge was blocked and
+        # resolved to a sinkhole address. A single expression yields one
+        # line, whatever its source layout.
+        block = harden_runner_allowlist().strip()
+        self.assertTrue(
+            block.startswith("${{")
+            and block.endswith("}}")
+            and block.count("${{") == 1,
+            block,
+        )
+
+    def test_allowlist_names_every_endpoint(self) -> None:
+        block = harden_runner_allowlist()
+        for endpoint in (
+            "github.com:443",
+            "ghcr.io:443",
+            "pkg-containers.githubusercontent.com:443",
+            "auth.docker.io:443",
+            "registry-1.docker.io:443",
+            "production.cloudflare.docker.com:443",
+            "production.cloudfront.docker.com:443",
+            "sigul-bridge-yul.linuxfoundation.org",
+            "sigul-bridge-us-west-2.linuxfoundation.org",
+            "sigul-bridge.opensearch.org:44334",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, block)
+
+
 class LiveBridgeSelectionTests(WorkflowShellTests):
     def test_existing_allowlist_accepts_only_the_selected_infrastructure(self) -> None:
         script = shell_body(named_step(LIVE_STEPS, "Check the selected bridge"))
