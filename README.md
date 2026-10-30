@@ -85,12 +85,15 @@ builds them. Dependabot proposes release updates after a seven-day cooldown;
 the test workflow exercises the proposed images, not real-server signing.
 Neither pinning nor a passing smoke test certifies their dependencies.
 
-As of **9 October 2026**, the modern pin is `v2.6.2`, with digest
-`sha256:f6ff1c879f9c2fd9f9f6ff3ffc41bdbb6a9a682ffb65033bb22b5fc816fab2dd`.
-That release ships `openssl-libs` 3.5.9 and Python 3.14.8, and removes pip,
-whose vendored `urllib3` no pip release had fixed. Its build provenance
-verifies against that index digest, which fixes both the `linux/amd64` and
-`linux/arm64` images, and Grype and Trivy rescans of each reported no finding.
+As of **30 October 2026**, the modern pin is `v2.6.7`, with digest
+`sha256:c1e513281090b5b2d1db8ed3ea03ac3f76850f0b68aa1217d54f89e0fde08610`.
+That release ships `openssl-libs` 3.5.9 and Python 3.14.8, and no pip, whose
+vendored `urllib3` no pip release had fixed. Its client also connects to a
+bridge name with more than one address
+([sigul-docker-k8s#102](https://github.com/lfreleng-actions/sigul-docker-k8s/issues/102)).
+Its build provenance verifies against that index digest, which fixes both the
+`linux/amd64` and `linux/arm64` images. Grype and Trivy rescans of each
+reported no finding, and neither image had a Fedora security update pending.
 A clean scan proves nothing beyond the day it ran, so every later digest update
 needs the same review and rescan.
 
@@ -629,7 +632,7 @@ bundled override and before a connection attempt.
 ### Production prerequisites
 
 - Use a reviewed [client image](#choosing-the-sigul-client). The modern
-  `v2.6.2` digest has passed review and rescan; repeat both for every later
+  `v2.6.7` digest has passed review and rescan; repeat both for every later
   digest update and for any bespoke image. Legacy use instead requires the
   documented unsupported-client exception, owner, retirement date and
   isolated runner; that exception does not resolve dependency findings.
@@ -700,14 +703,14 @@ workflow's opening comment lists what each environment holds:
   Listing a project as `legacy` records its approved unsupported-client
   exception, so the workflow sets `allow-legacy` for it, dry runs included.
   This workflow ignores the object's `enabled` flag.
-- **Sigul's client fails on a bridge name that resolves to more than one
-  address**
+- **The legacy Sigul client fails on a bridge name that resolves to more than
+  one address**, as the modern one did before `v2.6.7`
   ([sigul-docker-k8s#102](https://github.com/lfreleng-actions/sigul-docker-k8s/issues/102)).
   Until the action handles this itself
   ([#32](https://github.com/lfreleng-actions/sigul-sign-action/issues/32)),
-  the workflow pins the name to the first address that accepts a TCP
-  connection on port 44334 and passes it to the action as a hosts entry. That
-  check connects to the bridge even in a dry run.
+  the workflow pins the name, for either client, to the first address that
+  accepts a TCP connection on port 44334 and passes it to the action as a
+  hosts entry. That check connects to the bridge even in a dry run.
 - The inline harden-runner policy blocks egress except for that selected
   bridge on port 44334, the selected image registry's endpoints and GitHub
   checkout over HTTPS. It does not enable all bridges or unrelated

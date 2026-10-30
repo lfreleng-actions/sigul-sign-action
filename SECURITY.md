@@ -86,8 +86,8 @@ upstream publication of a fixed image; source fixes or draft releases alone
 do not update a pinned image. The unsupported legacy client's end-of-life
 dependencies are an exception to that update commitment.
 
-As of 9 October 2026, the modern pin is `v2.6.2`, which carries the OpenSSL
-fix and no longer ships pip or its vendored urllib3. Tracking the latest
+As of 30 October 2026, the modern pin is `v2.6.7`, which carries the OpenSSL
+fix and ships neither pip nor its vendored urllib3. Tracking the latest
 action release still does not establish dependency remediation on its own:
 each pin update needs a digest review and rescan. See the [client-image status
 in the README](README.md#choosing-the-sigul-client) for the current pin and
