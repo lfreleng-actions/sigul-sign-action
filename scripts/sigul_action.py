@@ -155,9 +155,11 @@ def report_plan(plan: Plan) -> None:
             info(f"  {target.name}")
         if len(plan.targets) > LISTING_LIMIT:
             info(f"  … and {len(plan.targets) - LISTING_LIMIT} more")
-    else:
+    elif plan.sign_type == "sign-git-tag":
         action = "sign and push" if plan.push_tag else "sign"
         info(f"Tag to {action}: {plan.tag}")
+    else:
+        info("Connection check: retrieves the signing key's public key; signs nothing")
     if plan.dry_run:
         info("Dry run: checks everything, signs nothing")
 

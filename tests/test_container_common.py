@@ -47,6 +47,14 @@ stop_process_group = cast(
 # kill of the whole group ends it.
 READER = "import sys; sys.stdin.read(); sys.exit(3)"
 HANG = "import sys, time; sys.stdin.read(); time.sleep(60)"
+# Prints its argument as the reply, then exits 0; or keeps printing,
+# 64 KiB at a time, for as long as anything reads, as a reply with no
+# end would.
+PRINTER = "import sys; sys.stdin.read(); sys.stdout.write(sys.argv[1])"
+FLOOD = (
+    "import sys; sys.stdin.read()\n"
+    + "while True:\n    sys.stdout.write('x' * 65536); sys.stdout.flush()"
+)
 GRANDCHILD = "import os, time; open(os.environ['MARKER'], 'w').close(); time.sleep(60)"
 HANG_IN_CHILD = (
     "import subprocess, sys; sys.stdin.read(); "
@@ -223,6 +231,52 @@ class CallWithPasswordTests(unittest.TestCase):
         self.assertTrue(marker.exists(), "the grandchild never started")
         grandchild = int(marker.read_text())
         self.assertFalse(is_running(grandchild), "the grandchild outlived the stop")
+
+
+class CappedOutputTests(unittest.TestCase):
+    """call_with_password with stdout to a file, capped at a byte count."""
+
+    @staticmethod
+    def too_large() -> int:
+        """The status for an over-cap reply, looked up when a test runs."""
+        return cast(int, vars(container_common)["TOO_LARGE"])
+
+    def call(self, script: str, *args: str, limit: int = 1024) -> tuple[int, bytes]:
+        root = scratch(self)
+        password = root / "password"
+        _ = password.write_bytes(b"secret\0\n")
+        output = root / "reply"
+        capped = cast(
+            Callable[..., int],
+            container_common.call_with_password,
+        )
+        with output.open("wb") as handle:
+            status = capped(
+                [sys.executable, "-c", script, *args],
+                str(password),
+                30,
+                stdout=handle,
+                limit=limit,
+            )
+        return status, output.read_bytes()
+
+    def test_a_reply_within_the_cap_passes_through(self) -> None:
+        status, written = self.call(PRINTER, "a" * 1024)
+        self.assertEqual(status, 0)
+        self.assertEqual(written, b"a" * 1024)
+
+    def test_a_reply_over_the_cap_is_stopped_while_it_streams(self) -> None:
+        # The client never ends of its own accord, so only the cap,
+        # enforced while the reply arrives, can stop it in time.
+        started = time.time()
+        status, written = self.call(FLOOD, limit=4096)
+        self.assertEqual(status, self.too_large())
+        self.assertLessEqual(len(written), 4096)
+        self.assertLess(time.time() - started, 15)
+
+    def test_one_byte_over_the_cap_is_refused(self) -> None:
+        status, _written = self.call(PRINTER, "a" * 1025)
+        self.assertEqual(status, self.too_large())
 
 
 if __name__ == "__main__":

@@ -21,7 +21,6 @@ import secrets
 import shutil
 import stat
 import sys
-import tempfile
 from pathlib import Path
 
 from action_common import (
@@ -50,6 +49,8 @@ from client_container import (
 from git_tag import SigningRepository, workspace_git_dir, write_tag_ref
 from gpg_bundle import kill_gpg_agent
 from prepare_credentials import prepare
+from private_storage import SHARED_MEMORY, private_directory
+from public_key import check_connection
 from termination import defer_termination
 
 # A dry run does no signing, so it has no business running long; a
@@ -57,39 +58,6 @@ from termination import defer_termination
 DRY_RUN_TIMEOUT_SECONDS = 600
 
 SUMMARY_FILE_LIMIT = 50
-
-# Prefer tmpfs over persistent storage. Swap, crash dumps, and a lost
-# runner still prevent an unconditional memory-only/erasure guarantee.
-SHARED_MEMORY = "/dev/shm"
-
-
-def is_memory_backed(path: str) -> bool:
-    """Return True when path is itself a tmpfs mount, per /proc/mounts.
-
-    Without a readable mount table, which is Linux's, nothing is known
-    to be in memory.
-    """
-    table = Path("/proc/mounts")
-    if not table.is_file():
-        return False
-    for line in table.read_text(encoding="utf-8", errors="replace").splitlines():
-        fields = line.split()
-        if len(fields) >= 3 and fields[1] == path and fields[2] == "tmpfs":
-            return True
-    return False
-
-
-def private_directory(prefix: str, fallback: str | None) -> Path:
-    """Create a mode-0700 temporary directory, in memory where possible.
-
-    tmpfs avoids ordinary persistent writes but can be swapped. Its
-    short path also fits gpg-agent sockets. Without a usable tmpfs,
-    fall back to the supplied directory and overwrite files on cleanup;
-    that cannot erase older CoW, journal, snapshot, or crash-dump copies.
-    """
-    if is_memory_backed(SHARED_MEMORY) and os.access(SHARED_MEMORY, os.W_OK):
-        return Path(tempfile.mkdtemp(prefix=prefix, dir=SHARED_MEMORY))
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=fallback))
 
 
 def clear_stale_signatures(plan: Plan) -> None:
@@ -394,7 +362,9 @@ def sign(plan: Plan, values: dict[str, str]) -> None:
         run = ContainerRun(plan, pulled, prepared, creds, name, user, selinux)
         if plan.sign_type == "sign-data":
             sign_data(run)
-        else:
+        elif plan.sign_type == "sign-git-tag":
             sign_git_tag(run, work, values["GH_KEY"])
+        else:
+            check_connection(run, gnupg)
     finally:
         cleanup(work, gnupg, name)

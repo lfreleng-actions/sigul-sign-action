@@ -11,12 +11,23 @@ import unittest
 from tests.helpers import REPOSITORY, scratch
 
 PASSPHRASE = b"sigul-test-passphrase"
+SIGN_DATA = (
+    "--batch",
+    "sign-data",
+    "-a",
+    "-o",
+    "payload.asc",
+    "--",
+    "test-key",
+    "payload",
+)
+GET_PUBLIC_KEY = ("--batch", "get-public-key", "--", "test-key")
 
 
 def mock_precheck() -> str:
     """Stop before global retry state or signing side effects."""
     source = (REPOSITORY / "tests" / "mock-sigul").read_text()
-    precheck, boundary, _ = source.partition('\nstate="/tmp/mock-sigul-state"')
+    precheck, boundary, _ = source.partition('\nstate="${MOCK_STATE:-')
     if not boundary:
         raise ValueError("Cannot isolate mock-sigul's stdin precheck")
     return precheck
@@ -27,23 +38,12 @@ PRECHECK = mock_precheck()
 
 
 class MockPassphraseTests(unittest.TestCase):
-    def precheck(self, payload: bytes) -> subprocess.CompletedProcess[bytes]:
+    def precheck(
+        self, payload: bytes, arguments: tuple[str, ...] = SIGN_DATA
+    ) -> subprocess.CompletedProcess[bytes]:
         root = scratch(self)
         return subprocess.run(
-            [
-                "/bin/sh",
-                "-c",
-                PRECHECK,
-                "mock-sigul",
-                "--batch",
-                "sign-data",
-                "-a",
-                "-o",
-                "payload.asc",
-                "--",
-                "test-key",
-                "payload",
-            ],
+            ["/bin/sh", "-c", PRECHECK, "mock-sigul", *arguments],
             input=payload,
             cwd=root,
             env={
@@ -105,6 +105,31 @@ class MockPassphraseTests(unittest.TestCase):
 
     def test_additional_newline_after_complete_frame_is_rejected(self) -> None:
         self.assert_bad_framing(PASSPHRASE + b"\0\n\n")
+
+    def test_get_public_key_checks_the_passphrase_as_sign_data_does(self) -> None:
+        done = self.precheck(PASSPHRASE + b"\0\n", GET_PUBLIC_KEY)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        for payload in (b"wrong-passphrase\0\n", PASSPHRASE, PASSPHRASE + b"\0"):
+            with self.subTest(payload=payload):
+                done = self.precheck(payload, GET_PUBLIC_KEY)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+
+    def test_get_public_key_refuses_the_password_option(self) -> None:
+        # --password would send the account password, not the key
+        # passphrase, and prove nothing about access to the key.
+        arguments = ("--batch", "get-public-key", "--password", "--", "test-key")
+        done = self.precheck(PASSPHRASE + b"\0\n", arguments)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+
+    def test_get_public_key_takes_exactly_one_key(self) -> None:
+        for arguments in (
+            ("--batch", "get-public-key", "--"),
+            ("--batch", "get-public-key", "--", "test-key", "extra"),
+            ("--batch", "get-public-key", "-o", "out", "--", "test-key"),
+        ):
+            with self.subTest(arguments=arguments):
+                done = self.precheck(PASSPHRASE + b"\0\n", arguments)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
 
 
 if __name__ == "__main__":

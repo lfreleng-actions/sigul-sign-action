@@ -23,6 +23,9 @@
 #                   local registry and named as a bespoke image, which
 #                   exercises signatures, ownership, retries and the
 #                   tag write-back;
+#                 - connection checks in the same test image, which
+#                   returns a throwaway public key in place of the
+#                   server's;
 #                 - credentials that must be refused.
 #
 # The pinned images are read from containers/*/Dockerfile, so a
@@ -282,7 +285,8 @@ jobs:
           tests/make-test-credentials.sh "${image}" "${PLATFORM}" \
             "${creds}" "${LAYOUT}" "${DB_TYPE}"
           mock="$(tests/build-mock-image.sh "${image}" "${PLATFORM}" \
-            localhost:5000 "sigul-mock-${CONTAINER}")"
+            localhost:5000 "sigul-mock-${CONTAINER}" \
+            "${creds}/public-key.asc")"
           delimiter="EOF_$(openssl rand -hex 16)"
           {
             echo "pin=${image}"
@@ -295,6 +299,11 @@ jobs:
             cat "${creds}/pki.asc"
             echo "${delimiter}"
             echo "passphrase=$(cat "${creds}/passphrase")"
+            echo "alternate_pki<<${delimiter}"
+            cat "${creds}/alternate-pki.asc"
+            echo "${delimiter}"
+            echo "alternate_passphrase=$(cat "${creds}/alternate-passphrase")"
+            echo "fingerprints=$(cat "${creds}/public-key-fingerprints")"
           } >> "$GITHUB_OUTPUT"
 
       - name: "Make the workspace fixtures"
@@ -547,6 +556,124 @@ jobs:
               fail "credentials were left in ${where}"
           done
           echo "Signatures, ownership and the signed tag are correct ✅"
+
+      # --- Connection checks, with the mock client image ---
+      #
+      # The mock fails each container's first get-public-key, so the
+      # check that passes has retried.
+
+      - name: "Check the connection with the mock client"
+        id: check_connection
+        uses: $/
+        with:
+          expected-bridge: "sigul-bridge.test:44334"
+          allow-legacy: "true"
+          container-image: ${{ steps.setup.outputs.mock_image }}
+          container-digest: ${{ steps.setup.outputs.mock_digest }}
+          sign-type: "check-connection"
+          retry-delay: "0"
+          sigul-hosts-entry: "true"
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      # The alternate bundle holds the same archive as the main one,
+      # encrypted with a passphrase the mock client refuses. A dry run
+      # decrypts it and opens the NSS database, but never hands the
+      # passphrase to the client, so it passes. The wrong-passphrase
+      # check below then gets past the runner's decryption and can only
+      # fail at the client's passphrase check.
+      - name: "Dry run with the alternate bundle"
+        id: alternate_dry_run
+        uses: $/
+        with:
+          expected-bridge: "sigul-bridge.test:44334"
+          allow-legacy: "true"
+          container: ${{ matrix.container }}
+          sign-object: "e2e/dist"
+          sigul-hosts-entry: ${{ matrix.hosts_entry }}
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          dry-run: "true"
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.alternate_passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.alternate_pki }}
+
+      - name: "Check the connection with a wrong passphrase (should fail)"
+        id: check_wrong_passphrase
+        continue-on-error: true
+        uses: $/
+        with:
+          allow-legacy: "true"
+          container-image: ${{ steps.setup.outputs.mock_image }}
+          container-digest: ${{ steps.setup.outputs.mock_digest }}
+          sign-type: "check-connection"
+          max-retries: "2"
+          retry-delay: "0"
+          sigul-hosts-entry: "true"
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.alternate_passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.alternate_pki }}
+
+      - name: "Check the connection in a dry run (should fail)"
+        id: check_dry_run
+        continue-on-error: true
+        uses: $/
+        with:
+          allow-legacy: "true"
+          container-image: ${{ steps.setup.outputs.mock_image }}
+          container-digest: ${{ steps.setup.outputs.mock_digest }}
+          sign-type: "check-connection"
+          dry-run: "true"
+          sigul-hosts-entry: "true"
+          sigul-ip: ${{ env.BRIDGE_ADDRESS }}
+          sigul-uri: ${{ env.BRIDGE_NAME }}
+          sigul-key-name: "test-key"
+          sigul-conf: ${{ steps.setup.outputs.conf }}
+          sigul-pass: ${{ steps.setup.outputs.passphrase }}
+          sigul-pki: ${{ steps.setup.outputs.pki }}
+
+      - name: "Assert the connection checks"
+        shell: bash
+        env:
+          EXPECTED: ${{ steps.setup.outputs.fingerprints }}
+          FINGERPRINTS: >-
+            ${{ steps.check_connection.outputs.public_key_fingerprints }}
+          COUNT: ${{ steps.check_connection.outputs.signed_count }}
+          DATA_FINGERPRINTS: >-
+            ${{ steps.sign_data.outputs.public_key_fingerprints }}
+          WRONG_PASSPHRASE: ${{ steps.check_wrong_passphrase.outcome }}
+          ALTERNATE_DRY_RUN: ${{ steps.alternate_dry_run.outcome }}
+          DRY_RUN: ${{ steps.check_dry_run.outcome }}
+          DRY_RUN_STATUS: >-
+            ${{ steps.check_dry_run.outputs.validation_status }}
+        run: |
+          set -euo pipefail
+          fail() { echo "ERROR: $* ❌"; exit 1; }
+          [ -n "${EXPECTED}" ] || fail "the test key has no fingerprints"
+          [ "${FINGERPRINTS}" = "${EXPECTED}" ] ||
+            fail "public_key_fingerprints is '${FINGERPRINTS}'," \
+              "not '${EXPECTED}'"
+          [ "${COUNT}" = "0" ] || fail "signed_count is ${COUNT}, not 0"
+          [ -z "${DATA_FINGERPRINTS}" ] ||
+            fail "sign-data reported fingerprints: ${DATA_FINGERPRINTS}"
+          [ "${ALTERNATE_DRY_RUN}" = "success" ] ||
+            fail "the alternate bundle did not decrypt: ${ALTERNATE_DRY_RUN}"
+          [ "${WRONG_PASSPHRASE}" = "failure" ] ||
+            fail "a wrong passphrase passed the connection check"
+          if [ "${DRY_RUN}" != "failure" ] ||
+              [ "${DRY_RUN_STATUS}" != "rejected" ]; then
+            fail "a dry-run connection check was not rejected in" \
+              "validation: ${DRY_RUN}, ${DRY_RUN_STATUS}"
+          fi
+          echo "Connection checks report the key and refuse a dry run ✅"
 
       # --- Credentials that must be refused ---
 

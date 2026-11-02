@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Sign artefacts or a git tag using a Sigul signing server.
+# Sign artefacts or a git tag using a Sigul signing server, or check,
+# signing nothing, that the client reaches it and may use the key.
 #
 # Sigul keeps the private key on a server the client never sees: the
 # client sends data to a bridge, the bridge relays it to the server, and
@@ -26,7 +27,8 @@
 # The work runs in scripts/: action_inputs.py plans and validates (with
 # client_image.py and sign_targets.py), signing.py signs, with
 # prepare_credentials.py (and gpg_bundle.py) and git_tag.py handling
-# the secrets and the tag, client_container.py runs the client, and
+# the secrets and the tag, public_key.py runs the connection check,
+# client_container.py runs the client, and
 # scripts/container/ runs inside it. sigul_action.py is the entry point
 # both steps below call.
 name: "sigul-sign-action"
@@ -35,7 +37,11 @@ description: "Sign artefacts or a git tag using a Sigul signing server"
 inputs:
   # --- The inputs of lfit/sigul-sign-action, unchanged ---
   sign-type:
-    description: "Either 'sign-data' or 'sign-git-tag'"
+    description: >
+      'sign-data', 'sign-git-tag', or 'check-connection', which retrieves
+      the signing key's public key from the server, proving the bridge,
+      the server and the key passphrase's access to the key work, and
+      signs nothing. It does not prove the server can sign.
     required: false
     default: "sign-data"
   sign-object:
@@ -43,8 +49,9 @@ inputs:
       For 'sign-data', the files to sign, one per line: a line containing
       '*' expands as a shell wildcard, and a directory signs every file
       beneath it, less 'exclude-globs'. For 'sign-git-tag', the name of
-      an existing annotated tag.
-    required: true
+      an existing annotated tag. Required for both; must be empty for
+      'check-connection'.
+    required: false
   sigul-ip:
     description: >
       IP address of the Sigul bridge. With sigul-uri, written as a hosts
@@ -145,7 +152,8 @@ inputs:
       pulls the image, decrypts the credentials and has the Sigul client
       load its configuration, NSS database and certificate, resolves the
       bridge, and checks the files or tag. It signs nothing, pushes
-      nothing and changes no file in the workspace.
+      nothing and changes no file in the workspace. It does not contact
+      the bridge; 'check-connection' does, and refuses a dry run.
     required: false
     default: "false"
   exclude-globs:
@@ -190,8 +198,14 @@ outputs:
   signed_count:
     description: >
       Files signed: 0 for 'sign-git-tag', which signs a tag object, and
-      0 for a dry run, which signs nothing.
+      0 for a dry run or 'check-connection', which sign nothing.
     value: ${{ steps.sign.outputs.signed_count }}
+  public_key_fingerprints:
+    description: >
+      For 'check-connection', the fingerprints of the public key the
+      server returned: the primary key's, then each subkey's, upper-case
+      hex separated by single spaces. Empty for the other sign-types.
+    value: ${{ steps.sign.outputs.public_key_fingerprints }}
   container_image:
     description: "The client image used, by digest"
     value: ${{ steps.sign.outputs.container_image }}

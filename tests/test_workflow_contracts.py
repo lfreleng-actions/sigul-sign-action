@@ -619,5 +619,68 @@ class ValidationAssertionTests(WorkflowShellTests):
         self.assert_not_rejected(status="cancelled")
 
 
+TESTING_STEPS = workflow_steps("testing.yaml")
+
+
+def step_inputs(name: str) -> dict[str, str]:
+    """The with: block of a named step, as written, unevaluated."""
+    step = named_step(TESTING_STEPS, name)
+    found = re.search(r"(?m)^        with:\n((?:          .*\n)+)", step)
+    if found is None:
+        raise ValueError(f"Expected a with: block in {name!r}")
+    pairs = (
+        line.strip().split(": ", 1)
+        for line in found[1].splitlines()
+        # Keys only: deeper lines continue a block scalar's value.
+        if not line.startswith(" " * 11) and ": " in line
+    )
+    return {key: value.strip("\"'") for key, value in pairs}
+
+
+WRONG_CHECK = "Check the connection with a wrong passphrase (should fail)"
+ALTERNATE_DRY_RUN = "Dry run with the alternate bundle"
+
+
+class WrongPassphraseWiringTests(unittest.TestCase):
+    """The wrong-passphrase check must fail at the server, not on the runner.
+
+    The action decrypts sigul-pki with sigul-pass before the client
+    runs. With the main bundle and any other passphrase, decryption
+    fails first, and the check passes without exercising the server's
+    passphrase check at all.
+    """
+
+    def test_the_bundle_decrypts_with_the_wrong_passphrase(self) -> None:
+        inputs = step_inputs(WRONG_CHECK)
+        self.assertEqual(
+            inputs["sigul-pki"], "${{ steps.setup.outputs.alternate_pki }}"
+        )
+        self.assertEqual(
+            inputs["sigul-pass"], "${{ steps.setup.outputs.alternate_passphrase }}"
+        )
+
+    def test_a_dry_run_shows_the_alternate_bundle_decrypts(self) -> None:
+        # A dry run decrypts the bundle and opens the NSS database, but
+        # never sends the passphrase to the client, so it passes with
+        # any passphrase that decrypts the bundle.
+        inputs = step_inputs(ALTERNATE_DRY_RUN)
+        self.assertEqual(inputs["dry-run"], "true")
+        self.assertEqual(
+            inputs["sigul-pki"], "${{ steps.setup.outputs.alternate_pki }}"
+        )
+        self.assertEqual(
+            inputs["sigul-pass"], "${{ steps.setup.outputs.alternate_passphrase }}"
+        )
+        check = named_step(TESTING_STEPS, "Assert the connection checks")
+        self.assertIn("steps.alternate_dry_run.outcome", check)
+
+    def test_both_bundles_hold_the_same_archive(self) -> None:
+        # So the only difference between the passing check and the
+        # failing one is the passphrase the server receives.
+        source = (REPOSITORY / "tests" / "make-test-credentials.sh").read_text()
+        self.assertIn("alternate-pki.asc", source)
+        self.assertIn("cmp ", source)
+
+
 if __name__ == "__main__":
     _ = unittest.main()

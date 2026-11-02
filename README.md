@@ -295,11 +295,53 @@ store without writing to it, even when fetching the tag.
 
 A dry run signs nothing, pushes nothing, and changes no workspace files. It
 still decrypts real credentials and runs the selected image, so it requires
-the same trust and isolation as signing. It never connects to the bridge:
+the same trust and isolation as signing. It does **not** contact the bridge:
 a Sigul bridge serves clients through a serial accept loop, and a bare
-connection disturbs it. A non-dry live run with independent signature
-verification must establish bridge/server access, key authorisation and a
-valid returned signature.
+connection disturbs it. To prove the bridge, the server and the key's
+authorisation without signing, use `check-connection` below. A non-dry live
+run with independent signature verification must establish a valid returned
+signature.
+
+### Check the connection
+
+```yaml
+- uses: lfreleng-actions/sigul-sign-action@<commit-sha> # vX.Y.Z
+  id: canary
+  with:
+    container: modern
+    sign-type: check-connection
+    # ... credentials as above, and no sign-object
+- run: echo "Server returned ${{ steps.canary.outputs.public_key_fingerprints }}"
+```
+
+`check-connection` asks the server for the signing key's public key with
+`sigul get-public-key`, and signs nothing. It sends the key passphrase, as
+signing does, never the account password, and the server checks that
+passphrase against the CI user's access to the key. Success proves the
+client reached the bridge, the double-TLS session reached the server, and
+the passphrase still authorises the user's access to the key. That suits a
+scheduled canary, where a real signature with a release key on every run
+would not.
+
+Success does not prove the server can sign. The server answers from the
+key's public half, never touching the secret one, so a missing, expired or
+unusable secret key goes unnoticed. To prove that, sign for real, with a
+key kept for the purpose rather than a release key.
+
+The reply must be a single ASCII-armoured `PGP PUBLIC KEY BLOCK` of at most
+1 MiB. The container stops a longer reply as it streams, and fails at once
+without a retry. The action reads the reply with `gpg --show-keys` in its own
+private GnuPG home, never the runner's keyring, and reports the primary key's
+fingerprint, then each subkey's, as `public_key_fingerprints`. It does not
+compare them with any expected key; a calling workflow that needs to do so
+compares that output.
+
+The container cannot write to the workspace. Retries follow `max-retries`,
+`retry-delay` and `attempt-timeout`, and `expected-bridge` applies as it does
+to signing. `sign-object` must be empty, and validation rejects
+`dry-run: "true"` with `validation_status: rejected`, since a dry run never
+connects. `push-tag: "false"`, `gh-key` and a changed
+`exclude-globs` have no effect, and each draws a notice.
 
 ## Inputs
 
@@ -307,8 +349,8 @@ valid returned signature.
 
 | Name                | Default             | Description                                                                                                  |
 | ------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `sign-type`         | `sign-data`         | `sign-data` or `sign-git-tag`                                                                                |
-| `sign-object`       |                     | **Required.** Files to sign, one per line, or a directory; or the tag to sign                                |
+| `sign-type`         | `sign-data`         | `sign-data`, `sign-git-tag`, or `check-connection` to check the bridge, server and key access                |
+| `sign-object`       |                     | Files to sign, one per line, or a directory; or the tag to sign. Must be empty for `check-connection`        |
 | `sigul-key-name`    |                     | **Required.** Name of the signing key on the server                                                          |
 | `sigul-conf`        |                     | **Required.** Body of the client configuration, `client.conf`, raw or base64                                 |
 | `sigul-pass`        |                     | **Required.** Key passphrase, which also decrypts `sigul-pki`; Sigul gets its first line                     |
@@ -325,7 +367,7 @@ valid returned signature.
 | `sigul-hosts-entry` | `auto`              | `auto` adds the hosts entry for `legacy`; `true` for any container; `false` never                            |
 | `expected-bridge`   | empty               | Require the effective Sigul bridge to match `DNS_HOST:PORT` before connection; empty disables the check      |
 | `push-tag`          | `true`              | Push a signed tag back to the repository                                                                     |
-| `dry-run`           | `false`             | Check local prerequisites without signing or contacting the bridge                                           |
+| `dry-run`           | `false`             | Check local prerequisites without signing or contacting the bridge; refused for `check-connection`           |
 | `exclude-globs`     | `global-jjb`'s list | File name patterns skipped inside a directory                                                                |
 | `max-retries`       | `5`                 | Attempts per signing operation, from 1 to 86400                                                              |
 | `retry-delay`       | `15`                | Seconds between attempts, from 0 to 86400                                                                    |
@@ -348,11 +390,12 @@ omitting them would change what a migrated release publishes.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                | Description                                                                         |
-| ------------------- | ----------------------------------------------------------------------------------- |
-| `validation_status` | Structural validation: `passed`, `rejected`, or empty if validation could not start |
-| `signed_count`      | Files signed on successful completion; `0` for `sign-git-tag` and for a dry run     |
-| `container_image`   | The client image used, by digest                                                    |
+| Name                      | Description                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| `validation_status`       | Structural validation: `passed`, `rejected`, or empty if validation could not start |
+| `signed_count`            | Files signed on success; `0` for `sign-git-tag`, `check-connection` and dry runs    |
+| `public_key_fingerprints` | For `check-connection`, the returned key's fingerprints; empty otherwise            |
+| `container_image`         | The client image used, by digest                                                    |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -671,7 +714,8 @@ layers:
   - signing-control-flow tests inside a pinned image with a mock `sigul`
     added, served from a local registry as a bespoke image. These exercise
     retries, output ownership and tag write-back, not real-server signing
-    or cryptographic verification;
+    or cryptographic verification. The mock also returns a throwaway
+    public key for `check-connection`, whose fingerprints the test compares;
   - credentials the action must refuse;
   - code planted by an earlier step: a `BASH_ENV` file, workspace Python
     modules and impostor tools on the job's `PATH`, which must not run with

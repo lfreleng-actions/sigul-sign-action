@@ -21,6 +21,21 @@
 #
 # Writes OUT_DIR/client.conf, OUT_DIR/pki.asc and OUT_DIR/passphrase.
 # The bridge is named sigul-bridge.test on the default port.
+#
+# Also writes OUT_DIR/alternate-pki.asc and OUT_DIR/alternate-passphrase:
+# the same archive, encrypted with a passphrase the mock client refuses.
+# The action decrypts sigul-pki with sigul-pass before the client runs,
+# so a wrong-passphrase test needs a bundle its passphrase decrypts, or
+# it fails on the runner and never reaches the client's passphrase
+# check. Both bundles are decrypted here and compared, so the passphrase
+# is the only difference between them.
+#
+# Also generates a throwaway OpenPGP key, with one subkey, standing in
+# for the key a Sigul server holds: OUT_DIR/public-key.asc is its
+# armoured public half, which build-mock-image.sh bakes into the mock
+# client for get-public-key, and OUT_DIR/public-key-fingerprints its
+# fingerprints, primary first, as public_key_fingerprints reports them.
+# The secret half never leaves the temporary directory.
 
 set -euo pipefail
 
@@ -40,6 +55,7 @@ case "${db_type}" in
 esac
 
 passphrase="sigul-test-passphrase"
+alternate_passphrase="sigul-alternate-passphrase"
 nss_password="nss-test-password"
 
 mkdir -p "${out}"
@@ -89,5 +105,32 @@ printf '%s\n' "${passphrase}" > "${out}/passphrase"
 gpg --homedir "${build}" --batch --yes --quiet --pinentry-mode loopback \
     --passphrase-file "${out}/passphrase" --armor --symmetric \
     --output "${out}/pki.asc" "${build}/pki.tar.xz"
+printf '%s\n' "${alternate_passphrase}" > "${out}/alternate-passphrase"
+gpg --homedir "${build}" --batch --yes --quiet --pinentry-mode loopback \
+    --passphrase-file "${out}/alternate-passphrase" --armor --symmetric \
+    --output "${out}/alternate-pki.asc" "${build}/pki.tar.xz"
+for bundle in pki alternate-pki; do
+    secret="${out}/passphrase"
+    [ "${bundle}" = pki ] || secret="${out}/alternate-passphrase"
+    gpg --homedir "${build}" --batch --yes --quiet --pinentry-mode loopback \
+        --passphrase-file "${secret}" --decrypt \
+        --output "${build}/${bundle}.check" "${out}/${bundle}.asc"
+    cmp "${build}/pki.tar.xz" "${build}/${bundle}.check"
+done
+
+key_uid="Sigul action test key <sigul-action-test@example.invalid>"
+gpg --homedir "${build}" --batch --quiet --pinentry-mode loopback \
+    --passphrase "" --quick-generate-key "${key_uid}" ed25519 sign never
+primary="$(gpg --homedir "${build}" --batch --with-colons --list-keys |
+    awk -F: '$1 == "fpr" { print $10; exit }')"
+gpg --homedir "${build}" --batch --quiet --pinentry-mode loopback \
+    --passphrase "" --quick-add-key "${primary}" cv25519 encr never
+gpg --homedir "${build}" --batch --armor --export "${primary}" \
+    > "${out}/public-key.asc"
+gpg --homedir "${build}" --batch --with-colons --with-subkey-fingerprint \
+    --list-keys "${primary}" |
+    awk -F: '$1 == "fpr" { print $10 }' | paste -sd ' ' - \
+    > "${out}/public-key-fingerprints"
+gpgconf --homedir "${build}" --kill all
 
 echo "Test credentials (${layout}, ${db_type}) written to ${out}"

@@ -35,8 +35,20 @@ from client_image import (
 from git_tag import check_tag_name, workspace_git_dir
 from sign_targets import SignTarget, plan_sign_data
 
-SIGN_TYPES = ("sign-data", "sign-git-tag")
+SIGN_TYPES = ("sign-data", "sign-git-tag", "check-connection")
 CREDENTIAL_INPUTS = ("sigul-conf", "sigul-pass", "sigul-pki")
+# action.yaml's default for exclude-globs; check-connection notes any
+# other value as unused.
+DEFAULT_EXCLUDE_GLOBS = (
+    "*.asc",
+    "*.md5",
+    "*.sha1",
+    "_maven.repositories",
+    "_remote.repositories",
+    "*.lastUpdated",
+    "maven-metadata.xml",
+    "maven-metadata-local.xml",
+)
 # One day: longer than any job may run, and well inside what sleep and
 # deadline arithmetic accept.
 INTEGER_LIMIT = 86_400
@@ -86,6 +98,11 @@ def parse_int(name: str, raw: str, minimum: int) -> int:
     return number
 
 
+def parse_patterns(raw: str) -> list[str]:
+    """Return the non-blank lines of a newline-separated input, stripped."""
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
 def require_inputs(env: Mapping[str, str]) -> tuple[str, str, str]:
     """Return sign-type, sign-object and sigul-key-name, checking every
     input the legacy action required. Credentials are seen only as
@@ -93,10 +110,17 @@ def require_inputs(env: Mapping[str, str]) -> tuple[str, str, str]:
     sign_type = env.get("SIGN_TYPE", "").strip() or "sign-data"
     if sign_type not in SIGN_TYPES:
         raise InputError(
-            f"sign-type must be 'sign-data' or 'sign-git-tag', got '{sign_type}'"
+            "sign-type must be 'sign-data', 'sign-git-tag' or "
+            + f"'check-connection', got '{sign_type}'"
         )
     sign_object = env.get("SIGN_OBJECT", "")
-    if not sign_object.strip():
+    if sign_type == "check-connection":
+        if sign_object.strip():
+            raise InputError(
+                "Input 'sign-object' must be empty for check-connection, "
+                + "which signs nothing"
+            )
+    elif not sign_object.strip():
         raise InputError("Input 'sign-object' is required")
     key_name = env.get("SIGUL_KEY_NAME", "").strip()
     if not key_name:
@@ -105,6 +129,32 @@ def require_inputs(env: Mapping[str, str]) -> tuple[str, str, str]:
         if env.get("HAVE_" + name.upper().replace("-", "_")) != "true":
             raise InputError(f"Input '{name}' is required")
     return sign_type, sign_object, key_name
+
+
+def check_connection_inputs(
+    env: Mapping[str, str], dry_run: bool, push_tag: bool, messages: Messages
+) -> None:
+    """Refuse a dry run, which never connects, and note the inputs a
+    connection check does not use."""
+    if dry_run:
+        raise InputError(
+            "dry-run: true cannot be used with check-connection: a dry run "
+            + "never contacts the bridge, which is what check-connection "
+            + "proves. It signs nothing, so set dry-run: false"
+        )
+    raw_excludes = env.get("EXCLUDE_GLOBS")
+    unused = (
+        ("push-tag", not push_tag),
+        ("gh-key", env.get("HAVE_GH_KEY") == "true"),
+        (
+            "exclude-globs",
+            raw_excludes is not None
+            and tuple(parse_patterns(raw_excludes)) != DEFAULT_EXCLUDE_GLOBS,
+        ),
+    )
+    for name, supplied in unused:
+        if supplied:
+            messages.notices.append(f"{name} is not used for check-connection")
 
 
 def build_plan(
@@ -159,12 +209,12 @@ def build_plan(
     targets: tuple[SignTarget, ...] = ()
     tag = ""
     if sign_type == "sign-data":
-        excludes = [
-            p.strip() for p in env.get("EXCLUDE_GLOBS", "").splitlines() if p.strip()
-        ]
+        excludes = parse_patterns(env.get("EXCLUDE_GLOBS", ""))
         targets = plan_sign_data(sign_object, workspace, excludes, messages)
         if have_gh_key:
             messages.notices.append("gh-key is not used for sign-data")
+    elif sign_type == "check-connection":
+        check_connection_inputs(env, dry_run, push_tag, messages)
     else:
         tag = sign_object.strip()
         tag_checker(tag)

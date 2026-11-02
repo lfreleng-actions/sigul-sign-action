@@ -46,14 +46,8 @@ from client_container import (
 )
 from client_image import HostEntry
 from prepare_credentials import PreparedCredentials
-from signing import (
-    SHARED_MEMORY,
-    clear_stale_signatures,
-    destroy,
-    is_memory_backed,
-    private_directory,
-    write_manifest,
-)
+from private_storage import SHARED_MEMORY, is_memory_backed, private_directory
+from signing import clear_stale_signatures, destroy, write_manifest
 from sigul_action import (
     LISTING_LIMIT,
     check_hosts_against_dns,
@@ -345,7 +339,7 @@ class PrivateDirectoryTests(unittest.TestCase):
 
     def test_fallback_without_a_tmpfs(self) -> None:
         fallback = scratch(self)
-        with mock.patch("signing.SHARED_MEMORY", str(fallback / "no-such-shm")):
+        with mock.patch("private_storage.SHARED_MEMORY", str(fallback / "no-such-shm")):
             made = private_directory("sigul-test.", str(fallback))
         self.assertEqual(made.parent, fallback)
 

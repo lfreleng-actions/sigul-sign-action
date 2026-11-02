@@ -42,3 +42,8 @@ python_version = "3.10"
 platform = "linux"
 mypy_path = "scripts:scripts/container"
 exclude = ["^scripts/container/"]
+
+# gpg --with-colons names its fingerprint record "fpr", which codespell
+# would otherwise correct.
+[tool.codespell]
+ignore-words-list = "fpr"

@@ -4,7 +4,7 @@
 #
 # A stand-in for the sigul client, for tests. Never contacts a server.
 #
-# Mirrors the real client's command line for the two commands the
+# Mirrors the real client's command line for the three commands the
 # action uses, and its effects:
 #
 #   sigul [--batch] [-c FILE] sign-data [-a] -o OUT -- KEY FILE
@@ -12,7 +12,10 @@
 #       file, as sigul's write_new_file does;
 #   sigul [--batch] [-c FILE] sign-git-tag -- KEY TAG
 #       in the current repository, appends a signature block to the
-#       tag object and moves the ref, as sigul does.
+#       tag object and moves the ref, as sigul does;
+#   sigul [--batch] [-c FILE] get-public-key -- KEY
+#       prints the armoured public key at MOCK_PUBLIC_KEY (by default
+#       the one build-mock-image.sh bakes in), signing nothing.
 #
 # When MOCK_PASSPHRASE is set, the complete stdin stream must match it
 # followed by exactly one NUL and one newline, as prepare() writes it.
@@ -24,7 +27,10 @@
 # hangs its first attempt, as a client does on a bridge that accepts
 # the connection and says nothing, until the action's attempt timeout
 # stops it. MOCK_FAIL_TAG_ONCE=1 does the same as MOCK-FAIL-ONCE for
-# sign-git-tag.
+# sign-git-tag, and MOCK_FAIL_GET_PUBLIC_KEY_ONCE=1 and
+# MOCK_HANG_GET_PUBLIC_KEY_ONCE=1 the same as MOCK-FAIL-ONCE and
+# MOCK-HANG-ONCE for get-public-key. MOCK_STATE names the directory
+# that remembers which first attempts have failed.
 
 set -eu
 
@@ -39,7 +45,7 @@ while [ $# -gt 0 ]; do
         --batch) shift ;;
         -c) shift 2 ;;
         --version) echo "client.py mock"; exit 0 ;;
-        sign-data | sign-git-tag) command="$1"; shift; break ;;
+        sign-data | sign-git-tag | get-public-key) command="$1"; shift; break ;;
         *) die "unexpected argument: $1" ;;
     esac
 done
@@ -53,9 +59,16 @@ while [ $# -gt 0 ]; do
         *) die "expected '--' before the key and object, got: $1" ;;
     esac
 done
-[ $# -eq 2 ] || die "expected KEY and one object after '--'"
-key="$1"
-object="$2"
+if [ "${command}" = "get-public-key" ]; then
+    [ -z "${output}" ] || die "get-public-key takes no -o"
+    [ $# -eq 1 ] || die "expected KEY alone after '--'"
+    key="$1"
+    object=""
+else
+    [ $# -eq 2 ] || die "expected KEY and one object after '--'"
+    key="$1"
+    object="$2"
+fi
 
 # Shell variables lose NULs and command substitution strips newlines;
 # a lossless byte encoding preserves both for the complete comparison.
@@ -65,7 +78,7 @@ if [ -n "${MOCK_PASSPHRASE:-}" ]; then
     [ "${received}" = "${expected}" ] || die "wrong passphrase or framing on stdin"
 fi
 
-state="/tmp/mock-sigul-state"
+state="${MOCK_STATE:-/tmp/mock-sigul-state}"
 mkdir -p "${state}"
 
 signature() {
@@ -105,6 +118,22 @@ case "${command}" in
         signed="$( { git cat-file -p "${unsigned}"; signature; } |
             git hash-object -t tag -w --stdin)"
         git update-ref "refs/tags/${object}" "${signed}" "${unsigned}"
+        ;;
+    get-public-key)
+        if [ "${MOCK_FAIL_GET_PUBLIC_KEY_ONCE:-0}" = 1 ] &&
+            [ ! -e "${state}/get-public-key" ]; then
+            : > "${state}/get-public-key"
+            die "induced transient failure: get-public-key ${key}"
+        fi
+        if [ "${MOCK_HANG_GET_PUBLIC_KEY_ONCE:-0}" = 1 ] &&
+            [ ! -e "${state}/get-public-key-hang" ]; then
+            : > "${state}/get-public-key-hang"
+            echo "mock sigul: induced hang: get-public-key ${key}" >&2
+            sleep 3600
+        fi
+        public_key="${MOCK_PUBLIC_KEY:-/usr/local/share/mock-sigul/public-key.asc}"
+        [ -s "${public_key}" ] || die "no public key at ${public_key}"
+        cat "${public_key}"
         ;;
     *) die "no command given" ;;
 esac

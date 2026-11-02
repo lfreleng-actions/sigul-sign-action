@@ -24,6 +24,7 @@ import collections
 import errno
 import os
 import pwd
+import select
 import signal
 import subprocess
 import sys
@@ -36,6 +37,13 @@ PGP_SIGNATURE_MARKER = "-----BEGIN PGP SIGNATURE-----"
 
 # What a timed-out attempt returns, as timeout(1) does.
 TIMED_OUT = 124
+
+# What an attempt returns when its output runs past the cap it was
+# given: stopped while still streaming, so the excess is never written.
+TOO_LARGE = 125
+
+# How much output is copied at a time when it is capped.
+_CHUNK_BYTES = 65536
 
 # How long a client told to stop gets before it is killed, and how
 # long a killed one gets to disappear.
@@ -227,7 +235,7 @@ def stop_process_group(process):
     _wait(process, time.time() + KILL_SECONDS)
 
 
-def call_with_password(argv, password_file, timeout=0):
+def call_with_password(argv, password_file, timeout=0, stdout=None, limit=None):
     """Run argv with the passphrase file on its stdin; return the status.
 
     sigul reads the key passphrase from stdin, NUL-terminated. With a
@@ -236,17 +244,73 @@ def call_with_password(argv, password_file, timeout=0):
     client itself never gives up on a bridge that accepts a connection
     and then says nothing. Polled, because Python 2.7's wait() has no
     timeout and a signal would race with a process ending on time.
+    stdout, when given, is an open file that receives the client's
+    output in place of the log. limit, with stdout, caps that output in
+    bytes: it is copied as it arrives, and an attempt that would write
+    more is stopped at once and reported as TOO_LARGE, so the file never
+    grows past the cap.
     """
+    if limit is not None:
+        return _call_capped(argv, password_file, timeout, stdout, limit)
     handle = open(password_file, "rb")
     try:
         # Its own process group, so that stop_process_group can reach
         # its children.
-        process = subprocess.Popen(argv, stdin=handle, preexec_fn=os.setsid)
+        process = subprocess.Popen(
+            argv, stdin=handle, stdout=stdout, preexec_fn=os.setsid
+        )
     finally:
         handle.close()
     if not timeout:
         return process.wait()
     status = _wait(process, time.time() + timeout)
+    if status is None:
+        stop_process_group(process)
+        return TIMED_OUT
+    return status
+
+
+def _call_capped(argv, password_file, timeout, stdout, limit):
+    """call_with_password's capped path: copy the output as it arrives.
+
+    The output goes through a pipe that this function reads, so the
+    count is known before anything reaches the file. select() bounds
+    each wait, so the attempt timeout still applies while the client is
+    silent, and the copy ends once every holder of the pipe's write end
+    has gone.
+    """
+    handle = open(password_file, "rb")
+    try:
+        process = subprocess.Popen(
+            argv, stdin=handle, stdout=subprocess.PIPE, preexec_fn=os.setsid
+        )
+    finally:
+        handle.close()
+    deadline = time.time() + timeout if timeout else None
+    pipe = process.stdout.fileno()
+    written = 0
+    try:
+        while True:
+            wait = _POLL_SECONDS * 10
+            if deadline is not None:
+                wait = deadline - time.time()
+                if wait <= 0:
+                    stop_process_group(process)
+                    return TIMED_OUT
+            ready, _w, _x = select.select([pipe], [], [], wait)
+            if not ready:
+                continue
+            chunk = os.read(pipe, _CHUNK_BYTES)
+            if not chunk:
+                break
+            if written + len(chunk) > limit:
+                stop_process_group(process)
+                return TOO_LARGE
+            stdout.write(chunk)
+            written += len(chunk)
+    finally:
+        process.stdout.close()
+    status = _wait(process, deadline)
     if status is None:
         stop_process_group(process)
         return TIMED_OUT
