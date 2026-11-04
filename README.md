@@ -789,11 +789,10 @@ and, for `signing`, an `operation`.
 - **The legacy Sigul client fails on a bridge name that resolves to more than
   one address**, as the modern one did before `v2.6.7`
   ([sigul-docker-k8s#102](https://github.com/lfreleng-actions/sigul-docker-k8s/issues/102)).
-  Until the action handles this itself
-  ([#32](https://github.com/lfreleng-actions/sigul-sign-action/issues/32)),
-  the workflow pins the name, for either client, to the first address that
-  accepts a TCP connection on port 44334 and passes it to the action as a
-  hosts entry. That check connects to the bridge in every mode.
+  The workflow pins the name for both clients, so every project takes the
+  same path: it picks the first address that accepts a TCP connection on
+  port 44334 and passes it to the action as a hosts entry. That check
+  connects to the bridge in every mode.
 - The inline harden-runner policy blocks egress except for that selected
   bridge on port 44334, the selected image registry's endpoints and GitHub
   checkout over HTTPS. It does not enable all bridges or unrelated
