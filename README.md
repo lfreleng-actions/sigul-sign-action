@@ -724,29 +724,68 @@ layers:
 
 ### Live signing
 
-Run `.github/workflows/live-signing.yaml` by hand to test real infrastructure
-with a throwaway file or a local tag that it never pushes. Dispatch it from
-`main` with a `project` (`onap`, `opendaylight`, `o-ran-sc` or `opensearch`),
-an `operation` and `dry-run`, which defaults to `true`.
+`.github/workflows/live-signing.yaml` tests real infrastructure, one job per
+project. It runs in one of three modes:
 
-Each project has its own GitHub environment, named after it, which admits the
-`main` branch and no other. Protect it as described in the production prerequisites;
-the checked-in workflow does not create reviewer or ref-protection rules. The
-workflow's opening comment lists what each environment holds:
+- **`dry-run`**, the default for a manual run, does everything short of
+  signing: it pulls the image, decrypts the credentials and has the Sigul
+  client load its configuration, NSS database and certificate.
+- **`connection-test`** runs the action's `check-connection`, which signs
+  nothing, then imports `SIGUL_PUBLIC_KEY` into a fresh GPG home. The step
+  fails unless the server's primary key fingerprint matches it; a subkey
+  difference draws a warning.
+- **`signing`** signs a throwaway file, or a local tag that it never pushes,
+  as chosen by `operation`, then verifies the signature against
+  `SIGUL_PUBLIC_KEY`.
 
-- **The secret `SIGUL_CREDENTIALS`**: base64 of a compact JSON document
-  carrying `version` 1, the base64 `config`, the one-line `password` and the
-  base64 armoured `pki`. The workflow masks every field before passing it on.
-- **The variables `SIGUL_KEY` and `SIGUL_URI`**, even for dry runs. The
-  workflow names every missing item in one error. `SIGUL_URI` is the bridge
-  host name without a port; it must identify one approved bridge for the
-  project's client and match `bridge-hostname` in the effective client
-  configuration.
-- **The client** comes from the repository variable `SIGUL_LIVE_PROJECTS`, a
-  JSON object keyed by project whose `container` is `legacy` or `modern`.
-  Listing a project as `legacy` records its approved unsupported-client
-  exception, so the workflow sets `allow-legacy` for it, dry runs included.
-  This workflow ignores the object's `enabled` flag.
+A scheduled run starts every six hours, at 17 minutes past, and runs
+`connection-test` for every enabled project. When a scheduled run fails, times
+out, or someone cancels it, the `notify-slack` job posts to Slack, naming each
+failed project and its first failed step, such as `Check the selected bridge` or
+`Compare the server's key`, with a link to the run. If it cannot list the
+run's jobs, it still posts the alert with the link. If Slack rejects the
+post, the job fails. Manual runs never post.
+That job reads `SLACK_BOT_TOKEN` inside the `notifications` environment and
+posts to the channel in `SLACK_CHANNEL_ID`.
+
+Dispatch a manual run from `main` with a `mode`, an optional `projects` list
+(comma, space or newline separated; blank selects every enabled project)
+and, for `signing`, an `operation`.
+
+- **The repository variable `SIGUL_LIVE_PROJECTS` lists the projects**, and
+  nothing else does. This JSON object, keyed by environment name, gives each
+  project's `container`, `legacy` or `modern`, and `enabled`, `true` or
+  `false`:
+
+  ```json
+  {"example": {"container": "modern", "enabled": true}}
+  ```
+
+  `container` selects the client image, the registry endpoints and the
+  approved bridges. Listing a project as `legacy` records its approved
+  unsupported-client exception, so the workflow sets `allow-legacy` for it.
+  A project with `enabled: false` stays out of every run, scheduled or manual;
+  naming it draws a warning. The `resolve` job fails when the variable is
+  missing or malformed, and reports every unknown project name at once.
+- **Each project has its own GitHub environment**, named after it, which
+  admits the `main` branch and no other. Protect it as described in the
+  production prerequisites; the checked-in workflow does not create reviewer
+  or ref-protection rules. A run from any other branch, or from a fork,
+  selects no projects and ends with a notice. Each environment holds:
+  - **The secret `SIGUL_CREDENTIALS`**: base64 of a compact JSON document
+    carrying `version` 1, the base64 `config`, the one-line `password` and
+    the base64 armoured `pki`. The workflow masks every field before passing
+    it on.
+  - **The variable `SIGUL_KEY`**, the signing key name.
+  - **The variable `SIGUL_URI`**, the bridge host name without a port. It
+    must identify one approved bridge for the project's client and match
+    `bridge-hostname` in the effective client configuration.
+  - **The variable `SIGUL_PUBLIC_KEY`**: the independently trusted, armoured
+    public signing key. The workflow refuses a connection test or signing run
+    without it, before the credentialed action.
+
+  A project whose environment lacks any of these four ends its job with a
+  notice naming what is missing, and runs no further steps.
 - **The legacy Sigul client fails on a bridge name that resolves to more than
   one address**, as the modern one did before `v2.6.7`
   ([sigul-docker-k8s#102](https://github.com/lfreleng-actions/sigul-docker-k8s/issues/102)).
@@ -754,17 +793,11 @@ workflow's opening comment lists what each environment holds:
   ([#32](https://github.com/lfreleng-actions/sigul-sign-action/issues/32)),
   the workflow pins the name, for either client, to the first address that
   accepts a TCP connection on port 44334 and passes it to the action as a
-  hosts entry. That check connects to the bridge even in a dry run.
+  hosts entry. That check connects to the bridge in every mode.
 - The inline harden-runner policy blocks egress except for that selected
   bridge on port 44334, the selected image registry's endpoints and GitHub
   checkout over HTTPS. It does not enable all bridges or unrelated
   publishing endpoints.
-- **Every non-dry run requires the GitHub environment variable
-  `SIGUL_PUBLIC_KEY`**: the independently trusted, armoured public signing
-  key. The workflow
-  supplies it to the shell as `PUBLIC_KEY`, refuses a missing key before the
-  credentialed action, then imports it into a fresh GPG home and runs
-  `gpg --verify` or `git verify-tag`. Dry runs do not require this variable.
 
 A passing automated workflow is not proof that the server signs or that the
 returned signature verifies. Complete the non-dry live verification before
