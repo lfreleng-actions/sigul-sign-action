@@ -4,21 +4,47 @@
 
 # Live signing test, against real Sigul infrastructure.
 #
-# Run by hand from the Actions tab. It signs a throwaway file, or a
-# throwaway tag that is never pushed, with real credentials, which
-# the testing workflow cannot: there, no bridge is ever contacted.
+# The testing workflow never contacts a bridge; this one does, with
+# real credentials, once for each selected project. It runs in one of
+# three modes:
 #
-# 'Dry run' is ticked by default. A dry run does everything short of
-# signing -- it pulls the image, decrypts the credentials, has the
-# Sigul client load its configuration, NSS database and certificate,
-# and resolves the bridge without connecting. It still decrypts real
-# credentials and runs the selected image, so requires a trusted job.
-# Untick it to sign and verify against the expected public key.
+#   dry-run          does everything short of signing: pulls the image,
+#                    decrypts the credentials, has the Sigul client load
+#                    its configuration, NSS database and certificate, and
+#                    resolves the bridge without signing. The default for
+#                    a manual run.
+#   connection-test  asks the server for the signing key's public key
+#                    (the action's 'check-connection'), signs nothing, and
+#                    compares the returned primary fingerprint with
+#                    SIGUL_PUBLIC_KEY. Every scheduled run uses this mode.
+#   signing          signs a throwaway file, or a throwaway tag that is
+#                    never pushed, and verifies the signature against
+#                    SIGUL_PUBLIC_KEY. Manual runs only.
 #
-# CREDENTIALS. Each project has its own environment -- onap,
-# opendaylight, o-ran-sc and opensearch -- which admits only the main
-# branch and carries any other protection rules. Pick one with the
-# 'project' input. Each environment holds:
+# Every mode decrypts real credentials and runs the selected image, so
+# each needs a trusted job.
+#
+# PROJECTS. The repository variable SIGUL_LIVE_PROJECTS is the only list
+# of projects; nothing in this workflow names one. It is a JSON object
+# keyed by environment name:
+#
+#   {"<project>": {"container": "legacy" | "modern", "enabled": true}}
+#
+# 'container' selects the action's built-in client image, the registry
+# endpoints harden-runner admits and the approved bridges. Listing a
+# project as legacy records its approved unsupported-client exception,
+# so it also sets allow-legacy. A project with 'enabled: false' stays out
+# of every run, scheduled or manual. The 'projects' input narrows a manual
+# run; blank selects every enabled project.
+#
+# The 'resolve' job reads that variable without any environment or
+# secret and builds the matrix for the 'live' job. Outside the main
+# branch of lfreleng-actions/sigul-sign-action it selects nothing and
+# ends with a notice: the project environments admit only main.
+#
+# CREDENTIALS. Each project has its own environment, named after it,
+# which admits only the main branch and carries any other protection
+# rules. Each environment holds:
 #
 #   SIGUL_CREDENTIALS  secret: base64 of the compact JSON document
 #                      {"version":1,"config":<base64 client.conf>,
@@ -30,74 +56,207 @@
 #                      the effective configuration after the bundle's
 #                      user configuration overrides client.conf.
 #   SIGUL_PUBLIC_KEY   variable: the trusted signing key's armoured public
-#                      half. A non-dry run requires it and verifies the
-#                      signature against it.
+#                      half. The connection test compares the server's key
+#                      with it, and signing verifies the signature with it.
 #
-# The repository variable SIGUL_LIVE_PROJECTS, a JSON object keyed by
-# environment name, gives each project's client as its 'container':
-# 'legacy' or 'modern'. Listing a project as legacy records its approved
-# unsupported-client exception, so it also sets allow-legacy. This
-# manual workflow ignores the object's 'enabled' flag.
+# A project whose environment lacks any of the four ends its job with a
+# notice and runs no further steps.
+#
+# SCHEDULE. Every six hours, off the hour, a connection test runs for
+# every enabled project. When a scheduled run fails or is cancelled, the
+# 'notify-slack' job posts the failed projects and their first failed
+# step to Slack. Manual runs never post.
 #
 # Sigul's client fails on a bridge name that resolves to several
 # addresses (lfreleng-actions/sigul-docker-k8s#102), so the workflow pins
 # the name to the first address that accepts a connection and passes it
 # to the action as a hosts entry. That check opens a TCP connection to
-# the bridge, dry run or not. This is interim, until the action does it
+# the bridge, in every mode. This is interim, until the action does it
 # itself (lfreleng-actions/sigul-sign-action#32).
 name: "Live signing 🔏"
 
 # yamllint disable-line rule:truthy
 on:
+  schedule:
+    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
-      project:
-        description: "Project, and its environment"
+      mode:
+        description: "What to do"
         type: choice
-        options: ["onap", "opendaylight", "o-ran-sc", "opensearch"]
-        default: "onap"
+        options: ["dry-run", "connection-test", "signing"]
+        default: "dry-run"
+      projects:
+        # yamllint disable-line rule:line-length
+        description: "Projects, comma, space or newline separated; blank for every enabled project"
+        type: string
+        required: false
+        default: ""
       operation:
-        description: "What to sign"
+        description: "What to sign, in signing mode"
         type: choice
         options: ["sign-data", "sign-git-tag"]
         default: "sign-data"
-      dry-run:
-        description: "Dry run: check everything, sign nothing"
-        type: boolean
-        default: true
 
 permissions: {}
+
+env:
+  GH_TELEMETRY: 'false'
 
 concurrency:
   group: "${{ github.workflow }}"
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    name: "Select projects"
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      count: ${{ steps.select.outputs.count }}
+      mode: ${{ steps.select.outputs.mode }}
+    steps:
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+
+      - name: "Split the projects input"
+        id: split
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/list-splitter-action@b56a625474875d05ca8d1c1eb3314c29c526c9a6  # v0.1.0
+        with:
+          list: ${{ inputs.projects }}
+          validate: 'none'
+
+      - name: "Select the projects"
+        id: select
+        shell: bash
+        env:
+          NAMES: ${{ steps.split.outputs.json }}
+          SIGUL_LIVE_PROJECTS: ${{ vars.SIGUL_LIVE_PROJECTS }}
+          EVENT_NAME: ${{ github.event_name }}
+          MODE_INPUT: ${{ inputs.mode }}
+          REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+
+          HOME_REPOSITORY = "lfreleng-actions/sigul-sign-action"
+          errors = []
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+          if os.environ["EVENT_NAME"] == "schedule":
+              mode = "connection-test"
+          else:
+              mode = os.environ.get("MODE_INPUT", "")
+          if mode not in ("dry-run", "connection-test", "signing"):
+              fail(f"Unknown mode {mode!r}")
+
+          selected, skipped = [], []
+          ref = os.environ["REF"]
+          repository = os.environ["REPOSITORY"]
+          if repository != HOME_REPOSITORY or ref != "refs/heads/main":
+              print("::notice::The project environments admit only the main "
+                    f"branch of {HOME_REPOSITORY}; {ref} in {repository} "
+                    "selects no projects")
+          else:
+              try:
+                  projects = json.loads(
+                      os.environ.get("SIGUL_LIVE_PROJECTS", ""))
+              except ValueError:
+                  fail("SIGUL_LIVE_PROJECTS is missing or not valid JSON")
+              if not isinstance(projects, dict) or not projects:
+                  fail("SIGUL_LIVE_PROJECTS must be a non-empty JSON object")
+              for name, entry in projects.items():
+                  if not isinstance(entry, dict):
+                      errors.append(
+                          f"SIGUL_LIVE_PROJECTS.{name} must be an object")
+                      continue
+                  if entry.get("container") not in ("legacy", "modern"):
+                      errors.append(f"SIGUL_LIVE_PROJECTS.{name}.container "
+                                    "must be legacy or modern")
+                  if not isinstance(entry.get("enabled"), bool):
+                      errors.append(f"SIGUL_LIVE_PROJECTS.{name}.enabled "
+                                    "must be true or false")
+              known = {name.lower(): name for name in projects}
+              if len(known) != len(projects):
+                  errors.append("SIGUL_LIVE_PROJECTS has names differing "
+                                "only in case")
+              for message in errors:
+                  print(f"::error::{message}")
+              if errors:
+                  sys.exit(1)
+
+              requested = json.loads(os.environ.get("NAMES") or "[]")
+              if requested:
+                  names = []
+                  for item in requested:
+                      name = known.get(str(item).strip().lower())
+                      if name is None:
+                          errors.append(f"Unknown project {item!r}: not in "
+                                        "SIGUL_LIVE_PROJECTS")
+                      elif name not in names:
+                          names.append(name)
+                  for message in errors:
+                      print(f"::error::{message}")
+                  if errors:
+                      sys.exit(1)
+              else:
+                  names = list(projects)
+              for name in names:
+                  entry = projects[name]
+                  if entry["enabled"]:
+                      selected.append({"project": name,
+                                       "container": entry["container"]})
+                  elif requested:
+                      print(f"::warning::Skipping {name}: disabled in "
+                            "SIGUL_LIVE_PROJECTS")
+                      skipped.append(name)
+              if not selected:
+                  print("::notice::No enabled project selected")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              matrix = json.dumps(selected, separators=(",", ":"))
+              out.write(f"matrix={matrix}\n")
+              out.write(f"count={len(selected)}\n")
+              out.write(f"mode={mode}\n")
+          lines = [f"### Live signing: {mode}", ""]
+          lines += [f"- `{item['project']}` ({item['container']})"
+                    for item in selected] or ["No projects selected."]
+          if skipped:
+              lines += ["", "Skipped, disabled in `SIGUL_LIVE_PROJECTS`:", ""]
+              lines += [f"- `{name}`" for name in skipped]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a",
+                    encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
+
   live:
-    # yamllint disable-line rule:line-length
-    name: "${{ inputs.dry-run && 'Dry run' || 'Sign' }}: ${{ inputs.operation }} (${{ inputs.project }})"
+    name: "${{ needs.resolve.outputs.mode }}: ${{ matrix.project }}"
+    needs: resolve
+    if: ${{ needs.resolve.outputs.count != '0' }}
     # amd64, which the legacy client image requires.
     runs-on: ubuntu-24.04
-    environment: ${{ inputs.project }}
+    environment: ${{ matrix.project }}
     permissions:
       contents: read
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     env:
       BRIDGE_HOST: ${{ vars.SIGUL_URI }}
-      # The project's client from SIGUL_LIVE_PROJECTS. One literal key per
-      # project, as zizmor reports a computed index as obfuscation.
-      CONTAINER: >-
-        ${{
-          inputs.project == 'onap' &&
-          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}').onap.container ||
-          inputs.project == 'opendaylight' &&
-          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}').opendaylight.container ||
-          inputs.project == 'o-ran-sc' &&
-          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}')['o-ran-sc'].container ||
-          inputs.project == 'opensearch' &&
-          fromJSON(vars.SIGUL_LIVE_PROJECTS || '{}').opensearch.container ||
-          ''
-        }}
+      MODE: ${{ needs.resolve.outputs.mode }}
     steps:
       # The firewall starts in a pre hook, before checkout. Keep its policy
       # inline: the organisation loader adds unrelated publishing endpoints.
@@ -114,73 +273,67 @@ jobs:
           allowed-endpoints: >-
             ${{ format('{0} {1} {2} {3} {4} {5} {6}',
                 'github.com:443',
-                env.CONTAINER == 'modern' &&
+                matrix.container == 'modern' &&
                   'ghcr.io:443 pkg-containers.githubusercontent.com:443' ||
                   '',
-                env.CONTAINER == 'legacy' &&
+                matrix.container == 'legacy' &&
                   'auth.docker.io:443 registry-1.docker.io:443' || '',
-                env.CONTAINER == 'legacy' &&
+                matrix.container == 'legacy' &&
                   'production.cloudflare.docker.com:443' || '',
-                env.CONTAINER == 'legacy' &&
+                matrix.container == 'legacy' &&
                   'production.cloudfront.docker.com:443' || '',
-                env.CONTAINER == 'legacy' &&
+                matrix.container == 'legacy' &&
                   (env.BRIDGE_HOST ==
                     'sigul-bridge-yul.linuxfoundation.org' ||
                    env.BRIDGE_HOST ==
                     'sigul-bridge-us-west-2.linuxfoundation.org') &&
                   format('{0}:44334', env.BRIDGE_HOST) || '',
-                env.CONTAINER == 'modern' &&
+                matrix.container == 'modern' &&
                   env.BRIDGE_HOST == 'sigul-bridge.opensearch.org' &&
                   'sigul-bridge.opensearch.org:44334' || '') }}
 
+      # Presence flags only: no secret value reaches this step.
+      - name: "Check environment readiness"
+        id: ready
+        shell: bash
+        env:
+          PROJECT: ${{ matrix.project }}
+          HAVE_CREDENTIALS: ${{ secrets.SIGUL_CREDENTIALS != '' }}
+          SIGUL_KEY: ${{ vars.SIGUL_KEY }}
+          SIGUL_URI: ${{ vars.SIGUL_URI }}
+          SIGUL_PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ "${HAVE_CREDENTIALS}" = "true" ] ||
+            missing+=("secret SIGUL_CREDENTIALS")
+          [ -n "${SIGUL_KEY//[[:space:]]/}" ] ||
+            missing+=("variable SIGUL_KEY")
+          [ -n "${SIGUL_URI//[[:space:]]/}" ] ||
+            missing+=("variable SIGUL_URI")
+          [ -n "${SIGUL_PUBLIC_KEY//[[:space:]]/}" ] ||
+            missing+=("variable SIGUL_PUBLIC_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            list="$(printf '%s, ' "${missing[@]}")"
+            echo "::notice::${PROJECT}: not configured," \
+              "missing ${list%, }; skipping"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: "Checkout repository"
+        if: ${{ steps.ready.outputs.ready == 'true' }}
         # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: "Require the expected public key"
-        if: ${{ !inputs.dry-run }}
-        shell: bash
-        env:
-          PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${PUBLIC_KEY//[[:space:]]/}" ]; then
-            echo "::error::Set SIGUL_PUBLIC_KEY before a non-dry signing run"
-            exit 1
-          fi
-
-      - name: "Check the project configuration"
-        shell: bash
-        env:
-          PROJECT: ${{ inputs.project }}
-          CONTAINER: ${{ env.CONTAINER }}
-          HAVE_CREDENTIALS: ${{ secrets.SIGUL_CREDENTIALS != '' }}
-          SIGUL_KEY: ${{ vars.SIGUL_KEY }}
-        run: |
-          set -euo pipefail
-          missing=()
-          case "${CONTAINER}" in
-            legacy | modern) ;;
-            *) missing+=("SIGUL_LIVE_PROJECTS container (legacy or modern)") ;;
-          esac
-          [ "${HAVE_CREDENTIALS}" = "true" ] ||
-            missing+=("secret SIGUL_CREDENTIALS")
-          [ -n "${SIGUL_KEY//[[:space:]]/}" ] ||
-            missing+=("variable SIGUL_KEY")
-          [ -n "${BRIDGE_HOST//[[:space:]]/}" ] ||
-            missing+=("variable SIGUL_URI")
-          if [ "${#missing[@]}" -gt 0 ]; then
-            list="$(printf '%s, ' "${missing[@]}")"
-            echo "::error::Project ${PROJECT} lacks: ${list%, }"
-            exit 1
-          fi
-
       - name: "Check the selected bridge"
+        if: ${{ steps.ready.outputs.ready == 'true' }}
         shell: bash
         env:
-          CONTAINER: ${{ env.CONTAINER }}
+          CONTAINER: ${{ matrix.container }}
         run: |
           set -euo pipefail
           case "${CONTAINER}:${BRIDGE_HOST}" in
@@ -193,10 +346,24 @@ jobs:
               ;;
           esac
 
+      - name: "Require the expected public key"
+        if: ${{ steps.ready.outputs.ready == 'true' && env.MODE != 'dry-run' }}
+        shell: bash
+        env:
+          PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PUBLIC_KEY//[[:space:]]/}" ]; then
+            echo "::error::Set SIGUL_PUBLIC_KEY before a connection test" \
+              "or signing run"
+            exit 1
+          fi
+
       # Interim workaround for lfreleng-actions/sigul-docker-k8s#102, until
       # lfreleng-actions/sigul-sign-action#32 pins inside the action.
       - name: "Pin the bridge address"
         id: pin
+        if: ${{ steps.ready.outputs.ready == 'true' }}
         shell: bash
         env:
           BRIDGE_PORT: "44334"
@@ -231,9 +398,13 @@ jobs:
 
       - name: "Make something to sign"
         id: target
+        if: >-
+          ${{ steps.ready.outputs.ready == 'true'
+          && env.MODE != 'connection-test' }}
         shell: bash
         env:
-          OPERATION: ${{ inputs.operation }}
+          OPERATION: >-
+            ${{ env.MODE == 'signing' && inputs.operation || 'sign-data' }}
           RUN_ID: ${{ github.run_id }}
           SHA: ${{ github.sha }}
         run: |
@@ -256,6 +427,7 @@ jobs:
 
       - name: "Unpack Sigul credentials"
         id: creds
+        if: ${{ steps.ready.outputs.ready == 'true' }}
         shell: bash
         env:
           SIGUL_CREDENTIALS: ${{ secrets.SIGUL_CREDENTIALS }}
@@ -286,16 +458,15 @@ jobs:
               out.write("\n".join(lines) + "\n")
           PY
 
-      - name: "Sign with Sigul"
-        id: sign
+      - name: "Dry run with Sigul"
+        if: ${{ steps.ready.outputs.ready == 'true' && env.MODE == 'dry-run' }}
         uses: $/
         with:
-          container: ${{ env.CONTAINER }}
-          allow-legacy: ${{ env.CONTAINER == 'legacy' }}
-          sign-type: ${{ inputs.operation }}
+          container: ${{ matrix.container }}
+          allow-legacy: ${{ matrix.container == 'legacy' }}
+          sign-type: sign-data
           sign-object: ${{ steps.target.outputs.object }}
-          push-tag: "false"
-          dry-run: ${{ inputs.dry-run }}
+          dry-run: "true"
           sigul-key-name: ${{ vars.SIGUL_KEY }}
           sigul-conf: ${{ steps.creds.outputs.config }}
           sigul-pass: ${{ steps.creds.outputs.password }}
@@ -305,8 +476,105 @@ jobs:
           sigul-hosts-entry: "true"
           expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
 
+      - name: "Check the connection with Sigul"
+        id: connect
+        if: >-
+          ${{ steps.ready.outputs.ready == 'true'
+          && env.MODE == 'connection-test' }}
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          allow-legacy: ${{ matrix.container == 'legacy' }}
+          sign-type: check-connection
+          sigul-key-name: ${{ vars.SIGUL_KEY }}
+          sigul-conf: ${{ steps.creds.outputs.config }}
+          sigul-pass: ${{ steps.creds.outputs.password }}
+          sigul-pki: ${{ steps.creds.outputs.pki }}
+          sigul-ip: ${{ steps.pin.outputs.address }}
+          sigul-uri: ${{ env.BRIDGE_HOST }}
+          sigul-hosts-entry: "true"
+          expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
+
+      - name: "Sign with Sigul"
+        id: sign
+        if: ${{ steps.ready.outputs.ready == 'true' && env.MODE == 'signing' }}
+        uses: $/
+        with:
+          container: ${{ matrix.container }}
+          allow-legacy: ${{ matrix.container == 'legacy' }}
+          sign-type: ${{ inputs.operation }}
+          sign-object: ${{ steps.target.outputs.object }}
+          push-tag: "false"
+          sigul-key-name: ${{ vars.SIGUL_KEY }}
+          sigul-conf: ${{ steps.creds.outputs.config }}
+          sigul-pass: ${{ steps.creds.outputs.password }}
+          sigul-pki: ${{ steps.creds.outputs.pki }}
+          sigul-ip: ${{ steps.pin.outputs.address }}
+          sigul-uri: ${{ env.BRIDGE_HOST }}
+          sigul-hosts-entry: "true"
+          expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
+
+      - name: "Compare the server's key"
+        if: >-
+          ${{ steps.ready.outputs.ready == 'true'
+          && env.MODE == 'connection-test' }}
+        shell: bash
+        env:
+          FINGERPRINTS: ${{ steps.connect.outputs.public_key_fingerprints }}
+          PUBLIC_KEY: ${{ vars.SIGUL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          read -r -a returned <<< "${FINGERPRINTS^^}"
+          if [ "${#returned[@]}" -eq 0 ]; then
+            echo "::error::The connection test returned no fingerprints"
+            exit 1
+          fi
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d /tmp/expected.XXXXXX)"
+          printf '%s\n' "${PUBLIC_KEY}" | gpg --batch --quiet --import
+          listing="$(gpg --batch --with-colons --with-subkey-fingerprint \
+            --list-keys)"
+          primaries=()
+          subkeys=()
+          last=""
+          while IFS=: read -r -a field; do
+            case "${field[0]:-}:${last}" in
+              pub:* | sub:*) last="${field[0]}" ;;
+              fpr:pub) primaries+=("${field[9]^^}"); last="" ;;
+              fpr:sub) subkeys+=("${field[9]^^}"); last="" ;;
+              *) ;;
+            esac
+          done <<< "${listing}"
+
+          if [ "${#primaries[@]}" -ne 1 ]; then
+            echo "::error::SIGUL_PUBLIC_KEY must hold exactly one primary key"
+            exit 1
+          fi
+          if [ "${returned[0]}" != "${primaries[0]}" ]; then
+            echo "::error::The server's key ${returned[0]} is not" \
+              "SIGUL_PUBLIC_KEY ${primaries[0]}"
+            exit 1
+          fi
+
+          only_server="$(comm -13 \
+            <(printf '%s\n' "${subkeys[@]}" | sort -u) \
+            <(printf '%s\n' "${returned[@]:1}" | sort -u) | grep . || true)"
+          only_expected="$(comm -23 \
+            <(printf '%s\n' "${subkeys[@]}" | sort -u) \
+            <(printf '%s\n' "${returned[@]:1}" | sort -u) | grep . || true)"
+          if [ -n "${only_server}${only_expected}" ]; then
+            only_server="${only_server:-none}"
+            only_expected="${only_expected:-none}"
+            echo "::warning::Subkeys differ; only on the server:" \
+              "${only_server//$'\n'/ }; only in SIGUL_PUBLIC_KEY:" \
+              "${only_expected//$'\n'/ }"
+          fi
+          echo "The server's key matches SIGUL_PUBLIC_KEY ${primaries[0]} ✅" |
+            tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: "Verify the signature"
-        if: ${{ !inputs.dry-run }}
+        if: ${{ steps.ready.outputs.ready == 'true' && env.MODE == 'signing' }}
         shell: bash
         env:
           OPERATION: ${{ inputs.operation }}
@@ -343,3 +611,108 @@ jobs:
           fi
           echo "Signature verified against SIGUL_PUBLIC_KEY ✅" |
             tee -a "$GITHUB_STEP_SUMMARY"
+
+  notify-slack:
+    name: "Notify Slack on failure"
+    needs: [resolve, live]
+    # Scheduled canaries only: manual runs are watched by whoever started
+    # them. always() lets this job evaluate after an upstream failure.
+    if: >-
+      ${{ always()
+      && github.event_name == 'schedule'
+      && (contains(needs.*.result, 'failure')
+      || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # The Slack bot token is read inside an environment, which also
+    # satisfies zizmor's secrets-outside-env audit.
+    environment: notifications
+    permissions:
+      actions: read  # list this run's jobs and their failed steps
+    steps:
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >-
+            api.github.com:443 slack.com:443
+
+      - name: "List the failed jobs"
+        id: jobs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          jobs="${RUNNER_TEMP}/jobs.jsonl"
+          run="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          # A failed lookup must not suppress the alert: post the generic
+          # message with the run link instead.
+          if ! gh api --paginate \
+            "${run}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+            --jq '.jobs[] | tojson' > "${jobs}"; then
+            echo "::warning::Could not list this run's jobs"
+            : > "${jobs}"
+          fi
+          python3 - "${jobs}" <<'PY'
+          import json, os, sys
+
+          # needs.*.result reports a timed-out job as a failure, but the
+          # jobs API names it apart.
+          ENDED = ("failure", "cancelled", "timed_out")
+
+          def escape(text):
+              return (str(text).replace("&", "&amp;")
+                      .replace("<", "&lt;").replace(">", "&gt;"))
+
+          lines = []
+          with open(sys.argv[1], encoding="utf-8") as jobs:
+              for line in jobs:
+                  if not line.strip():
+                      continue
+                  job = json.loads(line)
+                  if job.get("conclusion") not in ENDED:
+                      continue
+                  steps = job.get("steps") or []
+                  step = next((step.get("name") for step in steps
+                               if step.get("conclusion") in ENDED),
+                              "no failed step recorded")
+                  lines.append(f"• *{escape(job.get('name'))}* "
+                               f"({job['conclusion']}): {escape(step)}")
+          text = "\n".join(lines) or "No failed job was found; see the run."
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"summary={json.dumps(text[:2900])}\n")
+          PY
+
+      - name: "Notify Slack of the canary failure"
+        # yamllint disable-line rule:line-length
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d  # v4.0.0
+        with:
+          method: 'chat.postMessage'
+          token: "${{ secrets.SLACK_BOT_TOKEN }}"
+          # Fail the job when Slack rejects the post, so a lost alert shows.
+          errors: 'true'
+          # The summary output is a JSON string, which YAML reads as a
+          # double-quoted scalar whatever it contains.
+          # yamllint disable rule:line-length
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            text: "🔏 Sigul canary failed in ${{ github.repository }}"
+            blocks:
+              - type: "header"
+                text:
+                  type: "plain_text"
+                  text: "🔏 Sigul canary failed"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: ${{ steps.jobs.outputs.summary }}
+              - type: "context"
+                elements:
+                  - type: "mrkdwn"
+                    text: "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+          # yamllint enable rule:line-length
