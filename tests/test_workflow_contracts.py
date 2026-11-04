@@ -19,9 +19,17 @@ from typing import cast
 from tests.helpers import REPOSITORY, scratch
 
 
-def workflow_steps(filename: str) -> list[str]:
-    """Read the workflows' six-space-indented steps without a YAML dependency."""
+def workflow_steps(filename: str, job: str | None = None) -> list[str]:
+    """Read the workflows' six-space-indented steps without a YAML dependency.
+
+    Given a job, read only that job's steps, so jobs may share step names.
+    """
     source = (REPOSITORY / ".github" / "workflows" / filename).read_text()
+    if job is not None:
+        found = re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)", source)
+        if found is None:
+            raise ValueError(f"Expected a job named {job!r} in {filename}")
+        source = found[1]
     return re.split(r"(?m)^      - ", source)[1:]
 
 
@@ -45,14 +53,25 @@ def shell_body(step: str) -> str:
     return textwrap.dedent(found[1])
 
 
+def step_condition(step: str) -> str:
+    """A step's if: expression, folded onto one line as YAML reads it."""
+    found = re.search(r"(?m)^        if: (>-\n(?:          .*\n)+|.*\n)", step)
+    if found is None:
+        return ""
+    return " ".join(found[1].removeprefix(">-").split())
+
+
 # Extract at collection time so a broken harness cannot become an expected failure.
-LIVE_STEPS = workflow_steps("live-signing.yaml")
+LIVE_STEPS = workflow_steps("live-signing.yaml", "live")
 VERIFY_STEP = named_step(LIVE_STEPS, "Verify the signature")
 VERIFY_SCRIPT = shell_body(VERIFY_STEP)
 VALIDATION_STEP = named_step(
     workflow_steps("testing.yaml"), "Assert it failed during validation"
 )
 VALIDATION_SCRIPT = shell_body(VALIDATION_STEP)
+
+# The readiness guard every live step after the readiness check carries.
+READY = "steps.ready.outputs.ready == 'true'"
 
 # Functions intercept every external-service/credential command in these steps.
 # No real Docker, Git or GPG is invoked, and mktemp stays inside the test fixture.
@@ -66,6 +85,7 @@ gpg() {
     case " $* " in
         *' --import '*) cat >/dev/null; return "$IMPORT_STATUS" ;;
         *' --verify '*) return "$VERIFY_STATUS" ;;
+        *' --list-keys '*) printf '%s' "$KEY_LISTING" ;;
         *) return 99 ;;
     esac
 }
@@ -101,6 +121,7 @@ class WorkflowShellTests(unittest.TestCase):
                 "COMMAND_LOG": str(self.root / "commands"),
                 "IMPORT_STATUS": "0",
                 "VERIFY_STATUS": "0",
+                "KEY_LISTING": "",
                 **env,
             },
             capture_output=True,
@@ -140,28 +161,36 @@ class LiveVerificationTests(WorkflowShellTests):
         done = self.verify("sign-git-tag", PUBLIC_KEY="")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
 
+    @unittest.expectedFailure
     def test_expected_key_is_required_before_credentials_are_used(self) -> None:
-        signing = LIVE_STEPS.index(named_step(LIVE_STEPS, "Sign with Sigul"))
+        unpack = LIVE_STEPS.index(named_step(LIVE_STEPS, "Unpack Sigul credentials"))
         gates = [
             step
-            for step in LIVE_STEPS[:signing]
+            for step in LIVE_STEPS[:unpack]
             if re.search(r"(?m)^          PUBLIC_KEY:.*vars\.SIGUL_PUBLIC_KEY", step)
         ]
-        self.assertTrue(gates, "No expected-public-key gate precedes Sign with Sigul")
+        self.assertTrue(gates, "No expected-public-key gate precedes the credentials")
         for step in gates:
-            self.assertIn("if: ${{ !inputs.dry-run }}", step)
-            self.assertNotIn("secrets.", step)
-            done = self.shell(shell_body(step), PUBLIC_KEY="", DRY_RUN="false")
-            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-            done = self.shell(
-                shell_body(step),
-                PUBLIC_KEY="synthetic expected public key",
-                DRY_RUN="false",
+            self.assertEqual(
+                step_condition(step), f"${{{{ {READY} && env.MODE != 'dry-run' }}}}"
             )
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertNotIn("secrets.", step)
+            for mode in ("connection-test", "signing"):
+                with self.subTest(mode=mode):
+                    done = self.shell(shell_body(step), PUBLIC_KEY="", MODE=mode)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    done = self.shell(
+                        shell_body(step),
+                        PUBLIC_KEY="synthetic expected public key",
+                        MODE=mode,
+                    )
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
+    @unittest.expectedFailure
     def test_dry_runs_do_not_require_verification(self) -> None:
-        self.assertIn("if: ${{ !inputs.dry-run }}", VERIFY_STEP)
+        self.assertEqual(
+            step_condition(VERIFY_STEP), f"${{{{ {READY} && env.MODE == 'signing' }}}}"
+        )
 
     def test_expected_key_is_imported_and_both_operations_are_verified(self) -> None:
         for operation, command in (
@@ -458,8 +487,359 @@ class LiveBridgePinTests(WorkflowShellTests):
         self.assertFalse((self.root / "output").exists())
 
 
-# The configuration check's environment when the project is fully set up.
+# The readiness check's environment when the project is fully set up.
 COMPLETE_PROJECT = {
+    "PROJECT": "synthetic-project",
+    "HAVE_CREDENTIALS": "true",
+    "SIGUL_KEY": "synthetic-key",
+    "SIGUL_URI": "sigul-bridge.opensearch.org",
+    "SIGUL_PUBLIC_KEY": "synthetic expected public key",
+}
+
+
+class LiveReadinessTests(WorkflowShellTests):
+    def check(self, **env: str) -> tuple[subprocess.CompletedProcess[str], str]:
+        output = self.root / "output"
+        done = self.shell(
+            live_script("Check environment readiness"),
+            GITHUB_OUTPUT=str(output),
+            **{**COMPLETE_PROJECT, **env},
+        )
+        return done, output.read_text() if output.exists() else ""
+
+    @unittest.expectedFailure
+    def test_complete_configuration_is_ready(self) -> None:
+        done, output = self.check()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(output, "ready=true\n")
+        self.assertNotIn("::notice::", done.stdout)
+
+    @unittest.expectedFailure
+    def test_each_missing_item_skips_cleanly_and_is_named(self) -> None:
+        for variable, value, item in (
+            ("HAVE_CREDENTIALS", "false", "secret SIGUL_CREDENTIALS"),
+            ("SIGUL_KEY", "", "variable SIGUL_KEY"),
+            ("SIGUL_KEY", " ", "variable SIGUL_KEY"),
+            ("SIGUL_URI", "", "variable SIGUL_URI"),
+            ("SIGUL_PUBLIC_KEY", "\n", "variable SIGUL_PUBLIC_KEY"),
+        ):
+            with self.subTest(variable=variable, value=value):
+                (self.root / "output").unlink(missing_ok=True)
+                done, output = self.check(**{variable: value})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(output, "ready=false\n")
+                self.assertIn(
+                    f"::notice::synthetic-project: not configured, missing {item};"
+                    + " skipping\n",
+                    done.stdout,
+                )
+
+    @unittest.expectedFailure
+    def test_every_missing_item_is_named_in_one_notice(self) -> None:
+        done, output = self.check(
+            HAVE_CREDENTIALS="false", SIGUL_KEY="", SIGUL_URI="", SIGUL_PUBLIC_KEY=""
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(output, "ready=false\n")
+        notices = [line for line in done.stdout.splitlines() if "::notice::" in line]
+        self.assertEqual(len(notices), 1, done.stdout)
+        for item in ("SIGUL_CREDENTIALS", "SIGUL_KEY", "SIGUL_URI", "SIGUL_PUBLIC_KEY"):
+            self.assertIn(item, notices[0])
+
+    @unittest.expectedFailure
+    def test_readiness_reads_no_secret_value(self) -> None:
+        step = named_step(LIVE_STEPS, "Check environment readiness")
+        self.assertRegex(step, r"(?m)^        id: ready$")
+        self.assertIn("HAVE_CREDENTIALS: ${{ secrets.SIGUL_CREDENTIALS != '' }}", step)
+        self.assertEqual(
+            re.findall(r"secrets\.\w+", step), ["secrets.SIGUL_CREDENTIALS"]
+        )
+
+    @unittest.expectedFailure
+    def test_every_later_step_is_guarded_by_readiness(self) -> None:
+        ready = LIVE_STEPS.index(named_step(LIVE_STEPS, "Check environment readiness"))
+        for step in LIVE_STEPS[ready + 1 :]:
+            with self.subTest(step=step.splitlines()[0]):
+                condition = step_condition(step)
+                self.assertTrue(condition.startswith(f"${{{{ {READY}"), condition)
+
+
+# gpg --with-colons output for a primary key and one subkey.
+PRIMARY = "A" * 40
+SUBKEY = "B" * 40
+OTHER = "C" * 40
+
+
+def key_listing(primary: str = PRIMARY, *subkeys: str) -> str:
+    """Colon listing as gpg --with-subkey-fingerprint --list-keys prints it."""
+    lines = [
+        "pub:-:4096:1:0000:0:::-:::scESC::::::23::0:",
+        f"fpr:::::::::{primary}:",
+    ]
+    for subkey in subkeys:
+        lines += ["sub:-:4096:1:0001:0:::::e::::::23:", f"fpr:::::::::{subkey}:"]
+    lines.append("uid:-::::0::0000::Synthetic <synthetic@example.invalid>::::::::::0:")
+    return "\n".join(lines) + "\n"
+
+
+class LiveKeyComparisonTests(WorkflowShellTests):
+    def compare(
+        self, fingerprints: str, listing: str
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (self.root / "commands").write_text("")
+        return self.shell(
+            live_script("Compare the server's key"),
+            FINGERPRINTS=fingerprints,
+            PUBLIC_KEY="synthetic expected public key",
+            KEY_LISTING=listing,
+        )
+
+    @unittest.expectedFailure
+    def test_matching_keys_pass(self) -> None:
+        done = self.compare(f"{PRIMARY} {SUBKEY}", key_listing(PRIMARY, SUBKEY))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("::warning::", done.stdout)
+        self.assertIn(PRIMARY, (self.root / "summary").read_text())
+        calls = (self.root / "commands").read_text()
+        self.assertIn("gpg --batch --quiet --import\n", calls)
+
+    @unittest.expectedFailure
+    def test_case_differences_are_not_a_mismatch(self) -> None:
+        done = self.compare(PRIMARY.lower(), key_listing(PRIMARY))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    @unittest.expectedFailure
+    def test_a_different_primary_key_fails(self) -> None:
+        done = self.compare(f"{OTHER} {SUBKEY}", key_listing(PRIMARY, SUBKEY))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("::error::", done.stdout)
+        self.assertIn(OTHER, done.stdout)
+
+    @unittest.expectedFailure
+    def test_no_returned_fingerprint_fails(self) -> None:
+        done = self.compare("", key_listing(PRIMARY))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("::error::", done.stdout)
+
+    @unittest.expectedFailure
+    def test_an_expected_key_without_one_primary_fails(self) -> None:
+        for listing in ("", key_listing(PRIMARY) + key_listing(OTHER)):
+            with self.subTest(listing=listing):
+                done = self.compare(PRIMARY, listing)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("exactly one primary key", done.stdout)
+
+    @unittest.expectedFailure
+    def test_a_subkey_difference_only_warns(self) -> None:
+        for returned, expected in (
+            (f"{PRIMARY} {OTHER}", (SUBKEY,)),
+            (PRIMARY, (SUBKEY,)),
+            (f"{PRIMARY} {SUBKEY} {OTHER}", (SUBKEY,)),
+        ):
+            with self.subTest(returned=returned):
+                done = self.compare(returned, key_listing(PRIMARY, *expected))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                warnings = [
+                    line for line in done.stdout.splitlines() if "::warning::" in line
+                ]
+                self.assertEqual(len(warnings), 1, done.stdout)
+                self.assertTrue(OTHER in warnings[0] or SUBKEY in warnings[0])
+
+    @unittest.expectedFailure
+    def test_comparison_reads_the_connection_test_output(self) -> None:
+        step = named_step(LIVE_STEPS, "Compare the server's key")
+        self.assertIn(
+            "FINGERPRINTS: ${{ steps.connect.outputs.public_key_fingerprints }}", step
+        )
+        self.assertEqual(
+            step_condition(step),
+            f"${{{{ {READY} && env.MODE == 'connection-test' }}}}",
+        )
+
+
+def job_step(job: str, name: str) -> str:
+    """Look a step of another live-signing job up per test, like live_script."""
+    return named_step(workflow_steps("live-signing.yaml", job), name)
+
+
+HOME_REPOSITORY = "lfreleng-actions/sigul-sign-action"
+PROJECTS = {
+    "alpha": {"container": "legacy", "enabled": True},
+    "beta": {"container": "modern", "enabled": True},
+    "gamma": {"container": "legacy", "enabled": False},
+}
+
+
+class ResolveTests(WorkflowShellTests):
+    def resolve(
+        self,
+        names: list[str] | None = None,
+        projects: object = PROJECTS,
+        **env: str,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+        output = self.root / "output"
+        output.unlink(missing_ok=True)
+        done = self.shell(
+            shell_body(job_step("resolve", "Select the projects")),
+            **{
+                "NAMES": json.dumps(names or []),
+                "SIGUL_LIVE_PROJECTS": (
+                    projects if isinstance(projects, str) else json.dumps(projects)
+                ),
+                "EVENT_NAME": "workflow_dispatch",
+                "MODE_INPUT": "dry-run",
+                "REF": "refs/heads/main",
+                "REPOSITORY": HOME_REPOSITORY,
+                "GITHUB_OUTPUT": str(output),
+                **env,
+            },
+        )
+        self.addCleanup(self.assertNotIn, "Traceback", done.stdout + done.stderr)
+        lines = output.read_text().splitlines() if output.exists() else []
+        return done, dict(line.split("=", 1) for line in lines)
+
+    def assert_selected(
+        self, outputs: dict[str, str], *projects: tuple[str, str]
+    ) -> None:
+        self.assertEqual(
+            json.loads(outputs["matrix"]),
+            [{"project": name, "container": kind} for name, kind in projects],
+        )
+        self.assertEqual(outputs["count"], str(len(projects)))
+
+    @unittest.expectedFailure
+    def test_blank_input_selects_every_enabled_project(self) -> None:
+        cases: tuple[list[str] | None, ...] = (None, [])
+        for names in cases:
+            with self.subTest(names=names):
+                done, outputs = self.resolve(names)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assert_selected(outputs, ("alpha", "legacy"), ("beta", "modern"))
+                self.assertEqual(outputs["mode"], "dry-run")
+                self.assertNotIn("::warning::", done.stdout)
+
+    @unittest.expectedFailure
+    def test_named_projects_are_selected_in_order(self) -> None:
+        done, outputs = self.resolve(["beta", "alpha"], MODE_INPUT="signing")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assert_selected(outputs, ("beta", "modern"), ("alpha", "legacy"))
+        self.assertEqual(outputs["mode"], "signing")
+        summary = (self.root / "summary").read_text()
+        self.assertIn("`beta` (modern)", summary)
+
+    @unittest.expectedFailure
+    def test_every_unknown_name_is_reported(self) -> None:
+        done, outputs = self.resolve(["delta", "beta", "zeta"])
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        errors = [line for line in done.stdout.splitlines() if "::error::" in line]
+        self.assertEqual(len(errors), 2, done.stdout)
+        self.assertIn("delta", errors[0])
+        self.assertIn("zeta", errors[1])
+        self.assertEqual(outputs, {})
+
+    @unittest.expectedFailure
+    def test_a_disabled_name_is_skipped_with_a_warning(self) -> None:
+        done, outputs = self.resolve(["gamma", "beta"])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assert_selected(outputs, ("beta", "modern"))
+        self.assertIn(
+            "::warning::Skipping gamma: disabled in SIGUL_LIVE_PROJECTS\n", done.stdout
+        )
+        self.assertIn("`gamma`", (self.root / "summary").read_text())
+
+    @unittest.expectedFailure
+    def test_only_disabled_names_select_nothing(self) -> None:
+        done, outputs = self.resolve(["gamma"])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assert_selected(outputs)
+
+    @unittest.expectedFailure
+    def test_names_ignore_case_and_duplicates(self) -> None:
+        done, outputs = self.resolve(["BETA", "alpha", "beta", "Alpha"])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assert_selected(outputs, ("beta", "modern"), ("alpha", "legacy"))
+
+    @unittest.expectedFailure
+    def test_a_schedule_tests_the_connection_of_every_enabled_project(self) -> None:
+        done, outputs = self.resolve(EVENT_NAME="schedule", MODE_INPUT="")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(outputs["mode"], "connection-test")
+        self.assert_selected(outputs, ("alpha", "legacy"), ("beta", "modern"))
+
+    @unittest.expectedFailure
+    def test_bad_configuration_fails(self) -> None:
+        for projects in (
+            "",
+            "{not json",
+            "[]",
+            "{}",
+            {"alpha": "legacy"},
+            {"alpha": {"container": "bespoke", "enabled": True}},
+            {"alpha": {"enabled": True}},
+            {"alpha": {"container": "legacy", "enabled": "true"}},
+            {"alpha": {"container": "legacy"}},
+            {
+                "alpha": {"container": "legacy", "enabled": True},
+                "ALPHA": {"container": "legacy", "enabled": True},
+            },
+        ):
+            with self.subTest(projects=projects):
+                done, outputs = self.resolve(projects=projects)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("::error::", done.stdout)
+                self.assertIn("SIGUL_LIVE_PROJECTS", done.stdout)
+                self.assertEqual(outputs, {})
+
+    @unittest.expectedFailure
+    def test_every_configuration_error_is_reported(self) -> None:
+        done, _ = self.resolve(
+            projects={
+                "alpha": {"container": "bespoke", "enabled": True},
+                "beta": {"container": "modern", "enabled": 1},
+            }
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("alpha.container", done.stdout)
+        self.assertIn("beta.enabled", done.stdout)
+
+    @unittest.expectedFailure
+    def test_off_main_selects_nothing_with_a_notice(self) -> None:
+        for env in (
+            {"REF": "refs/heads/feature"},
+            {"REF": "refs/pull/7/merge"},
+            {"REPOSITORY": "someone/sigul-sign-action"},
+        ):
+            with self.subTest(env=env):
+                # Even a missing configuration ends cleanly off main.
+                done, outputs = self.resolve(["zeta"], projects="", **env)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("::notice::", done.stdout)
+                self.assertIn("only the main branch", done.stdout)
+                self.assert_selected(outputs)
+
+    @unittest.expectedFailure
+    def test_configuration_reaches_the_script_through_env(self) -> None:
+        step = job_step("resolve", "Select the projects")
+        self.assertIn("SIGUL_LIVE_PROJECTS: ${{ vars.SIGUL_LIVE_PROJECTS }}", step)
+        self.assertNotIn("secrets.", LIVE_SOURCE.split("\n  live:\n")[0])
+
+    @unittest.expectedFailure
+    def test_the_input_is_split_by_the_pinned_list_splitter(self) -> None:
+        step = job_step("resolve", "Split the projects input")
+        self.assertIn(
+            "uses: lfreleng-actions/list-splitter-action@"
+            + "b56a625474875d05ca8d1c1eb3314c29c526c9a6  # v0.1.0",
+            step,
+        )
+        self.assertIn("validate: 'none'", step)
+        self.assertIn(
+            "NAMES: ${{ steps.split.outputs.json }}",
+            job_step("resolve", "Select the projects"),
+        )
+
+
+# The configuration check's environment when the project is fully set up.
+CONFIGURED_PROJECT = {
     "PROJECT": "opensearch",
     "CONTAINER": "modern",
     "HAVE_CREDENTIALS": "true",
@@ -472,7 +852,7 @@ class LiveProjectConfigurationTests(WorkflowShellTests):
     def check(self, **env: str) -> subprocess.CompletedProcess[str]:
         return self.shell(
             live_script("Check the project configuration"),
-            **{**COMPLETE_PROJECT, **env},
+            **{**CONFIGURED_PROJECT, **env},
         )
 
     def test_complete_configuration_passes(self) -> None:
@@ -509,24 +889,52 @@ class LiveProjectConfigurationTests(WorkflowShellTests):
 
 LIVE_SOURCE = (REPOSITORY / ".github" / "workflows" / "live-signing.yaml").read_text()
 
+# Each mode's action call, and the inputs only it passes.
+ACTION_CALLS = {
+    "Dry run with Sigul": (
+        "dry-run",
+        ("sign-type: sign-data", 'dry-run: "true"'),
+    ),
+    "Check the connection with Sigul": (
+        "connection-test",
+        ("sign-type: check-connection",),
+    ),
+    "Sign with Sigul": (
+        "signing",
+        ("sign-type: ${{ inputs.operation }}", 'push-tag: "false"'),
+    ),
+}
+
 
 class LiveSigningWiringTests(unittest.TestCase):
-    def test_signing_uses_the_unpacked_credentials_and_the_pin(self) -> None:
-        step = named_step(LIVE_STEPS, "Sign with Sigul")
-        for line in (
-            "container: ${{ env.CONTAINER }}",
-            "allow-legacy: ${{ env.CONTAINER == 'legacy' }}",
-            "sigul-key-name: ${{ vars.SIGUL_KEY }}",
-            "sigul-conf: ${{ steps.creds.outputs.config }}",
-            "sigul-pass: ${{ steps.creds.outputs.password }}",
-            "sigul-pki: ${{ steps.creds.outputs.pki }}",
-            "sigul-ip: ${{ steps.pin.outputs.address }}",
-            "sigul-uri: ${{ env.BRIDGE_HOST }}",
-            'sigul-hosts-entry: "true"',
-        ):
-            with self.subTest(line=line):
-                self.assertRegex(step, rf"(?m)^          {re.escape(line)}$")
+    @unittest.expectedFailure
+    def test_each_mode_uses_the_unpacked_credentials_and_the_pin(self) -> None:
+        for name, (mode, extra) in ACTION_CALLS.items():
+            step = named_step(LIVE_STEPS, name)
+            self.assertEqual(
+                step_condition(step), f"${{{{ {READY} && env.MODE == '{mode}' }}}}"
+            )
+            for line in (
+                "uses: $/",
+                "container: ${{ matrix.container }}",
+                "allow-legacy: ${{ matrix.container == 'legacy' }}",
+                "sigul-key-name: ${{ vars.SIGUL_KEY }}",
+                "sigul-conf: ${{ steps.creds.outputs.config }}",
+                "sigul-pass: ${{ steps.creds.outputs.password }}",
+                "sigul-pki: ${{ steps.creds.outputs.pki }}",
+                "sigul-ip: ${{ steps.pin.outputs.address }}",
+                "sigul-uri: ${{ env.BRIDGE_HOST }}",
+                'sigul-hosts-entry: "true"',
+                "expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}",
+                *extra,
+            ):
+                with self.subTest(step=name, line=line):
+                    self.assertIn(" " + line + "\n", " " + step.strip() + "\n")
+        connect = named_step(LIVE_STEPS, "Check the connection with Sigul")
+        self.assertNotIn("sign-object:", connect)
+        self.assertRegex(connect, r"(?m)^        id: connect$")
 
+    @unittest.expectedFailure
     def test_retired_secrets_and_inputs_are_gone(self) -> None:
         for retired in (
             "secrets.SIGUL_CONF",
@@ -537,20 +945,151 @@ class LiveSigningWiringTests(unittest.TestCase):
             "secrets.SIGUL_KEY",
             "inputs.container",
             "inputs.allow-legacy",
+            "inputs.dry-run",
+            "inputs.project ",
+            "inputs.project }",
+            "env.CONTAINER",
             "sigul-${{",
         ):
             with self.subTest(retired=retired):
                 self.assertNotIn(retired, LIVE_SOURCE)
 
-    def test_job_runs_in_the_selected_project_environment(self) -> None:
+    @unittest.expectedFailure
+    def test_no_project_is_named_in_the_workflow(self) -> None:
+        for project in ("onap", "opendaylight", "o-ran-sc", 'opensearch"'):
+            with self.subTest(project=project):
+                self.assertNotIn(project, LIVE_SOURCE.lower())
+
+    @unittest.expectedFailure
+    def test_job_runs_in_each_selected_project_environment(self) -> None:
+        live = LIVE_SOURCE.split("\n  live:\n", 1)[1].split("\n  notify-slack:\n")[0]
+        for line in (
+            "    environment: ${{ matrix.project }}",
+            "    needs: resolve",
+            "    if: ${{ needs.resolve.outputs.count != '0' }}",
+            "      fail-fast: false",
+            "        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}",
+            "      BRIDGE_HOST: ${{ vars.SIGUL_URI }}",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line + "\n", live)
+
+    @unittest.expectedFailure
+    def test_triggers_and_inputs(self) -> None:
+        self.assertIn("    - cron: '17 */6 * * *'\n", LIVE_SOURCE)
         self.assertRegex(
-            LIVE_SOURCE, r"(?m)^    environment: \$\{\{ inputs\.project \}\}$"
+            LIVE_SOURCE,
+            r"(?m)^      mode:\n(?:        .*\n)*?"
+            + r'        options: \["dry-run", "connection-test", "signing"\]\n'
+            + r'        default: "dry-run"$',
         )
         self.assertRegex(
             LIVE_SOURCE,
-            r"(?m)^      project:\n(?:        .*\n)*?"
-            + r'        options: \["onap", "opendaylight", "o-ran-sc", "opensearch"\]$',
+            r"(?m)^      projects:\n(?:        .*\n)*?        type: string$",
         )
+        self.assertRegex(
+            LIVE_SOURCE,
+            r"(?m)^      operation:\n(?:        .*\n)*?"
+            + r'        options: \["sign-data", "sign-git-tag"\]$',
+        )
+        self.assertIn("  GH_TELEMETRY: 'false'\n", LIVE_SOURCE)
+
+
+GH_STUB = r"""
+gh() {
+    printf 'gh %s\n' "$*" >> "$COMMAND_LOG"
+    [ "$1" = api ] || return 99
+    cat "$HOME/api-response"
+}
+"""
+
+
+class NotifySlackTests(WorkflowShellTests):
+    def summarise(self, *jobs: object) -> tuple[subprocess.CompletedProcess[str], str]:
+        _ = (self.root / "api-response").write_text(
+            "".join(json.dumps(job) + "\n" for job in jobs)
+        )
+        output = self.root / "output"
+        done = self.shell(
+            GH_STUB + shell_body(job_step("notify-slack", "List the failed jobs")),
+            REPOSITORY=HOME_REPOSITORY,
+            RUN_ID="42",
+            RUN_ATTEMPT="1",
+            GITHUB_OUTPUT=str(output),
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        name, value = output.read_text().strip().split("=", 1)
+        self.assertEqual(name, "summary")
+        return done, cast(str, json.loads(value))
+
+    @unittest.expectedFailure
+    def test_failed_and_cancelled_jobs_name_their_first_failed_step(self) -> None:
+        def step(name: str, conclusion: str) -> dict[str, str]:
+            return {"name": name, "conclusion": conclusion}
+
+        _, summary = self.summarise(
+            {"name": "Select projects", "conclusion": "success", "steps": []},
+            {
+                "name": "connection-test: alpha",
+                "conclusion": "failure",
+                "steps": [
+                    step("Check environment readiness", "success"),
+                    step("Check the selected bridge", "failure"),
+                    step("Compare the server's key", "skipped"),
+                ],
+            },
+            {
+                "name": "connection-test: beta",
+                "conclusion": "cancelled",
+                "steps": [step("Check the connection with Sigul", "cancelled")],
+            },
+            {"name": "connection-test: <b>", "conclusion": "success", "steps": []},
+            {"name": "Notify Slack on failure", "conclusion": None, "steps": []},
+        )
+        self.assertEqual(
+            summary.splitlines(),
+            [
+                "• *connection-test: alpha* (failure): Check the selected bridge",
+                "• *connection-test: beta* (cancelled): "
+                + "Check the connection with Sigul",
+            ],
+        )
+        calls = (self.root / "commands").read_text()
+        self.assertIn(
+            "repos/lfreleng-actions/sigul-sign-action/actions/runs/42/attempts/1/jobs",
+            calls,
+        )
+
+    @unittest.expectedFailure
+    def test_slack_markup_in_names_is_escaped(self) -> None:
+        _, summary = self.summarise(
+            {"name": "x <!channel> & y", "conclusion": "failure", "steps": []}
+        )
+        self.assertIn("x &lt;!channel&gt; &amp; y", summary)
+        self.assertIn("no failed step recorded", summary)
+
+    @unittest.expectedFailure
+    def test_notification_is_scheduled_failures_only(self) -> None:
+        notify = LIVE_SOURCE.split("\n  notify-slack:\n", 1)[1]
+        condition = " ".join(
+            notify.split("    if: >-\n", 1)[1].split("\n    runs-on")[0].split()
+        )
+        self.assertEqual(
+            condition,
+            "${{ always() && github.event_name == 'schedule' && "
+            + "(contains(needs.*.result, 'failure') || "
+            + "contains(needs.*.result, 'cancelled')) }}",
+        )
+        for line in (
+            "    needs: [resolve, live]",
+            "    environment: notifications",
+            "      actions: read  #",
+            "            api.github.com:443 slack.com:443",
+            '          token: "${{ secrets.SLACK_BOT_TOKEN }}"',
+            "          method: 'chat.postMessage'",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line, notify)
 
 
 class ValidationAssertionTests(WorkflowShellTests):
