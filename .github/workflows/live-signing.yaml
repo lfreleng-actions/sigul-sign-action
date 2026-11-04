@@ -67,12 +67,13 @@
 # 'notify-slack' job posts the failed projects and their first failed
 # step to Slack. Manual runs never post.
 #
-# Sigul's client fails on a bridge name that resolves to several
-# addresses (lfreleng-actions/sigul-docker-k8s#102), so the workflow pins
-# the name to the first address that accepts a connection and passes it
-# to the action as a hosts entry. That check opens a TCP connection to
-# the bridge, in every mode. This is interim, until the action does it
-# itself (lfreleng-actions/sigul-sign-action#32).
+# The legacy 0.207 Sigul client fails on a bridge name that resolves to
+# several addresses (lfreleng-actions/sigul-docker-k8s#102); the modern
+# client has handled it since v2.6.7. The workflow pins the name for
+# both clients, so every project takes the same path: it picks the first
+# address that accepts a TCP connection on port 44334 and passes it to
+# the action as a hosts entry. That check opens a TCP connection to the
+# bridge, in every mode.
 name: "Live signing 🔏"
 
 # yamllint disable-line rule:truthy
@@ -359,8 +360,9 @@ jobs:
             exit 1
           fi
 
-      # Interim workaround for lfreleng-actions/sigul-docker-k8s#102, until
-      # lfreleng-actions/sigul-sign-action#32 pins inside the action.
+      # Pins the bridge name to one address for both clients; the legacy
+      # client fails on a multi-address name
+      # (lfreleng-actions/sigul-docker-k8s#102).
       - name: "Pin the bridge address"
         id: pin
         if: ${{ steps.ready.outputs.ready == 'true' }}
