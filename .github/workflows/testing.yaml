@@ -63,7 +63,7 @@ jobs:
         runner: ["ubuntu-22.04", "ubuntu-24.04"]
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+      - uses: lfreleng-actions/harden-runner-block-action@36a02f4a61b27e7a0a91e1df2134abe9545cf54e  # v0.16.1
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
@@ -141,7 +141,7 @@ jobs:
             dry_run: "yes"
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+      - uses: lfreleng-actions/harden-runner-block-action@36a02f4a61b27e7a0a91e1df2134abe9545cf54e  # v0.16.1
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
@@ -252,7 +252,7 @@ jobs:
       BRIDGE_NAME: "sigul-bridge.test"
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+      - uses: lfreleng-actions/harden-runner-block-action@36a02f4a61b27e7a0a91e1df2134abe9545cf54e  # v0.16.1
         with:
           config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
