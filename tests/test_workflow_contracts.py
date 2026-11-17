@@ -649,6 +649,10 @@ def job_step(job: str, name: str) -> str:
 
 
 HOME_REPOSITORY = "lfreleng-actions/sigul-sign-action"
+# Any release of the list splitter, pinned to a full commit SHA with its tag.
+LIST_SPLITTER_PIN = re.compile(
+    r"(?m)^ +uses: lfreleng-actions/list-splitter-action@[0-9a-f]{40}  # v\d+(\.\d+)*$"
+)
 PROJECTS = {
     "alpha": {"container": "legacy", "enabled": True},
     "beta": {"container": "modern", "enabled": True},
@@ -800,16 +804,19 @@ class ResolveTests(WorkflowShellTests):
 
     def test_the_input_is_split_by_the_pinned_list_splitter(self) -> None:
         step = job_step("resolve", "Split the projects input")
-        self.assertIn(
-            "uses: lfreleng-actions/list-splitter-action@"
-            + "b56a625474875d05ca8d1c1eb3314c29c526c9a6  # v0.1.0",
-            step,
-        )
+        self.assertRegex(step, LIST_SPLITTER_PIN)
         self.assertIn("validate: 'none'", step)
         self.assertIn(
             "NAMES: ${{ steps.split.outputs.json }}",
             job_step("resolve", "Select the projects"),
         )
+
+    def test_the_list_splitter_pin_rejects_a_movable_reference(self) -> None:
+        sha = "7bf2f3ab24d636464db599ce349bf345910c08d6"
+        for ref in ("v0  # v0", "main  # v0.1.1", f"{sha[:7]}  # v0.1.1", sha):
+            with self.subTest(ref=ref):
+                line = f"        uses: lfreleng-actions/list-splitter-action@{ref}\n"
+                self.assertNotRegex(line, LIST_SPLITTER_PIN)
 
 
 LIVE_SOURCE = (REPOSITORY / ".github" / "workflows" / "live-signing.yaml").read_text()
