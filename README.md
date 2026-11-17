@@ -5,6 +5,21 @@
 
 # 🔏 Sigul Sign Action
 
+<!-- markdownlint-disable MD013 -->
+
+[![Linux Foundation](https://img.shields.io/badge/Linux-Foundation-blue)](https://linuxfoundation.org/)
+[![Source Code](https://img.shields.io/badge/GitHub-Source-blue?logo=github&logoColor=white)](https://github.com/lfreleng-actions/sigul-sign-action)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![REUSE status](https://api.reuse.software/badge/github.com/lfreleng-actions/sigul-sign-action)](https://api.reuse.software/info/github.com/lfreleng-actions/sigul-sign-action)
+[![Latest Release](https://img.shields.io/github/v/release/lfreleng-actions/sigul-sign-action?label=Release&include_prereleases&sort=semver)](https://github.com/lfreleng-actions/sigul-sign-action/releases)
+
+[![Release](https://github.com/lfreleng-actions/sigul-sign-action/actions/workflows/release.yaml/badge.svg)](https://github.com/lfreleng-actions/sigul-sign-action/actions/workflows/release.yaml)
+[![Tests](https://github.com/lfreleng-actions/sigul-sign-action/actions/workflows/testing.yaml/badge.svg?branch=main)](https://github.com/lfreleng-actions/sigul-sign-action/actions/workflows/testing.yaml)
+[![pre-commit.ci status badge]][pre-commit.ci results page]
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lfreleng-actions/sigul-sign-action/badge)](https://scorecard.dev/viewer/?uri=github.com/lfreleng-actions/sigul-sign-action)
+
+<!-- markdownlint-enable MD013 -->
+
 Signs artefacts or a git tag using a [Sigul][sigul] signing server.
 
 Sigul keeps the artefact-signing private key on the server. The client sends
@@ -813,3 +828,5 @@ production use, including after a client-image update.
 [sigul]: https://pagure.io/sigul
 [legacy]: https://github.com/lfit/sigul-sign-action
 [rsd]: https://github.com/lfit/releng-sigul-docker
+[pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/sigul-sign-action/main
+[pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/sigul-sign-action/main.svg
