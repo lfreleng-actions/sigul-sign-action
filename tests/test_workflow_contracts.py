@@ -73,6 +73,13 @@ VALIDATION_SCRIPT = shell_body(VALIDATION_STEP)
 # The readiness guard every live step after the readiness check carries.
 READY = "steps.ready.outputs.ready == 'true'"
 
+# Modern-stack bridges named after the project they serve.
+PROJECT_BRIDGES = (
+    "sigul-bridge.onap.org",
+    "sigul-bridge.opendaylight.org",
+    "sigul-bridge.o-ran-sc.org",
+)
+
 # Functions intercept every external-service/credential command in these steps.
 # No real Docker, Git or GPG is invoked, and mktemp stays inside the test fixture.
 STUBS = r"""
@@ -316,6 +323,13 @@ class LiveAllowlistTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 self.assertIn(endpoint, block)
 
+    @unittest.expectedFailure
+    def test_allowlist_names_every_project_bridge(self) -> None:
+        block = harden_runner_allowlist()
+        for host in PROJECT_BRIDGES:
+            with self.subTest(host=host):
+                self.assertIn(f"'{host}'", block)
+
 
 class LiveBridgeSelectionTests(WorkflowShellTests):
     def test_existing_allowlist_accepts_only_the_selected_infrastructure(self) -> None:
@@ -332,6 +346,15 @@ class LiveBridgeSelectionTests(WorkflowShellTests):
             with self.subTest(container=container, host=host):
                 done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
                 self.assertEqual(done.returncode, status, done.stdout + done.stderr)
+
+    @unittest.expectedFailure
+    def test_project_bridges_accept_only_the_modern_client(self) -> None:
+        script = shell_body(named_step(LIVE_STEPS, "Check the selected bridge"))
+        for host in PROJECT_BRIDGES:
+            for container, status in (("modern", 0), ("legacy", 1)):
+                with self.subTest(container=container, host=host):
+                    done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
+                    self.assertEqual(done.returncode, status, done.stdout + done.stderr)
 
 
 def live_script(name: str) -> str:
@@ -885,9 +908,14 @@ class LiveSigningWiringTests(unittest.TestCase):
                 self.assertNotIn(retired, LIVE_SOURCE)
 
     def test_no_project_is_named_in_the_workflow(self) -> None:
+        # A bridge's host name carries its project's name; set aside only
+        # whole approved host names, so the name anywhere else still fails.
+        source = LIVE_SOURCE.lower()
+        for host in PROJECT_BRIDGES:
+            source = re.sub(rf"(?<![\w.-]){re.escape(host)}(?![\w.-])", "", source)
         for project in ("onap", "opendaylight", "o-ran-sc", 'opensearch"'):
             with self.subTest(project=project):
-                self.assertNotIn(project, LIVE_SOURCE.lower())
+                self.assertNotIn(project, source)
 
     def test_job_runs_in_each_selected_project_environment(self) -> None:
         live = LIVE_SOURCE.split("\n  live:\n", 1)[1].split("\n  notify-slack:\n")[0]
