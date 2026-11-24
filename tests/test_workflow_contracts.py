@@ -324,7 +324,6 @@ class LiveAllowlistTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 self.assertIn(endpoint, block)
 
-    @unittest.expectedFailure
     def test_allowlist_names_the_project_bridges(self) -> None:
         block = harden_runner_allowlist()
         for host in PROJECT_BRIDGES:
@@ -348,7 +347,6 @@ class LiveBridgeSelectionTests(WorkflowShellTests):
                 done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
                 self.assertEqual(done.returncode, status, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_project_bridges_take_the_modern_client_only(self) -> None:
         script = shell_body(named_step(LIVE_STEPS, "Check the selected bridge"))
         for host in PROJECT_BRIDGES:
@@ -909,9 +907,14 @@ class LiveSigningWiringTests(unittest.TestCase):
                 self.assertNotIn(retired, LIVE_SOURCE)
 
     def test_no_project_is_named_in_the_workflow(self) -> None:
+        # An approved bridge's host name may carry its project's name;
+        # nothing else in the workflow may name a project.
+        source = LIVE_SOURCE.lower()
+        for bridge in PROJECT_BRIDGES:
+            source = source.replace(bridge, "")
         for project in ("onap", "opendaylight", "o-ran-sc", 'opensearch"'):
             with self.subTest(project=project):
-                self.assertNotIn(project, LIVE_SOURCE.lower())
+                self.assertNotIn(project, source)
 
     def test_job_runs_in_each_selected_project_environment(self) -> None:
         live = LIVE_SOURCE.split("\n  live:\n", 1)[1].split("\n  notify-slack:\n")[0]

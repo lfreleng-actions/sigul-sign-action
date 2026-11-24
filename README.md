@@ -676,6 +676,9 @@ validation of encrypted configuration before materialization.
 | `sigul-bridge-yul.linuxfoundation.org`       | Legacy         | ONAP, OpenDaylight, EdgeX |
 | `sigul-bridge-us-west-2.linuxfoundation.org` | Legacy         | O-RAN-SC, DENT            |
 | `sigul-bridge.opensearch.org`                | Modern         | OpenSearch                |
+| `sigul-bridge.onap.org`                      | Modern         | ONAP                      |
+| `sigul-bridge.opendaylight.org`              | Modern         | OpenDaylight              |
+| `sigul-bridge.o-ran-sc.org`                  | Modern         | O-RAN-SC                  |
 
 <!-- markdownlint-enable MD013 -->
 
