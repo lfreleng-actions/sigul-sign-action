@@ -272,6 +272,14 @@ class ExpectedBridgeContractTests(unittest.TestCase):
         )
 
 
+# Each project's own bridge on the modern stack, beside OpenSearch's.
+PROJECT_BRIDGES = (
+    "sigul-bridge.onap.org",
+    "sigul-bridge.opendaylight.org",
+    "sigul-bridge.o-ran-sc.org",
+)
+
+
 def harden_runner_allowlist() -> str:
     """The live workflow's allowed-endpoints value, as written in YAML."""
     step = named_step(LIVE_STEPS, "Harden runner (block)")
@@ -316,6 +324,13 @@ class LiveAllowlistTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 self.assertIn(endpoint, block)
 
+    @unittest.expectedFailure
+    def test_allowlist_names_the_project_bridges(self) -> None:
+        block = harden_runner_allowlist()
+        for host in PROJECT_BRIDGES:
+            with self.subTest(host=host):
+                self.assertIn(f"'{host}'", block)
+
 
 class LiveBridgeSelectionTests(WorkflowShellTests):
     def test_existing_allowlist_accepts_only_the_selected_infrastructure(self) -> None:
@@ -332,6 +347,15 @@ class LiveBridgeSelectionTests(WorkflowShellTests):
             with self.subTest(container=container, host=host):
                 done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
                 self.assertEqual(done.returncode, status, done.stdout + done.stderr)
+
+    @unittest.expectedFailure
+    def test_project_bridges_take_the_modern_client_only(self) -> None:
+        script = shell_body(named_step(LIVE_STEPS, "Check the selected bridge"))
+        for host in PROJECT_BRIDGES:
+            for container, status in (("modern", 0), ("legacy", 1)):
+                with self.subTest(container=container, host=host):
+                    done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
+                    self.assertEqual(done.returncode, status, done.stdout + done.stderr)
 
 
 def live_script(name: str) -> str:
