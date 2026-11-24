@@ -272,7 +272,7 @@ jobs:
           # folded block keeps around continuation lines fuse neighbours
           # into one entry, leaving the bridge off the list.
           allowed-endpoints: >-
-            ${{ format('{0} {1} {2} {3} {4} {5} {6}',
+            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7}',
                 'github.com:443',
                 matrix.container == 'modern' &&
                   'ghcr.io:443 pkg-containers.githubusercontent.com:443' ||
@@ -291,7 +291,12 @@ jobs:
                   format('{0}:44334', env.BRIDGE_HOST) || '',
                 matrix.container == 'modern' &&
                   env.BRIDGE_HOST == 'sigul-bridge.opensearch.org' &&
-                  'sigul-bridge.opensearch.org:44334' || '') }}
+                  'sigul-bridge.opensearch.org:44334' || '',
+                matrix.container == 'modern' &&
+                  (env.BRIDGE_HOST == 'sigul-bridge.onap.org' ||
+                   env.BRIDGE_HOST == 'sigul-bridge.opendaylight.org' ||
+                   env.BRIDGE_HOST == 'sigul-bridge.o-ran-sc.org') &&
+                  format('{0}:44334', env.BRIDGE_HOST) || '') }}
 
       # Presence flags only: no secret value reaches this step.
       - name: "Check environment readiness"
@@ -340,7 +345,10 @@ jobs:
           case "${CONTAINER}:${BRIDGE_HOST}" in
             legacy:sigul-bridge-yul.linuxfoundation.org | \
             legacy:sigul-bridge-us-west-2.linuxfoundation.org | \
-            modern:sigul-bridge.opensearch.org) ;;
+            modern:sigul-bridge.opensearch.org | \
+            modern:sigul-bridge.onap.org | \
+            modern:sigul-bridge.opendaylight.org | \
+            modern:sigul-bridge.o-ran-sc.org) ;;
             *)
               echo "::error::SIGUL_URI does not match the selected client"
               exit 1

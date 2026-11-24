@@ -323,7 +323,6 @@ class LiveAllowlistTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 self.assertIn(endpoint, block)
 
-    @unittest.expectedFailure
     def test_allowlist_names_every_project_bridge(self) -> None:
         block = harden_runner_allowlist()
         for host in PROJECT_BRIDGES:
@@ -347,7 +346,6 @@ class LiveBridgeSelectionTests(WorkflowShellTests):
                 done = self.shell(script, CONTAINER=container, BRIDGE_HOST=host)
                 self.assertEqual(done.returncode, status, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_project_bridges_accept_only_the_modern_client(self) -> None:
         script = shell_body(named_step(LIVE_STEPS, "Check the selected bridge"))
         for host in PROJECT_BRIDGES:
