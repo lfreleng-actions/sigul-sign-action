@@ -819,6 +819,31 @@ A passing automated workflow is not proof that the server signs or that the
 returned signature verifies. Complete the non-dry live verification before
 production use, including after a client-image update.
 
+#### Sized payload
+
+A manual `signing` run with `sign-data` may also set `payload_bytes`, to sign
+a pseudo-random file of that size in place of the small text file. Use it
+against a service configured to accept that size, and nowhere else: it times
+a large upload end to end, through a real client over a real network. The
+`resolve` job, before any environment or secret is in reach, refuses the run
+when:
+
+- the value is not plain digits, or falls outside 1 to 17179869184 (16 GiB);
+- the run is not `signing` with `sign-data`;
+- a selected project uses the `legacy` container, naming that project.
+
+The job checks that the runner has room for the file plus 1 GiB, and fails
+before writing it, with the free and needed sizes, when it does not. It
+writes the file without holding it in memory. A sized payload gets one
+attempt (`max-retries: 1`), stopped after 600 seconds plus the payload at an
+assumed 1 MiB/s. The job's timeout grows by that attempt on top of its usual
+20 minutes, to 304 minutes at the 16 GiB ceiling, inside a hosted runner's
+six hours. The signature must verify against `SIGUL_PUBLIC_KEY` as usual.
+The job summary and a notice report the size, the time `Sign with Sigul`
+took, the rate in MB/s and whether that attempt succeeded. Scheduled runs
+never set the input, and a run without it keeps the small file, the action's
+default retries and the 20-minute job.
+
 ## Layout
 
 - `action.yaml` holds the inputs and two steps: a check, then signing.

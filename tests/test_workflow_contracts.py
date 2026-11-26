@@ -850,7 +850,6 @@ class ResolveTests(WorkflowShellTests):
             **{"MODE_INPUT": "signing", "PAYLOAD_BYTES_INPUT": payload, **env},
         )
 
-    @unittest.expectedFailure
     def test_no_payload_keeps_the_small_file_run(self) -> None:
         defaults = (
             ("max_retries", action_default("max-retries")),
@@ -870,7 +869,6 @@ class ResolveTests(WorkflowShellTests):
                 for key, value in defaults:
                     self.assertEqual(outputs[key], value, key)
 
-    @unittest.expectedFailure
     def test_a_sized_payload_gets_one_attempt_scaled_to_its_size(self) -> None:
         # 600 s plus the payload at 1 MiB/s; the job gets its usual 20
         # minutes plus that attempt, and the ceiling fits GitHub's 6 hours.
@@ -892,7 +890,6 @@ class ResolveTests(WorkflowShellTests):
                 self.assertLessEqual(int(attempt), 86400)
                 self.assertLessEqual(int(minutes), 360)
 
-    @unittest.expectedFailure
     def test_a_bad_payload_size_is_refused(self) -> None:
         for size in (
             "abc",
@@ -913,7 +910,6 @@ class ResolveTests(WorkflowShellTests):
                 self.assertIn("::error::payload_bytes", done.stdout)
                 self.assertEqual(outputs, {})
 
-    @unittest.expectedFailure
     def test_a_sized_payload_needs_signing_with_sign_data(self) -> None:
         for env in (
             {"MODE_INPUT": "dry-run"},
@@ -927,7 +923,6 @@ class ResolveTests(WorkflowShellTests):
                 self.assertIn("sign-data", done.stdout)
                 self.assertEqual(outputs, {})
 
-    @unittest.expectedFailure
     def test_a_sized_payload_refuses_a_legacy_project(self) -> None:
         for names in ([], ["alpha"], ["beta", "alpha"]):
             with self.subTest(names=names):
@@ -943,7 +938,6 @@ class ResolveTests(WorkflowShellTests):
                 self.assertIn("legacy", errors[0])
                 self.assertEqual(outputs, {})
 
-    @unittest.expectedFailure
     def test_the_payload_input_reaches_resolve_only_through_env(self) -> None:
         step = job_step("resolve", "Select the projects")
         self.assertIn("PAYLOAD_BYTES_INPUT: ${{ inputs.payload_bytes }}", step)
@@ -1081,7 +1075,6 @@ class LiveSigningWiringTests(unittest.TestCase):
         )
         self.assertIn("  GH_TELEMETRY: 'false'\n", LIVE_SOURCE)
 
-    @unittest.expectedFailure
     def test_payload_input_is_optional_and_blank_by_default(self) -> None:
         self.assertRegex(
             LIVE_SOURCE,
@@ -1091,7 +1084,6 @@ class LiveSigningWiringTests(unittest.TestCase):
             + r'        default: ""$',
         )
 
-    @unittest.expectedFailure
     def test_the_resolved_timings_reach_the_job_and_the_signing_step(self) -> None:
         live = LIVE_SOURCE.split("\n  live:\n", 1)[1].split("\n  notify-slack:\n")[0]
         for line in (
@@ -1152,7 +1144,6 @@ class LivePayloadTests(WorkflowShellTests):
             f"sigul-sign-action live test\nrun 4242\ncommit {'f' * 40}\n",
         )
 
-    @unittest.expectedFailure
     def test_a_sized_payload_is_written_at_that_size(self) -> None:
         done = self.make("70000", str(2**40))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -1165,7 +1156,6 @@ class LivePayloadTests(WorkflowShellTests):
         self.assertGreater(len(set(payload)), 200)
         self.assertFalse((self.root / "live-signing" / "payload.txt").exists())
 
-    @unittest.expectedFailure
     def test_a_payload_without_room_fails_before_writing(self) -> None:
         margin = 2**30
         for avail in ("0", str(70000 + margin - 1)):
@@ -1182,7 +1172,6 @@ class LivePayloadTests(WorkflowShellTests):
         done = self.make("70000", str(70000 + margin))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-    @unittest.expectedFailure
     def test_the_payload_size_reaches_the_step_through_env(self) -> None:
         step = named_step(LIVE_STEPS, "Make something to sign")
         self.assertIn("${PAYLOAD_BYTES", shell_body(step))
@@ -1214,7 +1203,6 @@ class LiveTimingTests(WorkflowShellTests):
         self.addCleanup(self.assertNotIn, "Traceback", done.stdout + done.stderr)
         return done
 
-    @unittest.expectedFailure
     def test_a_signed_payload_reports_size_time_and_rate(self) -> None:
         done = self.report("success")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -1233,7 +1221,6 @@ class LiveTimingTests(WorkflowShellTests):
             with self.subTest(item=item):
                 self.assertIn(item, summary)
 
-    @unittest.expectedFailure
     def test_a_failed_attempt_is_reported(self) -> None:
         done = self.report("failure")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -1242,7 +1229,6 @@ class LiveTimingTests(WorkflowShellTests):
             "| First attempt succeeded | no |", (self.root / "summary").read_text()
         )
 
-    @unittest.expectedFailure
     def test_the_clock_brackets_the_signing_step(self) -> None:
         names = [step.splitlines()[0] for step in LIVE_STEPS]
         start = names.index('name: "Start the signing clock"')
@@ -1267,7 +1253,6 @@ class LiveTimingTests(WorkflowShellTests):
             with self.subTest(line=line):
                 self.assertIn(line, report)
 
-    @unittest.expectedFailure
     def test_the_report_names_no_path_host_or_credential(self) -> None:
         report = named_step(LIVE_STEPS, "Report the signing time")
         for item in ("secrets.", "vars.", "BRIDGE_HOST", "steps.pin", "steps.target"):

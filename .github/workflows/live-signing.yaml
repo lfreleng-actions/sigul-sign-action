@@ -24,6 +24,21 @@
 # Every mode decrypts real credentials and runs the selected image, so
 # each needs a trusted job.
 #
+# SIZED PAYLOAD. A manual signing run with the sign-data operation may
+# set 'payload_bytes' to sign a file of that many pseudo-random bytes in
+# place of the small text file, from 1 to 17179869184 (16 GiB). It times
+# a service configured to accept that size, end to end; it is not for
+# routine runs. Only modern projects take it: 'resolve' refuses the run,
+# naming the project, when a selected project uses the legacy container.
+# The file is written only when the disk has room for it plus 1 GiB. A
+# sized payload gets one attempt ('max-retries' 1), timed out after
+# 600 s plus the payload at an assumed 1 MiB/s, and the job gets its
+# usual 20 minutes plus that attempt: 304 minutes at the ceiling, within
+# a hosted runner's six hours. The summary and a notice report the size,
+# the time the signing step took, the rate and whether the attempt
+# succeeded. Without the input every run, scheduled or manual, keeps the
+# small file, the action's default retries and the 20-minute job.
+#
 # PROJECTS. The repository variable SIGUL_LIVE_PROJECTS is the only list
 # of projects; nothing in this workflow names one. It is a JSON object
 # keyed by environment name:
@@ -98,6 +113,12 @@ on:
         type: choice
         options: ["sign-data", "sign-git-tag"]
         default: "sign-data"
+      payload_bytes:
+        # yamllint disable-line rule:line-length
+        description: "Size in bytes of the file to sign, in signing mode with sign-data; blank for the small default"
+        type: string
+        required: false
+        default: ""
 
 permissions: {}
 
@@ -118,6 +139,10 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
       count: ${{ steps.select.outputs.count }}
       mode: ${{ steps.select.outputs.mode }}
+      payload_bytes: ${{ steps.select.outputs.payload_bytes }}
+      max_retries: ${{ steps.select.outputs.max_retries }}
+      attempt_timeout: ${{ steps.select.outputs.attempt_timeout }}
+      timeout_minutes: ${{ steps.select.outputs.timeout_minutes }}
     steps:
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -141,14 +166,24 @@ jobs:
           SIGUL_LIVE_PROJECTS: ${{ vars.SIGUL_LIVE_PROJECTS }}
           EVENT_NAME: ${{ github.event_name }}
           MODE_INPUT: ${{ inputs.mode }}
+          OPERATION_INPUT: ${{ inputs.operation }}
+          PAYLOAD_BYTES_INPUT: ${{ inputs.payload_bytes }}
           REF: ${{ github.ref }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys
+          import json, os, re, sys
 
           HOME_REPOSITORY = "lfreleng-actions/sigul-sign-action"
+          PAYLOAD_CEILING = 16 * 1024 ** 3
+          # The small file keeps the action's own retry defaults and the
+          # job its 20 minutes. A sized payload gets one attempt, as long
+          # as the default plus the payload at the assumed rate, and the
+          # job that attempt on top of its usual 20 minutes.
+          DEFAULT_RETRIES, DEFAULT_ATTEMPT_SECONDS = 5, 600
+          DEFAULT_JOB_MINUTES = 20
+          ASSUMED_BYTES_PER_SECOND = 1024 ** 2
           errors = []
 
           def fail(message):
@@ -161,6 +196,28 @@ jobs:
               mode = os.environ.get("MODE_INPUT", "")
           if mode not in ("dry-run", "connection-test", "signing"):
               fail(f"Unknown mode {mode!r}")
+
+          # Untrusted: never echoed, and checked as text before int() so
+          # that no length or form of it can raise.
+          payload = 0
+          raw = ("" if os.environ["EVENT_NAME"] == "schedule"
+                 else os.environ.get("PAYLOAD_BYTES_INPUT", "").strip())
+          if raw:
+              if not re.fullmatch(r"[0-9]+", raw):
+                  fail("payload_bytes must be a whole number of bytes, "
+                       "digits only")
+              digits = raw.lstrip("0")
+              if len(digits) > len(str(PAYLOAD_CEILING)):
+                  payload = PAYLOAD_CEILING + 1
+              else:
+                  payload = int(digits or "0")
+              if not 1 <= payload <= PAYLOAD_CEILING:
+                  fail("payload_bytes must be from 1 to "
+                       f"{PAYLOAD_CEILING} (16 GiB)")
+              if (mode != "signing"
+                      or os.environ.get("OPERATION_INPUT") != "sign-data"):
+                  fail("payload_bytes applies only to the signing mode "
+                       "with the sign-data operation")
 
           selected, skipped = [], []
           ref = os.environ["REF"]
@@ -225,14 +282,36 @@ jobs:
               if not selected:
                   print("::notice::No enabled project selected")
 
+          if payload:
+              legacy = [item["project"] for item in selected
+                        if item["container"] == "legacy"]
+              if legacy:
+                  fail("payload_bytes needs the modern client; these "
+                       "projects use the legacy container: "
+                       f"{', '.join(legacy)}")
+              retries = 1
+              attempt = DEFAULT_ATTEMPT_SECONDS + -(
+                  -payload // ASSUMED_BYTES_PER_SECOND)
+              minutes = DEFAULT_JOB_MINUTES + -(-attempt // 60)
+          else:
+              retries, attempt = DEFAULT_RETRIES, DEFAULT_ATTEMPT_SECONDS
+              minutes = DEFAULT_JOB_MINUTES
+
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               matrix = json.dumps(selected, separators=(",", ":"))
               out.write(f"matrix={matrix}\n")
               out.write(f"count={len(selected)}\n")
               out.write(f"mode={mode}\n")
+              out.write(f"payload_bytes={payload or ''}\n")
+              out.write(f"max_retries={retries}\n")
+              out.write(f"attempt_timeout={attempt}\n")
+              out.write(f"timeout_minutes={minutes}\n")
           lines = [f"### Live signing: {mode}", ""]
           lines += [f"- `{item['project']}` ({item['container']})"
                     for item in selected] or ["No projects selected."]
+          if payload:
+              lines += ["", f"Sized payload: {payload} bytes, one attempt of "
+                        f"at most {attempt} s, job timeout {minutes} minutes"]
           if skipped:
               lines += ["", "Skipped, disabled in `SIGUL_LIVE_PROJECTS`:", ""]
               lines += [f"- `{name}`" for name in skipped]
@@ -250,7 +329,8 @@ jobs:
     environment: ${{ matrix.project }}
     permissions:
       contents: read
-    timeout-minutes: 20
+    # 20 minutes, or more for a sized payload; 'resolve' works it out.
+    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.timeout_minutes) }}
     strategy:
       fail-fast: false
       matrix:
@@ -258,6 +338,8 @@ jobs:
     env:
       BRIDGE_HOST: ${{ vars.SIGUL_URI }}
       MODE: ${{ needs.resolve.outputs.mode }}
+      # Digits validated by 'resolve', or blank for the small file.
+      PAYLOAD_BYTES: ${{ needs.resolve.outputs.payload_bytes }}
     steps:
       # The firewall starts in a pre hook, before checkout. Keep its policy
       # inline: the organisation loader adds unrelated publishing endpoints.
@@ -421,9 +503,30 @@ jobs:
           set -euo pipefail
           if [ "${OPERATION}" = "sign-data" ]; then
             mkdir -p live-signing
-            printf 'sigul-sign-action live test\nrun %s\ncommit %s\n' \
-              "${RUN_ID}" "${SHA}" > live-signing/payload.txt
-            echo "object=live-signing/payload.txt" >> "$GITHUB_OUTPUT"
+            if [ -n "${PAYLOAD_BYTES:-}" ]; then
+              # 'resolve' validated it; check again before arithmetic,
+              # which would evaluate anything else as an expression.
+              if [[ ! "${PAYLOAD_BYTES}" =~ ^[1-9][0-9]{0,10}$ ]]; then
+                echo "::error::The payload size is not a whole number"
+                exit 1
+              fi
+              # Room for the payload, and 1 GiB for everything else.
+              needed=$((PAYLOAD_BYTES + 1024 * 1024 * 1024))
+              free="$(df -B1 --output=avail live-signing | tail -n 1)"
+              free="${free//[[:space:]]/}"
+              if [ "${free}" -lt "${needed}" ]; then
+                echo "::error::Not enough free disk for the payload:" \
+                  "${free} bytes free, ${needed} needed"
+                exit 1
+              fi
+              # Streamed by head, never held in memory.
+              head -c "${PAYLOAD_BYTES}" /dev/urandom > live-signing/payload.bin
+              echo "object=live-signing/payload.bin" >> "$GITHUB_OUTPUT"
+            else
+              printf 'sigul-sign-action live test\nrun %s\ncommit %s\n' \
+                "${RUN_ID}" "${SHA}" > live-signing/payload.txt
+              echo "object=live-signing/payload.txt" >> "$GITHUB_OUTPUT"
+            fi
           else
             # A local tag only: push-tag is off below, so nothing
             # leaves the runner.
@@ -505,6 +608,18 @@ jobs:
           sigul-hosts-entry: "true"
           expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
 
+      # Brackets 'Sign with Sigul' with the report below, so the time
+      # covers that step alone.
+      - name: "Start the signing clock"
+        id: clock
+        if: >-
+          ${{ steps.ready.outputs.ready == 'true' && env.MODE == 'signing'
+          && env.PAYLOAD_BYTES != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "started=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+
       - name: "Sign with Sigul"
         id: sign
         if: ${{ steps.ready.outputs.ready == 'true' && env.MODE == 'signing' }}
@@ -515,6 +630,9 @@ jobs:
           sign-type: ${{ inputs.operation }}
           sign-object: ${{ steps.target.outputs.object }}
           push-tag: "false"
+          # The action's defaults, or one attempt sized to the payload.
+          max-retries: ${{ needs.resolve.outputs.max_retries }}
+          attempt-timeout: ${{ needs.resolve.outputs.attempt_timeout }}
           sigul-key-name: ${{ vars.SIGUL_KEY }}
           sigul-conf: ${{ steps.creds.outputs.config }}
           sigul-pass: ${{ steps.creds.outputs.password }}
@@ -523,6 +641,46 @@ jobs:
           sigul-uri: ${{ env.BRIDGE_HOST }}
           sigul-hosts-entry: "true"
           expected-bridge: ${{ format('{0}:44334', env.BRIDGE_HOST) }}
+
+      # Reports a failed attempt too, but not a failure before the clock
+      # started, which leaves nothing to time. Size, time and rate only:
+      # no path, host or credential.
+      - name: "Report the signing time"
+        if: >-
+          ${{ steps.ready.outputs.ready == 'true' && env.MODE == 'signing'
+          && env.PAYLOAD_BYTES != '' && !cancelled()
+          && steps.clock.outputs.started != '' }}
+        shell: bash
+        env:
+          STARTED: ${{ steps.clock.outputs.started }}
+          OUTCOME: ${{ steps.sign.outcome }}
+        run: |
+          set -euo pipefail
+          ENDED="$(date +%s%N)" python3 - <<'PY'
+          import os
+
+          size = int(os.environ["PAYLOAD_BYTES"])
+          nanoseconds = int(os.environ["ENDED"]) - int(os.environ["STARTED"])
+          seconds = max(nanoseconds, 1) / 1e9
+          rate = size / seconds / 1e6
+          succeeded = "yes" if os.environ["OUTCOME"] == "success" else "no"
+          print(f"::notice::Sized payload: {size} bytes "
+                f"({size / 1024 ** 3:.2f} GiB) signed in {seconds:.1f} s, "
+                f"{rate:.2f} MB/s; first attempt succeeded: {succeeded}")
+          lines = [
+              "### Sized payload timing",
+              "",
+              "| Measure | Value |",
+              "| --- | --- |",
+              f"| Size | {size} bytes ({size / 1024 ** 3:.2f} GiB) |",
+              f"| Sign with Sigul | {seconds:.1f} s |",
+              f"| Rate | {rate:.2f} MB/s |",
+              f"| First attempt succeeded | {succeeded} |",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a",
+                    encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
 
       - name: "Compare the server's key"
         if: >-
