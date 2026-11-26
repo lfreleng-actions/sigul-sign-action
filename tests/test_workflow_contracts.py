@@ -699,6 +699,8 @@ class ResolveTests(WorkflowShellTests):
                 ),
                 "EVENT_NAME": "workflow_dispatch",
                 "MODE_INPUT": "dry-run",
+                "OPERATION_INPUT": "sign-data",
+                "PAYLOAD_BYTES_INPUT": "",
                 "REF": "refs/heads/main",
                 "REPOSITORY": HOME_REPOSITORY,
                 "GITHUB_OUTPUT": str(output),
@@ -839,6 +841,138 @@ class ResolveTests(WorkflowShellTests):
                 line = f"        uses: lfreleng-actions/list-splitter-action@{ref}\n"
                 self.assertNotRegex(line, LIST_SPLITTER_PIN)
 
+    def sized(
+        self, payload: str, names: list[str] | None = None, **env: str
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+        """Resolve a signing run with a sized payload, modern projects only."""
+        return self.resolve(
+            names or ["beta"],
+            **{"MODE_INPUT": "signing", "PAYLOAD_BYTES_INPUT": payload, **env},
+        )
+
+    @unittest.expectedFailure
+    def test_no_payload_keeps_the_small_file_run(self) -> None:
+        defaults = (
+            ("max_retries", action_default("max-retries")),
+            ("attempt_timeout", action_default("attempt-timeout")),
+            ("timeout_minutes", "20"),
+            ("payload_bytes", ""),
+        )
+        for env in (
+            {"MODE_INPUT": "signing"},
+            {"MODE_INPUT": "dry-run", "PAYLOAD_BYTES_INPUT": " "},
+            {"EVENT_NAME": "schedule", "MODE_INPUT": "", "PAYLOAD_BYTES_INPUT": "9"},
+        ):
+            with self.subTest(env=env):
+                done, outputs = self.resolve(None, PROJECTS, **env)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assert_selected(outputs, ("alpha", "legacy"), ("beta", "modern"))
+                for key, value in defaults:
+                    self.assertEqual(outputs[key], value, key)
+
+    @unittest.expectedFailure
+    def test_a_sized_payload_gets_one_attempt_scaled_to_its_size(self) -> None:
+        # 600 s plus the payload at 1 MiB/s; the job gets its usual 20
+        # minutes plus that attempt, and the ceiling fits GitHub's 6 hours.
+        for size, attempt, minutes in (
+            ("1", "601", "31"),
+            ("1048576", "601", "31"),
+            ("1048577", "602", "31"),
+            ("01073741824", "1624", "48"),
+            ("17179869184", "16984", "304"),
+        ):
+            with self.subTest(size=size):
+                done, outputs = self.sized(size)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assert_selected(outputs, ("beta", "modern"))
+                self.assertEqual(outputs["payload_bytes"], str(int(size)))
+                self.assertEqual(outputs["max_retries"], "1")
+                self.assertEqual(outputs["attempt_timeout"], attempt)
+                self.assertEqual(outputs["timeout_minutes"], minutes)
+                self.assertLessEqual(int(attempt), 86400)
+                self.assertLessEqual(int(minutes), 360)
+
+    @unittest.expectedFailure
+    def test_a_bad_payload_size_is_refused(self) -> None:
+        for size in (
+            "abc",
+            "1e9",
+            "-1",
+            "+1",
+            "1 024",
+            "0x10",
+            "\uff11\uff12",
+            "0",
+            "000",
+            "17179869185",
+            "9" * 5000,
+        ):
+            with self.subTest(size=size[:20]):
+                done, outputs = self.sized(size)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("::error::payload_bytes", done.stdout)
+                self.assertEqual(outputs, {})
+
+    @unittest.expectedFailure
+    def test_a_sized_payload_needs_signing_with_sign_data(self) -> None:
+        for env in (
+            {"MODE_INPUT": "dry-run"},
+            {"MODE_INPUT": "connection-test"},
+            {"OPERATION_INPUT": "sign-git-tag"},
+        ):
+            with self.subTest(env=env):
+                done, outputs = self.sized("1024", None, **env)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("::error::payload_bytes", done.stdout)
+                self.assertIn("sign-data", done.stdout)
+                self.assertEqual(outputs, {})
+
+    @unittest.expectedFailure
+    def test_a_sized_payload_refuses_a_legacy_project(self) -> None:
+        for names in ([], ["alpha"], ["beta", "alpha"]):
+            with self.subTest(names=names):
+                done, outputs = self.resolve(
+                    names, MODE_INPUT="signing", PAYLOAD_BYTES_INPUT="1024"
+                )
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                errors = [
+                    line for line in done.stdout.splitlines() if "::error::" in line
+                ]
+                self.assertEqual(len(errors), 1, done.stdout)
+                self.assertIn("alpha", errors[0])
+                self.assertIn("legacy", errors[0])
+                self.assertEqual(outputs, {})
+
+    @unittest.expectedFailure
+    def test_the_payload_input_reaches_resolve_only_through_env(self) -> None:
+        step = job_step("resolve", "Select the projects")
+        self.assertIn("PAYLOAD_BYTES_INPUT: ${{ inputs.payload_bytes }}", step)
+        self.assertIn("OPERATION_INPUT: ${{ inputs.operation }}", step)
+        self.assertEqual(LIVE_SOURCE.count("inputs.payload_bytes"), 1)
+        resolve = LIVE_SOURCE.split("\n  resolve:\n", 1)[1].split("\n  live:\n")[0]
+        for output in (
+            "payload_bytes",
+            "max_retries",
+            "attempt_timeout",
+            "timeout_minutes",
+        ):
+            with self.subTest(output=output):
+                self.assertIn(
+                    f"      {output}: ${{{{ steps.select.outputs.{output} }}}}\n",
+                    resolve,
+                )
+
+
+def action_default(name: str) -> str:
+    """An action input's default, as action.yaml declares it."""
+    source = (REPOSITORY / "action.yaml").read_text()
+    found = re.search(
+        rf'(?m)^  {re.escape(name)}:\n(?:    .*\n)*?    default: "([^"]*)"$', source
+    )
+    if found is None:
+        raise ValueError(f"Expected a quoted default for {name!r} in action.yaml")
+    return found[1]
+
 
 LIVE_SOURCE = (REPOSITORY / ".github" / "workflows" / "live-signing.yaml").read_text()
 
@@ -946,6 +1080,199 @@ class LiveSigningWiringTests(unittest.TestCase):
             + r'        options: \["sign-data", "sign-git-tag"\]$',
         )
         self.assertIn("  GH_TELEMETRY: 'false'\n", LIVE_SOURCE)
+
+    @unittest.expectedFailure
+    def test_payload_input_is_optional_and_blank_by_default(self) -> None:
+        self.assertRegex(
+            LIVE_SOURCE,
+            r"(?m)^      payload_bytes:\n(?:        .*\n)*?"
+            + r"        type: string\n"
+            + r"        required: false\n"
+            + r'        default: ""$',
+        )
+
+    @unittest.expectedFailure
+    def test_the_resolved_timings_reach_the_job_and_the_signing_step(self) -> None:
+        live = LIVE_SOURCE.split("\n  live:\n", 1)[1].split("\n  notify-slack:\n")[0]
+        for line in (
+            "    timeout-minutes: "
+            + "${{ fromJSON(needs.resolve.outputs.timeout_minutes) }}",
+            "      PAYLOAD_BYTES: ${{ needs.resolve.outputs.payload_bytes }}",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line + "\n", live)
+        timings = (
+            "max-retries: ${{ needs.resolve.outputs.max_retries }}",
+            "attempt-timeout: ${{ needs.resolve.outputs.attempt_timeout }}",
+        )
+        sign = named_step(LIVE_STEPS, "Sign with Sigul")
+        for line in timings:
+            with self.subTest(line=line):
+                self.assertIn(" " + line + "\n", " " + sign.strip() + "\n")
+        for name in ("Dry run with Sigul", "Check the connection with Sigul"):
+            with self.subTest(step=name):
+                step = named_step(LIVE_STEPS, name)
+                self.assertNotIn("max-retries:", step)
+                self.assertNotIn("attempt-timeout:", step)
+
+
+# Replaces df, so a test controls the free space the step sees.
+DF_STUB = r"""
+df() {
+    printf 'df %s\n' "$*" >> "$COMMAND_LOG"
+    printf '%s\n' '    Avail' "$DF_AVAIL"
+}
+"""
+
+
+class LivePayloadTests(WorkflowShellTests):
+    def make(
+        self, payload: str = "", avail: str = ""
+    ) -> subprocess.CompletedProcess[str]:
+        done = self.shell(
+            DF_STUB + live_script("Make something to sign"),
+            OPERATION="sign-data",
+            RUN_ID="4242",
+            SHA="f" * 40,
+            PAYLOAD_BYTES=payload,
+            DF_AVAIL=avail,
+            GITHUB_OUTPUT=str(self.root / "output"),
+        )
+        self.addCleanup(self.assertNotIn, "Traceback", done.stdout + done.stderr)
+        return done
+
+    def test_without_a_payload_the_small_file_is_signed(self) -> None:
+        done = self.make()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(
+            (self.root / "output").read_text(), "object=live-signing/payload.txt\n"
+        )
+        self.assertEqual(
+            (self.root / "live-signing" / "payload.txt").read_text(),
+            f"sigul-sign-action live test\nrun 4242\ncommit {'f' * 40}\n",
+        )
+
+    @unittest.expectedFailure
+    def test_a_sized_payload_is_written_at_that_size(self) -> None:
+        done = self.make("70000", str(2**40))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(
+            (self.root / "output").read_text(), "object=live-signing/payload.bin\n"
+        )
+        payload = (self.root / "live-signing" / "payload.bin").read_bytes()
+        self.assertEqual(len(payload), 70000)
+        # Pseudo-random rather than a run of one byte.
+        self.assertGreater(len(set(payload)), 200)
+        self.assertFalse((self.root / "live-signing" / "payload.txt").exists())
+
+    @unittest.expectedFailure
+    def test_a_payload_without_room_fails_before_writing(self) -> None:
+        margin = 2**30
+        for avail in ("0", str(70000 + margin - 1)):
+            with self.subTest(avail=avail):
+                done = self.make("70000", avail)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn(
+                    f"::error::Not enough free disk for the payload: {avail} "
+                    + f"bytes free, {70000 + margin} needed",
+                    done.stdout,
+                )
+                self.assertFalse((self.root / "live-signing" / "payload.bin").exists())
+                self.assertFalse((self.root / "output").exists())
+        done = self.make("70000", str(70000 + margin))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    @unittest.expectedFailure
+    def test_the_payload_size_reaches_the_step_through_env(self) -> None:
+        step = named_step(LIVE_STEPS, "Make something to sign")
+        self.assertIn("${PAYLOAD_BYTES", shell_body(step))
+        self.assertNotIn("payload_bytes", step)
+
+
+# Replaces date, so the elapsed time is fixed.
+DATE_STUB = r"""
+date() {
+    [ "$*" = '+%s%N' ] || return 99
+    printf '%s\n' "$NOW_NS"
+}
+"""
+
+STARTED_NS = 1_800_000_000_000_000_000
+
+
+class LiveTimingTests(WorkflowShellTests):
+    def report(
+        self, outcome: str, size: str = "80000000"
+    ) -> subprocess.CompletedProcess[str]:
+        done = self.shell(
+            DATE_STUB + live_script("Report the signing time"),
+            PAYLOAD_BYTES=size,
+            STARTED=str(STARTED_NS),
+            NOW_NS=str(STARTED_NS + 8_000_000_000),
+            OUTCOME=outcome,
+        )
+        self.addCleanup(self.assertNotIn, "Traceback", done.stdout + done.stderr)
+        return done
+
+    @unittest.expectedFailure
+    def test_a_signed_payload_reports_size_time_and_rate(self) -> None:
+        done = self.report("success")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        notice = (
+            "::notice::Sized payload: 80000000 bytes (0.07 GiB) signed in 8.0 s, "
+            + "10.00 MB/s; first attempt succeeded: yes\n"
+        )
+        self.assertIn(notice, done.stdout)
+        summary = (self.root / "summary").read_text()
+        for item in (
+            "80000000",
+            "8.0 s",
+            "10.00 MB/s",
+            "| First attempt succeeded | yes |",
+        ):
+            with self.subTest(item=item):
+                self.assertIn(item, summary)
+
+    @unittest.expectedFailure
+    def test_a_failed_attempt_is_reported(self) -> None:
+        done = self.report("failure")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("first attempt succeeded: no\n", done.stdout)
+        self.assertIn(
+            "| First attempt succeeded | no |", (self.root / "summary").read_text()
+        )
+
+    @unittest.expectedFailure
+    def test_the_clock_brackets_the_signing_step(self) -> None:
+        names = [step.splitlines()[0] for step in LIVE_STEPS]
+        start = names.index('name: "Start the signing clock"')
+        self.assertEqual(names[start + 1], 'name: "Sign with Sigul"')
+        self.assertEqual(names[start + 2], 'name: "Report the signing time"')
+        clock = named_step(LIVE_STEPS, "Start the signing clock")
+        self.assertRegex(clock, r"(?m)^        id: clock$")
+        self.assertIn("date +%s%N", shell_body(clock))
+        sized = f"{READY} && env.MODE == 'signing' && env.PAYLOAD_BYTES != ''"
+        self.assertEqual(step_condition(clock), f"${{{{ {sized} }}}}")
+        report = named_step(LIVE_STEPS, "Report the signing time")
+        # A failure before the clock leaves no start time to report from.
+        started = "steps.clock.outputs.started != ''"
+        self.assertEqual(
+            step_condition(report),
+            f"${{{{ {sized} && !cancelled() && {started} }}}}",
+        )
+        for line in (
+            "STARTED: ${{ steps.clock.outputs.started }}",
+            "OUTCOME: ${{ steps.sign.outcome }}",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line, report)
+
+    @unittest.expectedFailure
+    def test_the_report_names_no_path_host_or_credential(self) -> None:
+        report = named_step(LIVE_STEPS, "Report the signing time")
+        for item in ("secrets.", "vars.", "BRIDGE_HOST", "steps.pin", "steps.target"):
+            with self.subTest(item=item):
+                self.assertNotIn(item, report)
 
 
 GH_STUB = r"""
