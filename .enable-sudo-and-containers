@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+#
+# Gives Code Monkey sessions on this repository sudo and Docker
+# (lfreleng-actions/github-code-monkey-bot, docs/DESIGN.md section 4.1).
+# Only this file's presence at the root of the default branch counts;
+# the bot never reads its content.
+#
+# Why: this action signs through Sigul clients that run in the images
+# under containers/: modern/ builds on the client image from
+# lfreleng-actions/sigul-docker-k8s, and legacy/ on lfreleng/sigul. A
+# change to the action cannot be checked end to end unless the session
+# can build and run those containers.
+#
+# The grant also gives the session the means to undo harden-runner, so
+# remove this file once the repository no longer needs it.
